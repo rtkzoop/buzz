@@ -1,6 +1,6 @@
 {
   "linear": { "team": "BUZZ", "projects": [], "localMode": true },
-  "pr": { "repo": "block/buzz", "base": "main" },
+  "pr": { "repo": "rtkzoop/zap-buzz", "base": "main" },
   "paths": {
     "specs": "docs/superpowers/specs",
     "plans": "docs/superpowers/plans",
