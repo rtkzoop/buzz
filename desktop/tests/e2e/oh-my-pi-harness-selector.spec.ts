@@ -295,6 +295,20 @@ test.describe("Oh My Pi harness selector", () => {
       }),
     );
 
+    await page.goto("/");
+
+    const seededAgent = (
+      await invokeMockCommand<
+        Array<{
+          pubkey: string;
+          provider: string | null;
+        }>
+      >(page, "list_managed_agents")
+    ).find((agent) => agent.pubkey === AGENT_PUBKEY);
+    expect(seededAgent).toMatchObject({
+      provider: "anthropic",
+    });
+
     await openEditDialog(page);
     await pickDropdownOption(page, "edit-agent-runtime", "Oh My Pi");
     await expect(page.locator("#edit-agent-runtime")).toHaveText("Oh My Pi");

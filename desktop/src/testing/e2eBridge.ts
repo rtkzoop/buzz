@@ -77,6 +77,7 @@ type MockManagedAgentSeed = {
   agentCommand?: string;
   agentCommandOverride?: string | null;
   agentArgs?: string[];
+  provider?: string | null;
   lastError?: string | null;
   lastErrorCode?: number | null;
   needsRestart?: boolean;
@@ -2002,6 +2003,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     system_prompt: null,
     avatar_url: seed.avatarUrl ?? null,
     model: null,
+    provider: seed.provider ?? null,
     env_vars: {},
     status,
     pid: status === "running" ? 42000 + mockManagedAgents.length : null,
@@ -7922,6 +7924,7 @@ async function handleUpdateManagedAgent(args: {
     agentCommand?: string | null;
     agentCommandOverride?: string | null;
     agentArgs?: string[];
+    provider?: string | null;
   };
 }): Promise<{ agent: RawManagedAgent; profile_sync_error: string | null }> {
   const agent = getMockManagedAgent(args.input.pubkey);
@@ -7951,6 +7954,9 @@ async function handleUpdateManagedAgent(args: {
   }
   if (args.input.agentArgs !== undefined) {
     agent.agent_args = [...args.input.agentArgs];
+  }
+  if (args.input.provider !== undefined) {
+    agent.provider = args.input.provider;
   }
   agent.updated_at = new Date().toISOString();
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
