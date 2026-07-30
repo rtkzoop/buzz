@@ -74,6 +74,9 @@ type MockManagedAgentSeed = {
   channelNames?: string[];
   channelIds?: string[];
   backend?: RawManagedAgent["backend"];
+  agentCommand?: string;
+  agentCommandOverride?: string | null;
+  agentArgs?: string[];
   lastError?: string | null;
   lastErrorCode?: number | null;
   needsRestart?: boolean;
@@ -809,6 +812,7 @@ type RawTeam = {
 };
 
 type MockManagedAgent = RawManagedAgent & {
+  agent_command_override?: string | null;
   private_key_nsec: string;
   log_lines: string[];
 };
@@ -1987,8 +1991,9 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     persona_id: seed.personaId ?? null,
     relay_url: DEFAULT_RELAY_WS_URL,
     acp_command: "buzz-acp",
-    agent_command: "goose",
-    agent_args: ["acp"],
+    agent_command: seed.agentCommand ?? "goose",
+    agent_command_override: seed.agentCommandOverride ?? null,
+    agent_args: seed.agentArgs ?? ["acp"],
     mcp_command: "",
     turn_timeout_seconds: 320,
     idle_timeout_seconds: null,
@@ -7914,6 +7919,9 @@ async function handleUpdateManagedAgent(args: {
     envVars?: Record<string, string>;
     respondTo?: "owner-only" | "allowlist" | "anyone";
     respondToAllowlist?: string[];
+    agentCommand?: string | null;
+    agentCommandOverride?: string | null;
+    agentArgs?: string[];
   };
 }): Promise<{ agent: RawManagedAgent; profile_sync_error: string | null }> {
   const agent = getMockManagedAgent(args.input.pubkey);
@@ -7934,6 +7942,15 @@ async function handleUpdateManagedAgent(args: {
   }
   if (args.input.respondToAllowlist !== undefined) {
     agent.respond_to_allowlist = args.input.respondToAllowlist;
+  }
+  if (args.input.agentCommand !== undefined) {
+    agent.agent_command = args.input.agentCommand ?? "";
+  }
+  if (args.input.agentCommandOverride !== undefined) {
+    agent.agent_command_override = args.input.agentCommandOverride;
+  }
+  if (args.input.agentArgs !== undefined) {
+    agent.agent_args = [...args.input.agentArgs];
   }
   agent.updated_at = new Date().toISOString();
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };

@@ -116,6 +116,7 @@ export default defineConfig({
         "**/profile-nsec-reveal.spec.ts",
         "**/signout-confirmation.spec.ts",
         "**/agent-provider-dropdowns.spec.ts",
+        "**/oh-my-pi-harness-selector.spec.ts",
         "**/agent-lifecycle-feedback.spec.ts",
         "**/inbox-live-update.spec.ts",
         "**/mesh-compute.spec.ts",
