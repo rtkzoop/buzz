@@ -1,14 +1,14 @@
 # Oh My Pi Harness Selector Code Review
 
 **Date:** 2026-07-30
-**Review range:** `e1ed72c6..fc3b4694`
+**Review scope:** approved design through final E2E bridge correction
 **Reviewer model:** gpt-5.5
 **Verdict:** Clean after two correction rounds
 
 ## Findings resolved
 
-1. **Standalone agents could retain a stale provider when switching to Oh My Pi.** Native metadata hid provider selection, but `resolveRuntimeProviderCapability("ompl", false)` returned `unknown`, causing submit to omit the provider update. Commit `7bfcc2bc` classifies `ompl` as provider-locked, emits an explicit `null` only when clearing an existing standalone provider, and preserves omit behavior for unknown/custom and linked instances. Unit regressions captured RED (`unknown` vs `locked`) and GREEN.
-2. **The first Playwright provider assertion was a false positive.** The E2E bridge ignored provider seed/update values, so the record began at `null`. Commit `fc3b4694` adds provider seed/update handling with omit-vs-null semantics and makes the scenario assert `anthropic` before Save and `null` after Save. The strengthened test failed RED with expected `anthropic`, received `null`, then passed GREEN.
+1. **Standalone agents could retain a stale provider when switching to Oh My Pi.** Native metadata hid provider selection, but `resolveRuntimeProviderCapability("ompl", false)` returned `unknown`, causing submit to omit the provider update. The provider-lock correction classifies `ompl` as provider-locked, emits an explicit `null` only when clearing an existing standalone provider, and preserves omit behavior for unknown/custom and linked instances. Unit regressions captured RED (`unknown` vs `locked`) and GREEN.
+2. **The first Playwright provider assertion was a false positive.** The E2E bridge ignored provider seed/update values, so the record began at `null`. The bridge correction adds provider seed/update handling with omit-vs-null semantics and makes the scenario assert `anthropic` before Save and `null` after Save. The strengthened test failed RED with expected `anthropic`, received `null`, then passed GREEN.
 
 ## Final review
 
