@@ -8,7 +8,7 @@ use super::{
     is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
     parse_semver_tag, probe_codex_acp_major_version, record_agent_command,
     refresh_login_shell_path, BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL,
-    GOOSE_AVATAR_URL,
+    GOOSE_AVATAR_URL, OH_MY_PI_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
 
@@ -51,9 +51,10 @@ fn recognizes_oh_my_pi_commands_paths_and_avatar() {
     ] {
         let runtime = super::known_acp_runtime(command).expect("Oh My Pi runtime");
         assert_eq!(runtime.id, "ompl");
+        assert_eq!(runtime.avatar_url, OH_MY_PI_AVATAR_URL);
         assert_eq!(
             managed_agent_avatar_url(command).as_deref(),
-            Some(runtime.avatar_url)
+            Some(OH_MY_PI_AVATAR_URL)
         );
     }
 }

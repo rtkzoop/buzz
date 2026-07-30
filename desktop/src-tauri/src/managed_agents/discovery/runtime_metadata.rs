@@ -83,7 +83,7 @@ impl KnownAcpRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::super::known_acp_runtime_exact;
+    use super::super::{known_acp_runtime_exact, OH_MY_PI_AVATAR_URL};
 
     #[test]
     fn oh_my_pi_metadata_matches_approved_contract() {
@@ -126,8 +126,12 @@ mod tests {
         assert!(ompl.default_env.is_empty());
         assert!(ompl.required_normalized_fields.is_empty());
         assert!(ompl.login_hint.is_none());
-        assert!(ompl.auth_probe_args.is_none());
-        assert!(!ompl.avatar_url.is_empty());
+        assert_eq!(ompl.auth_probe_args, None);
+        assert_eq!(
+            ompl.avatar_url,
+            "https://raw.githubusercontent.com/can1357/oh-my-pi/main/assets/icon.svg"
+        );
+        assert_eq!(ompl.avatar_url, OH_MY_PI_AVATAR_URL);
     }
 
     #[test]
