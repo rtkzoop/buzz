@@ -191,10 +191,11 @@ test("resolveRuntimeProviderCapability classifies provider-capable runtimes as c
   assert.equal(resolveRuntimeProviderCapability("goose", true), "capable");
 });
 
-test("resolveRuntimeProviderCapability classifies known CLI-login runtimes as locked before the catalog loads", () => {
+test("resolveRuntimeProviderCapability classifies known provider-locked runtimes as locked before the catalog loads", () => {
   // The core fix: a not-yet-loaded catalog must not force these to "unknown".
   assert.equal(resolveRuntimeProviderCapability("claude", false), "locked");
   assert.equal(resolveRuntimeProviderCapability("codex", false), "locked");
+  assert.equal(resolveRuntimeProviderCapability("ompl", false), "locked");
   assert.equal(resolveRuntimeProviderCapability(" claude ", false), "locked");
 });
 

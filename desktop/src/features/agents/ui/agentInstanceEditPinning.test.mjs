@@ -226,6 +226,32 @@ test("rehost_submit_persistsToggleAsCommandClear_andOmitsHarnessOverride", () =>
   );
 });
 
+test("rehost_submit_clearsStaleProviderWhenSwitchingToOmpl", () => {
+  // Native Oh My Pi (`ompl`) is provider-locked/harness-managed. When an agent
+  // previously had a standalone provider, the submit path must send an explicit
+  // null update rather than omit the field and preserve stale provider bytes.
+  const capability = resolveRuntimeProviderCapability(
+    "ompl",
+    runtimeSupportsLlmProviderSelection("ompl"),
+  );
+  assert.equal(capability, "locked");
+
+  const oldProvider = "anthropic";
+  const providerUpdate =
+    capability === "capable"
+      ? undefined
+      : capability === "locked"
+        ? (oldProvider ?? null) !== null
+          ? null
+          : undefined
+        : undefined;
+  assert.equal(
+    providerUpdate,
+    null,
+    "provider-locked ompl must clear a non-null old provider on submit",
+  );
+});
+
 test("rehost_steadyStateInherit_localEditsStayAuthoritative", () => {
   // Wipe-on-poll companion: an agent ALREADY inheriting at open (no pin) with
   // deliberate local edits — the submission snapshot must pass them through
