@@ -289,6 +289,7 @@ test.describe("Oh My Pi harness selector", () => {
             agentCommand: "omp",
             agentCommandOverride: "omp",
             agentArgs: [],
+            provider: "anthropic",
           },
         ],
       }),
@@ -302,12 +303,18 @@ test.describe("Oh My Pi harness selector", () => {
 
     const savedAgent = (
       await invokeMockCommand<
-        Array<{ pubkey: string; agent_command: string; agent_args: string[] }>
+        Array<{
+          pubkey: string;
+          agent_command: string;
+          agent_args: string[];
+          provider: string | null;
+        }>
       >(page, "list_managed_agents")
     ).find((agent) => agent.pubkey === AGENT_PUBKEY);
     expect(savedAgent).toMatchObject({
       agent_command: "ompl",
       agent_args: ["acp"],
+      provider: null,
     });
     expect(savedAgent?.agent_command).not.toBe("omp");
 
