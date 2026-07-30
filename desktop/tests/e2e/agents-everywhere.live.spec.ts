@@ -10,6 +10,14 @@ const enabled = process.env.BUZZ_E2E_AGENTS_EVERYWHERE === "1";
 const relayBin = process.env.BUZZ_E2E_RELAY_BIN;
 const cliBin = process.env.BUZZ_E2E_CLI_BIN;
 const adminBin = process.env.BUZZ_E2E_ADMIN_BIN;
+const lazyPoolSize = 24;
+const fakeAcpWakeDelayMs = 500;
+// Serial initialization takes at least 12s with this fixture. First-ready lazy
+// wake should comfortably publish its reply below this bound on CI.
+const maxLazyWakeMs = 8_000;
+// ACP subscriptions intentionally replay a five-second startup skew window.
+// Age the initial probe beyond it so restart begins genuinely idle.
+const startupReplaySkewClearMs = 6_000;
 
 function required(name: string, value: string | undefined): string {
   if (!value) throw new Error(`${name} is required for the live gate`);
@@ -81,6 +89,42 @@ async function eventually<T>(fn: () => Promise<T | undefined>): Promise<T> {
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw lastError ?? new Error("live assertion timed out");
+}
+
+async function sendAndAwaitAck(
+  relay: RelaySpec,
+  channelId: string,
+  senderKey: string,
+  probe: string,
+): Promise<number> {
+  const relayHttp = `http://127.0.0.1:${relay.ports.main}`;
+  const wakeStartedAt = Date.now();
+  await run(
+    required("BUZZ_E2E_CLI_BIN", cliBin),
+    [
+      "messages",
+      "send",
+      "--channel",
+      channelId,
+      "--content",
+      `@AgentsEverywhereProbe AE-ID:${probe}`,
+    ],
+    { BUZZ_RELAY_URL: relayHttp, BUZZ_PRIVATE_KEY: senderKey },
+  );
+  const expectedAck = `AE-ACK:${probe}`;
+  const messages = await eventually(async () => {
+    const output = await run(
+      required("BUZZ_E2E_CLI_BIN", cliBin),
+      ["messages", "get", "--channel", channelId, "--limit", "20"],
+      { BUZZ_RELAY_URL: relayHttp, BUZZ_PRIVATE_KEY: senderKey },
+    );
+    const rows = JSON.parse(output) as Array<{ content?: string }>;
+    return rows.some((row) => row.content === expectedAck) ? rows : undefined;
+  });
+  expect(messages.filter((row) => row.content === expectedAck)).toHaveLength(1);
+  const latencyMs = Date.now() - wakeStartedAt;
+  expect(latencyMs).toBeLessThan(maxLazyWakeMs);
+  return latencyMs;
 }
 
 test.describe("agents everywhere live two-relay gate", () => {
@@ -176,13 +220,19 @@ test.describe("agents everywhere live two-relay gate", () => {
       }
 
       const acpChildren = [];
+      const acpEnv = {
+        BUZZ_ACP_AGENTS: String(lazyPoolSize),
+        BUZZ_ACP_RESPOND_TO: "anyone",
+        BUZZ_ACP_NO_MEMORY: "true",
+        BUZZ_E2E_FAKE_ACP_WAKE_MS: String(fakeAcpWakeDelayMs),
+      };
       for (const { relay } of channels) {
         acpChildren.push(
           await harness.startAcp(
             `acp-${relay.name}`,
             `ws://127.0.0.1:${relay.ports.main}`,
             agentKey,
-            { BUZZ_ACP_RESPOND_TO: "anyone", BUZZ_ACP_NO_MEMORY: "true" },
+            acpEnv,
           ),
         );
       }
@@ -207,35 +257,60 @@ test.describe("agents everywhere live two-relay gate", () => {
           .join("; "),
       });
 
+      const initialLatencies = [];
       for (const { relay, id } of channels) {
-        const relayHttp = `http://127.0.0.1:${relay.ports.main}`;
-        await run(
-          required("BUZZ_E2E_CLI_BIN", cliBin),
-          [
-            "messages",
-            "send",
-            "--channel",
+        initialLatencies.push({
+          relay: relay.name,
+          latencyMs: await sendAndAwaitAck(
+            relay,
             id,
-            "--content",
-            `@AgentsEverywhereProbe AE-ID:${relay.name}`,
-          ],
-          { BUZZ_RELAY_URL: relayHttp, BUZZ_PRIVATE_KEY: senderKey },
-        );
-        const messages = await eventually(async () => {
-          const output = await run(
-            required("BUZZ_E2E_CLI_BIN", cliBin),
-            ["messages", "get", "--channel", id, "--limit", "20"],
-            { BUZZ_RELAY_URL: relayHttp, BUZZ_PRIVATE_KEY: senderKey },
-          );
-          const rows = JSON.parse(output) as Array<{ content?: string }>;
-          return rows.some((row) => row.content === `AE-ACK:${relay.name}`)
-            ? rows
-            : undefined;
+            senderKey,
+            `${relay.name}-initial`,
+          ),
         });
-        expect(
-          messages.filter((row) => row.content === `AE-ACK:${relay.name}`),
-        ).toHaveLength(1);
       }
+
+      const refilledTrees = await eventually(async () => {
+        const trees = await Promise.all(
+          acpChildren.map((child) => {
+            if (!child.pid) throw new Error("ACP listener has no pid");
+            return processTree(child.pid);
+          }),
+        );
+        return trees.every((tree) => tree.length > 1) ? trees : undefined;
+      });
+      expect(refilledTrees.every((tree) => tree.length > 1)).toBe(true);
+
+      const restarted = channels[0];
+      await harness.terminateProcessGracefully(`acp-${restarted.relay.name}`);
+      await new Promise((resolve) =>
+        setTimeout(resolve, startupReplaySkewClearMs),
+      );
+      const restartedAcp = await harness.startAcp(
+        `acp-${restarted.relay.name}`,
+        `ws://127.0.0.1:${restarted.relay.ports.main}`,
+        agentKey,
+        acpEnv,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+      expect(restartedAcp.exitCode).toBeNull();
+      if (!restartedAcp.pid)
+        throw new Error("restarted ACP listener has no pid");
+      expect(await processTree(restartedAcp.pid)).toHaveLength(1);
+      const restartLatencyMs = await sendAndAwaitAck(
+        restarted.relay,
+        restarted.id,
+        senderKey,
+        `${restarted.relay.name}-restart`,
+      );
+      console.log(
+        JSON.stringify({
+          idleProcessCounts: idleTrees.map((tree) => tree.length),
+          initialLatencies,
+          refilledProcessCounts: refilledTrees.map((tree) => tree.length),
+          restartLatencyMs,
+        }),
+      );
     } catch (error) {
       console.error(await harness.logs());
       throw error;

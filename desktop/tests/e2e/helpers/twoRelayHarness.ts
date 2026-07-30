@@ -54,6 +54,11 @@ export class TwoRelayHarness {
    * the run. Throws if the process does not exit within `timeoutMs`.
    */
   async terminateRelayGracefully(name: string, timeoutMs = 45_000) {
+    await this.terminateProcessGracefully(name, timeoutMs);
+  }
+
+  /** SIGTERM one owned process by name and wait for it to exit. */
+  async terminateProcessGracefully(name: string, timeoutMs = 45_000) {
     const owned = [...this.processes]
       .reverse()
       .find(
@@ -62,7 +67,7 @@ export class TwoRelayHarness {
           candidate.child.exitCode === null &&
           candidate.child.signalCode === null,
       );
-    if (!owned) throw new Error(`no live relay process named ${name}`);
+    if (!owned) throw new Error(`no live owned process named ${name}`);
     const exited = new Promise<void>((resolveExit) =>
       owned.child.once("exit", () => resolveExit()),
     );
@@ -70,9 +75,7 @@ export class TwoRelayHarness {
     if (
       !(await Promise.race([exited.then(() => true), delay(timeoutMs, false)]))
     ) {
-      throw new Error(
-        `${name} did not exit within ${timeoutMs}ms of SIGTERM — graceful drain is stuck`,
-      );
+      throw new Error(`${name} did not exit within ${timeoutMs}ms of SIGTERM`);
     }
   }
 

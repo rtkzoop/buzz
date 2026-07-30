@@ -1317,7 +1317,12 @@ async fn tokio_main() -> Result<()> {
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
+        initialize_agent_pool(
+            &PoolStartup::from_config(&config, observer.clone()),
+            None,
+            PoolInitializationTarget::Full,
+        )
+        .await?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -1728,9 +1733,13 @@ async fn tokio_main() -> Result<()> {
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
-                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
-                        .await
-                        .map_err(|error| error.to_string());
+                    let result = initialize_agent_pool(
+                        &startup,
+                        Some(wake_shutdown),
+                        PoolInitializationTarget::FirstReady,
+                    )
+                    .await
+                    .map_err(|error| error.to_string());
                     if let Err(error) = wake_tx.send((attempt, result)).await {
                         let (_attempt, result) = error.0;
                         if let Ok(mut abandoned_pool) = result {
@@ -3724,6 +3733,86 @@ struct PoolStartup {
     observer: Option<observer::ObserverHandle>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolInitializationTarget {
+    /// Initialize every configured slot before returning.
+    Full,
+    /// Return as soon as one usable slot exists. Empty slots are refilled by
+    /// the normal maintenance loop after the queued work starts dispatching.
+    FirstReady,
+}
+
+impl PoolInitializationTarget {
+    fn reached(self, live_count: usize, configured_count: usize) -> bool {
+        match self {
+            Self::Full => live_count >= configured_count,
+            Self::FirstReady => live_count >= 1,
+        }
+    }
+}
+
+struct PoolInitialization<T> {
+    slots: Vec<Option<T>>,
+    live_count: usize,
+    target: PoolInitializationTarget,
+}
+
+impl<T> PoolInitialization<T> {
+    fn new(configured_count: usize, target: PoolInitializationTarget) -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None)
+                .take(configured_count)
+                .collect(),
+            live_count: 0,
+            target,
+        }
+    }
+
+    fn record_success(&mut self, index: usize, value: T) -> bool {
+        self.slots[index] = Some(value);
+        self.live_count += 1;
+        self.target.reached(self.live_count, self.slots.len())
+    }
+
+    fn into_parts(self) -> (Vec<Option<T>>, usize) {
+        (self.slots, self.live_count)
+    }
+}
+
+#[cfg(test)]
+mod pool_initialization_target_tests {
+    use super::{PoolInitialization, PoolInitializationTarget};
+
+    #[test]
+    fn first_ready_stops_after_one_worker_and_preserves_capacity() {
+        let mut initialization = PoolInitialization::new(24, PoolInitializationTarget::FirstReady);
+
+        assert!(initialization.record_success(3, "ready"));
+
+        let (slots, live_count) = initialization.into_parts();
+        assert_eq!(slots.len(), 24);
+        assert_eq!(live_count, 1);
+        assert_eq!(slots[3], Some("ready"));
+        assert!(slots
+            .iter()
+            .enumerate()
+            .all(|(index, slot)| index == 3 || slot.is_none()));
+    }
+
+    #[test]
+    fn full_waits_for_every_configured_worker() {
+        let mut initialization = PoolInitialization::new(3, PoolInitializationTarget::Full);
+
+        assert!(!initialization.record_success(0, "first"));
+        assert!(!initialization.record_success(2, "second"));
+        assert!(initialization.record_success(1, "third"));
+
+        let (slots, live_count) = initialization.into_parts();
+        assert_eq!(live_count, 3);
+        assert_eq!(slots, vec![Some("first"), Some("third"), Some("second")]);
+    }
+}
+
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
@@ -3741,10 +3830,16 @@ impl PoolStartup {
 async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
+    target: PoolInitializationTarget,
 ) -> Result<AgentPool> {
     // One agent failing to start must not kill the whole pool.
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
-    let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
+    // Lazy wake only needs one usable worker before the first buffered event can
+    // dispatch. The remaining configured slots stay present as `None` and are
+    // populated by the existing background refill path instead of delaying the
+    // first response behind N sequential ACP handshakes.
+    let configured_count = startup.agents as usize;
+    let mut initialization = PoolInitialization::new(configured_count, target);
     for i in 0..startup.agents as usize {
         let spawn_result = AcpClient::spawn(
             &startup.command,
@@ -3762,6 +3857,7 @@ async fn initialize_agent_pool(
                         biased;
                         _ = shutdown.changed() => {
                             acp.shutdown().await;
+                            let (mut agent_slots, _) = initialization.into_parts();
                             shutdown_agent_slots(&mut agent_slots).await;
                             return Err(anyhow::anyhow!("pool initialization cancelled by shutdown"));
                         }
@@ -3792,48 +3888,57 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
-                        agent_slots.push(Some(OwnedAgent {
-                            index: i,
-                            acp,
-                            state: SessionState::default(),
-                            model_capabilities: None,
-                            desired_model: startup.model.clone(),
-                            model_overridden: false,
-                            agent_name,
-                            goose_system_prompt_supported: None,
-                            protocol_version,
-                        }));
+                        let target_reached = initialization.record_success(
+                            i,
+                            OwnedAgent {
+                                index: i,
+                                acp,
+                                state: SessionState::default(),
+                                model_capabilities: None,
+                                desired_model: startup.model.clone(),
+                                model_overridden: false,
+                                agent_name,
+                                goose_system_prompt_supported: None,
+                                protocol_version,
+                            },
+                        );
+                        if target_reached {
+                            break;
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                     Err(_) => {
                         tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(agent = i, "agent failed to spawn: {e}");
-                agent_slots.push(None);
             }
         }
     }
-    let live_count = agent_slots.iter().filter(|slot| slot.is_some()).count();
+    let (agent_slots, live_count) = initialization.into_parts();
     if live_count == 0 {
         return Err(anyhow::anyhow!(
             "all {} agents failed to start — cannot continue",
             startup.agents
         ));
     }
-    if live_count < startup.agents as usize {
+    if target == PoolInitializationTarget::Full && live_count < configured_count {
         tracing::warn!(
             "started {}/{} agents — continuing with reduced pool",
             live_count,
             startup.agents
+        );
+    } else if target == PoolInitializationTarget::FirstReady && live_count < configured_count {
+        tracing::info!(
+            ready = live_count,
+            configured = configured_count,
+            "lazy agent pool has a usable worker; deferring remaining slots"
         );
     }
     tracing::info!("agent_pool_ready agents={}", live_count);
