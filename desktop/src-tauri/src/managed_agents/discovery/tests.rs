@@ -40,6 +40,82 @@ fn resolves_known_avatar_for_command_paths_and_aliases() {
 }
 
 #[test]
+fn recognizes_oh_my_pi_commands_paths_and_avatar() {
+    for command in [
+        "ompl",
+        "omp",
+        "/Users/example/.local/bin/ompl",
+        "/opt/homebrew/bin/omp",
+        r"C:\Tools\ompl.exe",
+        r"C:\Tools\omp.exe",
+    ] {
+        let runtime = super::known_acp_runtime(command).expect("Oh My Pi runtime");
+        assert_eq!(runtime.id, "ompl");
+        assert_eq!(
+            managed_agent_avatar_url(command).as_deref(),
+            Some(runtime.avatar_url)
+        );
+    }
+}
+
+#[test]
+fn normalizes_oh_my_pi_args_to_acp_without_overwriting_explicit_args() {
+    assert_eq!(normalize_agent_args("ompl", vec![]), vec!["acp"]);
+    assert_eq!(normalize_agent_args("omp", vec![]), vec!["acp"]);
+    assert_eq!(
+        normalize_agent_args("/Users/example/.local/bin/ompl", vec![]),
+        vec!["acp"]
+    );
+    assert_eq!(normalize_agent_args("omp", vec!["acp".into()]), vec!["acp"]);
+    assert_eq!(
+        normalize_agent_args("ompl", vec!["serve".into(), "--debug".into()]),
+        vec!["serve", "--debug"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oh_my_pi_resolver_prefers_primary_command_then_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ompl = temp.path().join("ompl");
+    let omp = temp.path().join("omp");
+    for bin in [&ompl, &omp] {
+        std::fs::write(bin, "#!/bin/sh\nexit 0\n").expect("write script");
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+    }
+
+    let runtime = super::known_acp_runtime_exact("ompl").expect("Oh My Pi runtime");
+    let resolve_from_temp = |command: &&str| {
+        let path = temp.path().join(command);
+        path.is_file().then_some(path)
+    };
+    let both = runtime
+        .commands
+        .iter()
+        .find_map(|command| resolve_from_temp(command).map(|path| (*command, path)));
+
+    std::fs::remove_file(&ompl).expect("remove primary command");
+    let fallback = runtime
+        .commands
+        .iter()
+        .find_map(|command| resolve_from_temp(command).map(|path| (*command, path)));
+
+    assert_eq!(both.as_ref().map(|(command, _)| *command), Some("ompl"));
+    assert_eq!(
+        both.as_ref().map(|(_, path)| path.as_path()),
+        Some(ompl.as_path())
+    );
+    assert_eq!(fallback.as_ref().map(|(command, _)| *command), Some("omp"));
+    assert_eq!(
+        fallback.as_ref().map(|(_, path)| path.as_path()),
+        Some(omp.as_path())
+    );
+}
+
+#[test]
 fn returns_none_for_unknown_commands() {
     assert!(managed_agent_avatar_url("custom-agent").is_none());
 }

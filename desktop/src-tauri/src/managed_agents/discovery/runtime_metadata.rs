@@ -86,6 +86,51 @@ mod tests {
     use super::super::known_acp_runtime_exact;
 
     #[test]
+    fn oh_my_pi_metadata_matches_approved_contract() {
+        let ompl = known_acp_runtime_exact("ompl").expect("Oh My Pi runtime");
+
+        assert_eq!(ompl.id, "ompl");
+        assert_eq!(ompl.label, "Oh My Pi");
+        assert_eq!(ompl.commands, &["ompl", "omp"]);
+        assert_eq!(ompl.aliases, &[] as &[&str]);
+        assert_eq!(
+            ompl.cli_install_commands,
+            &["curl -fsSL https://omp.sh/install | sh"]
+        );
+        assert_eq!(ompl.cli_install_commands_windows, &[] as &[&str]);
+        assert_eq!(
+            ompl.cli_install_instructions_url,
+            "https://github.com/can1357/oh-my-pi"
+        );
+        assert_eq!(
+            ompl.cli_install_hint,
+            "Install Oh My Pi with the official installer."
+        );
+        assert_eq!(ompl.skill_dir, Some(".omp/skills"));
+        assert_eq!(ompl.config_file_path, Some("~/.omp/agent/config.yml"));
+        assert_eq!(ompl.config_file_format, Some("yaml"));
+        assert!(ompl.supports_acp_model_switching);
+        assert!(ompl.supports_acp_native_config);
+        assert!(ompl.provider_locked);
+        assert!(ompl.mcp_command.is_none());
+        assert!(!ompl.mcp_hooks);
+        assert!(ompl.underlying_cli.is_none());
+        assert!(ompl.adapter_install_commands.is_empty());
+        assert!(ompl.adapter_install_instructions_url.is_empty());
+        assert!(ompl.adapter_install_hint.is_empty());
+        assert!(ompl.model_env_var.is_none());
+        assert!(ompl.provider_env_var.is_none());
+        assert!(ompl.thinking_env_var.is_none());
+        assert!(ompl.max_tokens_env_var.is_none());
+        assert!(ompl.context_limit_env_var.is_none());
+        assert!(ompl.default_env.is_empty());
+        assert!(ompl.required_normalized_fields.is_empty());
+        assert!(ompl.login_hint.is_none());
+        assert!(ompl.auth_probe_args.is_none());
+        assert!(!ompl.avatar_url.is_empty());
+    }
+
+    #[test]
     fn vendor_metadata_distinguishes_cli_and_adapter_guidance() {
         let goose = known_acp_runtime_exact("goose").unwrap();
         assert_eq!(
