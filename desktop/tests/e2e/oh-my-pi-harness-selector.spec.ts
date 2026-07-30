@@ -108,6 +108,17 @@ async function openEditDialog(page: Page) {
   });
 }
 
+async function openAgentRuntimeSettings(page: Page) {
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-settings").click();
+  await page.getByTestId("profile-popover-settings").click();
+  await expect(page.getByTestId("settings-view")).toBeVisible();
+  await page.getByTestId("settings-nav-agents").click();
+  await expect(page.getByTestId("settings-agent-runtimes")).toBeVisible({
+    timeout: 10_000,
+  });
+}
+
 async function pickDropdownOption(page: Page, triggerId: string, name: string) {
   await page.locator(`#${triggerId}`).click();
   await page.getByRole("menuitemradio", { name }).click();
@@ -115,6 +126,23 @@ async function pickDropdownOption(page: Page, triggerId: string, name: string) {
 
 function bridgeConfig(mock: Record<string, unknown>) {
   return mock as Parameters<typeof installMockBridge>[1];
+}
+
+async function invokeMockCommand<T>(
+  page: Page,
+  command: string,
+  payload?: unknown,
+) {
+  return page.evaluate(
+    async ({ command, payload }) => {
+      const invoke = window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+      if (!invoke) {
+        throw new Error("Mock command invoker is not installed");
+      }
+      return (await invoke(command, payload)) as T;
+    },
+    { command, payload },
+  );
 }
 
 test.describe("Oh My Pi harness selector", () => {
@@ -146,7 +174,17 @@ test.describe("Oh My Pi harness selector", () => {
 
     await expect(page.locator("#persona-runtime")).toHaveText("Oh My Pi");
     await expect(page.locator("#persona-llm-provider")).toHaveCount(0);
-    await expect(page.locator("#persona-display-name")).toBeVisible();
+    await page.locator("#persona-model").click();
+    await page.getByRole("button", { name: "Custom model..." }).click();
+    await page.locator("#persona-custom-model").fill("ompl-default");
+    await page.locator("#persona-display-name").fill("Oh My Pi Scratch");
+    await expect(page.getByTestId("persona-dialog-submit")).toBeEnabled();
+    await expect(
+      page.getByText("Visit Settings > Agents to set it up."),
+    ).toHaveCount(0);
+    await expect(
+      page.getByTestId("persona-advanced-required-badge"),
+    ).toHaveCount(0);
     await captureDialog(page, "persona-dialog", "create-oh-my-pi-selected");
   });
 
@@ -182,6 +220,26 @@ test.describe("Oh My Pi harness selector", () => {
       "Goose (default)",
     );
     await captureDialog(page, "persona-dialog", "create-unavailable-guidance");
+
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByTestId("persona-dialog")).not.toBeVisible();
+    await openAgentRuntimeSettings(page);
+    const runtimeCard = page.getByTestId("doctor-runtime-ompl");
+    await expect(runtimeCard).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.getByTestId("doctor-runtime-guidance-ompl"),
+    ).toContainText("Install Oh My Pi with the official installer.");
+    const setupGuide = runtimeCard.getByRole("button", {
+      name: "CLI setup guide",
+    });
+    await expect(setupGuide).toBeVisible();
+    await invokeMockCommand(page, "clear_e2e_opened_external_urls");
+    await setupGuide.click();
+    await expect
+      .poll(() =>
+        invokeMockCommand<string[]>(page, "get_e2e_opened_external_urls"),
+      )
+      .toContain("https://ohmypi.example/install");
   });
 
   test("opens an Oh My Pi seeded agent with runtime and arguments resolved", async ({
@@ -241,6 +299,17 @@ test.describe("Oh My Pi harness selector", () => {
     await expect(page.locator("#edit-agent-runtime")).toHaveText("Oh My Pi");
     await page.getByTestId("edit-agent-dialog-submit").click();
     await expect(page.getByTestId("edit-agent-dialog")).not.toBeVisible();
+
+    const savedAgent = (
+      await invokeMockCommand<
+        Array<{ pubkey: string; agent_command: string; agent_args: string[] }>
+      >(page, "list_managed_agents")
+    ).find((agent) => agent.pubkey === AGENT_PUBKEY);
+    expect(savedAgent).toMatchObject({
+      agent_command: "ompl",
+      agent_args: ["acp"],
+    });
+    expect(savedAgent?.agent_command).not.toBe("omp");
 
     await page.getByTestId("user-profile-edit-agent").click();
     await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
