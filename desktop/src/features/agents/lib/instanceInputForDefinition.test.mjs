@@ -153,6 +153,25 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.deepEqual(input.backend, { type: "local" });
 });
 
+test("Oh My Pi create input preserves resolved command and default args", async () => {
+  const omplRuntime = {
+    ...gooseRuntime,
+    id: "ompl",
+    label: "Oh My Pi",
+    command: "/Users/example/.local/bin/ompl",
+    defaultArgs: ["acp"],
+    mcpCommand: null,
+  };
+
+  const input = await buildInstanceInputForDefinition(
+    persona({ runtime: "ompl" }),
+    omplRuntime,
+  );
+
+  assert.equal(input.agentCommand, "/Users/example/.local/bin/ompl");
+  assert.deepEqual(input.agentArgs, ["acp"]);
+});
+
 test("no backend intent is byte-identical to the pre-intent mapping", async () => {
   // The 3 pre-B5 call sites (useManagedAgentActions, usePersonaActions,
   // UserProfilePanel) pass no intent; their output must not move.
