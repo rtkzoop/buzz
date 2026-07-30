@@ -1,8 +1,8 @@
 # Oh My Pi Harness Selector Code Review
 
-**Date:** 2026-07-30  
-**Review range:** `e1ed72c6..fc3b4694`  
-**Reviewer model:** gpt-5.5  
+**Date:** 2026-07-30
+**Review range:** `e1ed72c6..fc3b4694`
+**Reviewer model:** gpt-5.5
 **Verdict:** Clean after two correction rounds
 
 ## Findings resolved
