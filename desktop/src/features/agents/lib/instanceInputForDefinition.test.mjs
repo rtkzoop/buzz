@@ -157,7 +157,7 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.deepEqual(input.backend, { type: "local" });
 });
 
-test("Oh My Pi create input preserves resolved command and default args", async () => {
+test("Oh My Pi create input preserves the resolved command", async () => {
   const omplRuntime = {
     ...gooseRuntime,
     id: "ompl",
@@ -173,7 +173,8 @@ test("Oh My Pi create input preserves resolved command and default args", async 
   );
 
   assert.equal(input.agentCommand, "/Users/example/.local/bin/ompl");
-  assert.deepEqual(input.agentArgs, ["acp"]);
+  // B-5: args are resolved live from the definition at spawn, never frozen here.
+  assert.deepEqual(input.agentArgs, []);
 });
 
 test("no backend intent is byte-identical to the pre-intent mapping", async () => {

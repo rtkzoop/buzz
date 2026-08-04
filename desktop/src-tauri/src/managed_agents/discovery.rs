@@ -208,6 +208,7 @@ const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         thinking_env_var: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
+        max_rounds_env_var: None,
         required_normalized_fields: &[],
         login_hint: None,
         auth_probe_args: None,
