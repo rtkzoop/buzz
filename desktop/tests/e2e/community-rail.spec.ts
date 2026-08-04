@@ -51,6 +51,15 @@ test.describe("community rail", () => {
 
     const rail = page.getByTestId("community-rail");
     await expect(rail).toBeVisible();
+    await expect(page.getByTestId("app-sidebar-layer")).toHaveCSS(
+      "z-index",
+      "10",
+    );
+    await expect(page.getByTestId("app-sidebar-layer")).toHaveCSS(
+      "overflow",
+      "visible",
+    );
+    await expect(rail).toHaveCSS("z-index", "0");
 
     const buttonA = page.getByTestId(`community-rail-button-${COMMUNITY_A.id}`);
     const buttonB = page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`);
@@ -145,6 +154,7 @@ test.describe("community rail", () => {
     await expect(page.getByTestId("community-invite-email-field")).toHaveCount(
       0,
     );
+    await expect(page.getByTestId("member-pubkey-input")).toBeVisible();
     await expect(page.getByTestId("copy-invite-link")).toBeVisible();
   });
 
@@ -182,6 +192,7 @@ test.describe("community rail", () => {
     await installMockBridge(
       page,
       {
+        relayMembershipEoseDelayMs: 30_000,
         relayRequiresMembership: true,
         relayRole: "admin",
       },
@@ -215,7 +226,7 @@ test.describe("community rail", () => {
     ).not.toBeFocused();
     await expect(
       menu.getByRole("menuitem", { name: "Invite to community" }),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: 1_000 });
     await expect(
       menu.getByRole("menuitem", { name: "Community settings" }),
     ).toBeVisible();
@@ -446,14 +457,7 @@ test.describe("community rail", () => {
   test("does not repair a remembered channel until live validation succeeds", async ({
     page,
   }) => {
-    await installMockBridge(
-      page,
-      {
-        channelsReadDelayMs: 300,
-        channelsReadErrors: [null, "temporary channel read failure"],
-      },
-      { skipCommunitySeed: true },
-    );
+    await installMockBridge(page, undefined, { skipCommunitySeed: true });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
     await page.addInitScript((communityId) => {
       window.localStorage.setItem(
@@ -472,6 +476,31 @@ test.describe("community rail", () => {
         ),
       )
       .not.toBeNull();
+    expect(
+      await page.evaluate(async () => {
+        const testWindow = window as Window & {
+          __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
+          __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
+          __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+            command: string,
+          ) => Promise<unknown>;
+        };
+        const deferNext = testWindow.__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__;
+        const release = testWindow.__BUZZ_E2E_RELEASE_CHANNELS_READ__;
+        const invoke = testWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+        if (!deferNext || !release || !invoke) {
+          throw new Error("missing channel-read latch seam");
+        }
+        deferNext();
+        const released = release();
+        await invoke("get_channels");
+        return {
+          released,
+          pending: testWindow.__BUZZ_E2E_CHANNELS_READ_PENDING__,
+        };
+      }),
+    ).toEqual({ released: 0, pending: 0 });
     await page.evaluate(() => {
       const source = window.localStorage.getItem(
         "buzz-channels.v1:ws://localhost:3000",
@@ -486,20 +515,88 @@ test.describe("community rail", () => {
         JSON.stringify(snapshot),
       );
     });
-
+    await page.evaluate(() => {
+      const config = (
+        window as Window & {
+          __BUZZ_E2E__?: {
+            mock?: {
+              channelsReadError?: string;
+              channelsReadErrors?: (string | null)[];
+            };
+          };
+        }
+      ).__BUZZ_E2E__;
+      if (!config) throw new Error("missing E2E config");
+      config.mock = {
+        ...config.mock,
+        channelsReadError: "temporary channel read failure",
+        channelsReadErrors: ["temporary channel read failure"],
+      };
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => window.__BUZZ_E2E__?.mock?.channelsReadErrors?.length ?? 0,
+        ),
+      )
+      .toBe(1);
+    await page.evaluate(() => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
+        __BUZZ_E2E_INVALIDATE_CHANNELS__?: () => Promise<void>;
+      };
+      const deferNextChannelsRead =
+        testWindow.__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__;
+      const invalidateChannels = testWindow.__BUZZ_E2E_INVALIDATE_CHANNELS__;
+      if (!deferNextChannelsRead) {
+        throw new Error("missing channel-read defer seam");
+      }
+      if (!invalidateChannels) {
+        throw new Error("missing channel invalidation seam");
+      }
+      // Arm and trigger in one browser task so unrelated callbacks cannot
+      // claim the one-shot before the validation read starts.
+      deferNextChannelsRead();
+      void invalidateChannels();
+    });
+    await page.waitForFunction(
+      () =>
+        (
+          window as Window & {
+            __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+          }
+        ).__BUZZ_E2E_CHANNELS_READ_PENDING__ === 1,
+    );
+    expect(
+      await page.evaluate(async () => {
+        const invoke = (
+          window as Window & {
+            __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+              command: string,
+            ) => Promise<unknown>;
+          }
+        ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+        if (!invoke) throw new Error("missing mock command seam");
+        try {
+          await invoke("get_channels");
+          return null;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      }),
+    ).toBe("temporary channel read failure");
+    expect(
+      await page.evaluate(
+        () =>
+          (
+            window as Window & {
+              __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+            }
+          ).__BUZZ_E2E_CHANNELS_READ_PENDING__,
+      ),
+    ).toBe(1);
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-    await expect(page).toHaveURL(/#\/channels\/general$/);
-    await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          return raw ? JSON.parse(raw)[communityId] : null;
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "channel", channelId: "general" });
-    await page.waitForTimeout(400);
+    await expect(page).not.toHaveURL(/#\/channels\/general$/);
     await expect
       .poll(() =>
         page.evaluate((communityId) => {
@@ -511,7 +608,45 @@ test.describe("community rail", () => {
       )
       .toEqual({ kind: "channel", channelId: "general" });
 
-    await expect(page.getByTestId("channel-general")).toBeVisible();
+    const released = await page.evaluate(
+      () =>
+        (
+          window as Window & {
+            __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
+          }
+        ).__BUZZ_E2E_RELEASE_CHANNELS_READ__?.() ?? 0,
+    );
+    expect(released).toBe(1);
+    expect(
+      await page.evaluate(async () => {
+        const testWindow = window as Window & {
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+            command: string,
+          ) => Promise<unknown>;
+          __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+        };
+        const invoke = testWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+        if (!invoke) throw new Error("missing mock command seam");
+        let message: string | null = null;
+        try {
+          await invoke("get_channels");
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        return {
+          message,
+          pending: testWindow.__BUZZ_E2E_CHANNELS_READ_PENDING__,
+        };
+      }),
+    ).toEqual({ message: "temporary channel read failure", pending: 0 });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => window.__BUZZ_E2E__?.mock?.channelsReadErrors?.length ?? 0,
+        ),
+      )
+      .toBe(0);
+
     await expect
       .poll(() =>
         page.evaluate((communityId) => {
@@ -522,6 +657,32 @@ test.describe("community rail", () => {
         }, COMMUNITY_B.id),
       )
       .toEqual({ kind: "channel", channelId: "general" });
+    await page.evaluate(async () => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: {
+          mock?: { channelsReadError?: string };
+        };
+        __BUZZ_E2E_INVALIDATE_CHANNELS__?: () => Promise<void>;
+      };
+      const config = testWindow.__BUZZ_E2E__;
+      const invalidateChannels = testWindow.__BUZZ_E2E_INVALIDATE_CHANNELS__;
+      if (!config?.mock) throw new Error("missing E2E mock config");
+      if (!invalidateChannels) {
+        throw new Error("missing channel invalidation seam");
+      }
+      config.mock.channelsReadError = undefined;
+      await invalidateChannels();
+    });
+    await expect
+      .poll(() =>
+        page.evaluate((communityId) => {
+          const raw = window.localStorage.getItem(
+            "buzz-community-destinations",
+          );
+          return raw ? JSON.parse(raw)[communityId] : null;
+        }, COMMUNITY_B.id),
+      )
+      .toEqual({ kind: "home" });
   });
 
   test("does not restore a remembered destination on cold boot", async ({
@@ -658,9 +819,46 @@ test.describe("community rail", () => {
       `community-rail-button-${COMMUNITY_A.id}`,
     );
     await expect(firstButton).toBeVisible();
-    const box = await firstButton.boundingBox();
-    expect(box).not.toBeNull();
-    expect(box?.y ?? 0).toBeGreaterThanOrEqual(32);
+    const buttonBox = await firstButton.boundingBox();
+    const railBox = await page.getByTestId("community-rail").boundingBox();
+    const searchBox = await page.getByTestId("open-search").boundingBox();
+    const appSurfaceBox = await page
+      .locator(".buzz-huddle-app-surface")
+      .boundingBox();
+    const contentBox = await page
+      .locator("[data-buzz-content-surface]")
+      .first()
+      .boundingBox();
+    expect(buttonBox).not.toBeNull();
+    expect(railBox).not.toBeNull();
+    expect(searchBox).not.toBeNull();
+    expect(appSurfaceBox).not.toBeNull();
+    expect(contentBox).not.toBeNull();
+    expect(buttonBox?.y ?? 0).toBeGreaterThanOrEqual(32);
+    expect(
+      Math.abs((buttonBox?.y ?? 0) - (contentBox?.y ?? 0) - 6),
+    ).toBeLessThan(0.5);
+    expect(Math.abs((railBox?.y ?? 0) - (appSurfaceBox?.y ?? 0))).toBeLessThan(
+      0.5,
+    );
+    expect(
+      Math.abs(
+        (railBox?.y ?? 0) +
+          (railBox?.height ?? 0) -
+          ((appSurfaceBox?.y ?? 0) + (appSurfaceBox?.height ?? 0)),
+      ),
+    ).toBeLessThan(0.5);
+
+    const leftInset = (buttonBox?.x ?? 0) - (railBox?.x ?? 0);
+    const rightInset =
+      (railBox?.x ?? 0) +
+      (railBox?.width ?? 0) -
+      ((buttonBox?.x ?? 0) + (buttonBox?.width ?? 0));
+    expect(Math.abs(leftInset - 10)).toBeLessThan(0.5);
+    expect(Math.abs(leftInset - rightInset)).toBeLessThan(0.5);
+    const visibleRightGap =
+      (searchBox?.x ?? 0) - ((buttonBox?.x ?? 0) + (buttonBox?.width ?? 0));
+    expect(Math.abs(leftInset - visibleRightGap)).toBeLessThan(0.5);
 
     // With the rail visible, the top-chrome controls (sidebar toggle, back/
     // forward) sit just past the traffic lights near the rail edge — not

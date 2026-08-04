@@ -3,6 +3,10 @@ import {
   activateRateLimit,
   parseRateLimitHint,
 } from "@/shared/api/relayRateLimitGate";
+import {
+  fromRawInstallRuntimeResult,
+  type RawInstallRuntimeResult,
+} from "@/shared/api/installTypes";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
@@ -114,10 +118,14 @@ type RawRelayAgent = {
   respond_to?: RelayAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
+
+import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
 export type RawManagedAgent = {
   pubkey: string;
   name: string;
   persona_id: string | null;
+  // Optional: pre-feature fixtures may omit it. The record's harness/runtime id.
+  runtime?: string | null;
   team_id?: string | null;
   relay_url: string;
   acp_command: string;
@@ -137,6 +145,7 @@ export type RawManagedAgent = {
   persona_out_of_date: boolean;
   persona_orphaned: boolean;
   needs_restart: boolean;
+  restart_diff?: RawRestartDiffEntry[];
   env_vars?: Record<string, string>;
   status: ManagedAgent["status"];
   pid: number | null;
@@ -152,8 +161,7 @@ export type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
-  // Optional: pre-feature mock fixtures may omit these. Mapped to
-  // `"owner-only"` / `[]` in `fromRawManagedAgent`.
+  // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
@@ -182,6 +190,9 @@ export type RawAcpRuntimeCatalogEntry = {
   model_env_var?: string | null;
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
+  max_tokens_env_var?: string | null;
+  context_limit_env_var?: string | null;
+  max_rounds_env_var?: string | null;
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
@@ -192,24 +203,15 @@ export type RawAcpRuntimeCatalogEntry = {
   /** Tagged union with snake_case status values — same shape as `AuthStatus`. */
   auth_status: AuthStatus;
   login_hint?: string;
+  source: "builtin" | "preset" | "custom";
+  /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
+  definition_env?: Record<string, string>;
 };
 
-export type RawInstallStepResult = {
-  step: string;
-  command: string;
-  success: boolean;
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-  hint?: string;
-};
-
-export type RawInstallRuntimeResult = {
-  success: boolean;
-  steps: RawInstallStepResult[];
-  restarted_count: number;
-  failed_restart_count: number;
-};
+export type {
+  RawInstallRuntimeResult,
+  RawInstallStepResult,
+} from "./installTypes";
 
 type RawGitBashPrerequisite = {
   available: boolean;
@@ -461,6 +463,9 @@ export async function searchMessages(
     q: input.q,
     limit: input.limit,
     channelId: input.channelId,
+    authors: input.authors,
+    since: input.since,
+    until: input.until,
   });
 
   return {
@@ -593,11 +598,11 @@ export async function uploadMedia(
     isTemp,
   });
 }
-
-export async function pickAndUploadMedia(): Promise<BlobDescriptor[]> {
-  return invokeTauri<BlobDescriptor[]>("pick_and_upload_media", {});
+export async function pickAndUploadMedia(
+  progressId?: string,
+): Promise<BlobDescriptor[]> {
+  return invokeTauri<BlobDescriptor[]>("pick_and_upload_media", { progressId });
 }
-
 export async function uploadMediaBytes(
   data: number[],
   filename?: string,
@@ -688,6 +693,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     pubkey: agent.pubkey,
     name: agent.name,
     personaId: agent.persona_id,
+    runtime: agent.runtime ?? null,
     teamId: agent.team_id ?? null,
     relayUrl: agent.relay_url,
     acpCommand: agent.acp_command,
@@ -703,11 +709,11 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
     modelSource: agent.model_source ?? null,
-    // Fallbacks for pre-feature mocks/fixtures. Real records always carry them.
     provider: agent.provider ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,
     personaOrphaned: agent.persona_orphaned ?? false,
     needsRestart: agent.needs_restart ?? false,
+    restartDiff: agent.restart_diff ?? [],
     envVars: agent.env_vars ?? {},
     status: agent.status,
     pid: agent.pid,
@@ -723,14 +729,12 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     autoRestartOnConfigChange: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend,
     backendAgentId: agent.backend_agent_id,
-    // Fallbacks for pre-feature mocks/fixtures that don't carry these fields.
-    // Real agent records always include them (defaulted server-side).
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
   };
 }
 
-function fromRawAcpRuntimeCatalogEntry(
+export function fromRawAcpRuntimeCatalogEntry(
   entry: RawAcpRuntimeCatalogEntry,
 ): AcpRuntimeCatalogEntry {
   return {
@@ -745,6 +749,9 @@ function fromRawAcpRuntimeCatalogEntry(
     modelEnvVar: entry.model_env_var ?? null,
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
+    maxTokensEnvVar: entry.max_tokens_env_var ?? null,
+    contextLimitEnvVar: entry.context_limit_env_var ?? null,
+    maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
     installHint: entry.install_hint,
     installInstructionsUrl: entry.install_instructions_url,
     canAutoInstall: entry.can_auto_install,
@@ -753,25 +760,10 @@ function fromRawAcpRuntimeCatalogEntry(
     nodeRequired: entry.node_required,
     authStatus: entry.auth_status,
     loginHint: entry.login_hint ?? null,
-  };
-}
-
-function fromRawInstallRuntimeResult(
-  raw: RawInstallRuntimeResult,
-): InstallRuntimeResult {
-  return {
-    success: raw.success,
-    steps: raw.steps.map((step) => ({
-      step: step.step,
-      command: step.command,
-      success: step.success,
-      stdout: step.stdout,
-      stderr: step.stderr,
-      exitCode: step.exit_code,
-      hint: step.hint,
-    })),
-    restartedCount: raw.restarted_count,
-    failedRestartCount: raw.failed_restart_count,
+    source: entry.source,
+    // Map definition_env (snake_case from Rust) to definitionEnv (camelCase).
+    // Absent when empty (Rust serialization skips empty BTreeMap) — default to {}.
+    definitionEnv: entry.definition_env ?? {},
   };
 }
 
@@ -934,6 +926,45 @@ export async function discoverAcpRuntimes(): Promise<AcpRuntimeCatalogEntry[]> {
   ).map(fromRawAcpRuntimeCatalogEntry);
 }
 
+/** Input shape for creating or updating a custom harness. */
+export type HarnessDefinitionInput = {
+  id: string;
+  label: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  installInstructionsUrl?: string;
+  installHint?: string;
+};
+
+/** Save (create or overwrite) a custom harness definition. Returns the catalog entry. */
+export async function saveCustomHarness(
+  definition: HarnessDefinitionInput,
+  originalId?: string,
+): Promise<AcpRuntimeCatalogEntry> {
+  const raw = await invokeTauri<RawAcpRuntimeCatalogEntry>(
+    "save_custom_harness",
+    {
+      definition: {
+        id: definition.id,
+        label: definition.label,
+        command: definition.command,
+        args: definition.args ?? [],
+        env: definition.env ?? {},
+        installInstructionsUrl: definition.installInstructionsUrl ?? "",
+        installHint: definition.installHint ?? "",
+      },
+      originalId: originalId ?? null,
+    },
+  );
+  return fromRawAcpRuntimeCatalogEntry(raw);
+}
+
+/** Delete a custom harness definition by id. No-op if already gone. */
+export async function deleteCustomHarness(id: string): Promise<void> {
+  await invokeTauri<void>("delete_custom_harness", { id });
+}
+
 export async function installAcpRuntime(
   runtimeId: string,
 ): Promise<InstallRuntimeResult> {
@@ -996,9 +1027,8 @@ export type RuntimeFileConfigSubset = {
 };
 
 /**
- * Get the file-layer config for a runtime so dialogs can show
- * "Set in goose config" instead of surfacing a false required-field marker.
- * Returns `null` when the runtime has no config file or it cannot be parsed.
+ * Get the file-layer config for a runtime so dialogs can show "Set in goose config" instead of
+ * surfacing a false required-field marker. Returns `null` when unavailable or unparseable.
  */
 export async function getRuntimeFileConfig(
   runtimeId: string,
@@ -1012,13 +1042,9 @@ export async function getRuntimeFileConfig(
 }
 
 /**
- * Return the key names of all non-empty baked build env vars.
- *
- * Internal (Block) builds bake provider credentials into the binary at compile
- * time. This returns the *key names only* — never the values — so dialogs can
- * treat them as satisfied without exposing secrets to the frontend.
- *
- * OSS builds return an empty array (no baked env).
+ * Return the key names of all non-empty baked build env vars. Internal (Block) builds bake
+ * provider credentials into the binary at compile time; this returns *key names only* (never
+ * values) so dialogs treat them as satisfied without exposing secrets. OSS builds return [].
  */
 export async function getBakedBuildEnvKeys(): Promise<string[]> {
   return invokeTauri<string[]>("get_baked_build_env_keys");

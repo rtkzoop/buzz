@@ -260,11 +260,18 @@ export function UserProfilePopover({
   const selfProfileQuery = useProfileQuery(open && showProfileActions);
   const isCurrentUserOwner = ownsAuthorAgent(profile, currentPubkey);
   const viewerIsOwner = isCurrentUserOwner || isOwner === true;
+  const showHuddleAction =
+    showHumanProfileActions ||
+    (showProfileActions &&
+      isBotProfile &&
+      viewerIsOwner &&
+      !isAgentClassificationPending);
   const showMessageAction =
     showProfileActions &&
     !isAgentClassificationPending &&
     (!isBotProfile || viewerIsOwner);
-  const showAnyProfileActions = showHumanProfileActions || showMessageAction;
+  const showAnyProfileActions =
+    showHumanProfileActions || showMessageAction || showHuddleAction;
   const canViewActivity =
     isBotProfile && viewerIsOwner && canOpenAgentActivity(pubkey);
   const presenceStatus = presenceQuery.data?.[pubkey.toLowerCase()];
@@ -356,7 +363,7 @@ export function UserProfilePopover({
   const handleHuddle = React.useCallback(async () => {
     if (
       !showProfileActions ||
-      !showHumanProfileActions ||
+      !showHuddleAction ||
       pendingAction !== null ||
       isStartingHuddle
     ) {
@@ -369,7 +376,7 @@ export function UserProfilePopover({
     try {
       const dm = await openDmMutation.mutateAsync({ pubkeys: [pubkey] });
       await goChannel(dm.id);
-      await startHuddle(dm.id, []);
+      await startHuddle(dm.id, isBotProfile ? [pubkey] : []);
       await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
       if (isMountedRef.current) {
         setOpen(false);
@@ -389,7 +396,8 @@ export function UserProfilePopover({
     pendingAction,
     pubkey,
     queryClient,
-    showHumanProfileActions,
+    isBotProfile,
+    showHuddleAction,
     showProfileActions,
     startHuddle,
   ]);
@@ -585,6 +593,11 @@ export function UserProfilePopover({
         data-testid="user-profile-popover"
         onMouseEnter={handleContentMouseEnter}
         onMouseLeave={handleMouseLeave}
+        // This is a hover card: moving focus into its first button on open
+        // makes the profile header look keyboard-selected before the user has
+        // interacted with it. Keep focus on the trigger; Tab still enters the
+        // card and shows its normal focus treatment when needed.
+        onOpenAutoFocus={(event) => event.preventDefault()}
         side="top"
         sideOffset={8}
       >
@@ -722,7 +735,7 @@ export function UserProfilePopover({
                       Message
                     </Button>
                   ) : null}
-                  {showHumanProfileActions ? (
+                  {showHuddleAction ? (
                     <Button
                       className="min-w-0 flex-1"
                       data-testid={`user-profile-popover-huddle-${pubkey}`}

@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { isMacPlatform } from "@/shared/lib/platform";
 
 import { relayClient } from "@/shared/api/relayClient";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
@@ -8,6 +10,7 @@ import {
   getDefaultRelayUrl,
 } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
+import { clearTrayAgentActivity } from "@/shared/api/trayMenu";
 import { getOverrides } from "@/shared/features";
 import { resetMediaCaches } from "@/shared/lib/mediaUrl";
 import { clearSearchHitEventCache } from "@/app/navigation/searchHitEventCache";
@@ -16,6 +19,7 @@ import {
   initDraftStore,
 } from "@/features/messages/lib/useDrafts";
 import { resetRenderScopedReactionHydration } from "@/features/messages/lib/renderScopedReactions";
+import { resetBackgroundMediaUploads } from "@/features/messages/lib/backgroundMediaUploadStore";
 import {
   resetActiveAgentTurnsStore,
   saveActiveAgentTurnsForCommunity,
@@ -53,6 +57,9 @@ function resetCommunityState({
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
+  if (isTauri() && isMacPlatform()) {
+    void clearTrayAgentActivity();
+  }
   if (resetAvatarState) {
     resetAvatarProfileSync();
     resetAvatarPresentations();
@@ -61,6 +68,7 @@ function resetCommunityState({
   resetMediaCaches();
   resetVideoPlayerState();
   resetRenderScopedReactionHydration();
+  resetBackgroundMediaUploads();
   clearSearchHitEventCache();
   clearMarkdownNodeCache();
 }

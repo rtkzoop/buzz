@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'directional_transition_scope.dart';
 import 'frosted_app_bar.dart';
 
 /// A convenience [Scaffold] that overlays a [FrostedAppBar] on top of its body.
@@ -21,20 +22,39 @@ class FrostedScaffold extends StatelessWidget {
   /// Whether the body should resize when the on-screen keyboard appears.
   final bool? resizeToAvoidBottomInset;
 
+  /// Optional scaffold background, useful when a parent supplies a shared
+  /// surface behind this page.
+  final Color? backgroundColor;
+
   const FrostedScaffold({
     super.key,
     required this.appBar,
     required this.body,
     this.floatingActionButton,
     this.resizeToAvoidBottomInset,
+    this.backgroundColor,
   });
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: backgroundColor,
       resizeToAvoidBottomInset: resizeToAvoidBottomInset,
       floatingActionButton: floatingActionButton,
-      body: Stack(children: [body, appBar]),
+      body: Stack(
+        children: [
+          DirectionalTransitionMotion(
+            transformKey: const ValueKey(
+              'frosted-scaffold-body-transition-transform',
+            ),
+            opacityKey: const ValueKey(
+              'frosted-scaffold-body-transition-opacity',
+            ),
+            child: body,
+          ),
+          appBar,
+        ],
+      ),
     );
   }
 }

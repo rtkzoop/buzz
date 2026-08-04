@@ -1,20 +1,25 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' show pi;
+import 'dart:math' show max, min, pi;
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:flutter/physics.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/auth/auth.dart';
+import '../../shared/community/community_icon_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
+import '../../shared/widgets/anchored_popover_menu.dart';
+import '../../shared/widgets/buzz_loading_indicator.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
+import '../../shared/widgets/skeleton.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import '../../shared/custom_emoji/custom_emoji_provider.dart';
 import '../../shared/custom_emoji/custom_emoji_render.dart';
@@ -25,6 +30,7 @@ import '../profile/user_cache_provider.dart';
 import '../pairing/pairing_page.dart';
 import '../pairing/pairing_provider.dart';
 import 'channel.dart';
+import 'channel_actions_sheet.dart';
 import 'channel_detail_page.dart';
 import 'channel_management_provider.dart';
 import 'dm_channel_labels.dart';
@@ -32,12 +38,14 @@ import 'ephemeral_channel_display.dart';
 import 'channel_mutes/channel_mutes_provider.dart';
 import 'channel_sections/channel_sections_provider.dart';
 import 'channel_sections/channel_sections_storage.dart';
+import 'channel_sort/channel_sort_provider.dart';
+import 'channel_sort/channel_sort_storage.dart';
 import 'channel_stars/channel_stars_provider.dart';
 import 'channels_provider.dart';
-import 'read_state/deferred_read_state_update.dart';
-import 'read_state/read_state_format.dart';
-import 'read_state/read_state_provider.dart';
-import 'read_state/read_state_time.dart';
+import '../../shared/read_state/deferred_read_state_update.dart';
+import '../../shared/read_state/read_state_format.dart';
+import '../../shared/read_state/read_state_provider.dart';
+import '../../shared/read_state/read_state_time.dart';
 import 'unread_badge/observed_unread_event.dart';
 
 part 'channels_page/body.dart';
@@ -45,15 +53,13 @@ part 'channels_page/sections.dart';
 part 'channels_page/channel_tile.dart';
 part 'channels_page/sheets.dart';
 part 'channels_page/badges.dart';
+part 'channels_page/skeleton.dart';
 part 'channels_page/community.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
 
 enum _QuickAction { createChannel, newDm }
 
-/// Height of the [_ConnectionBanner]: vertical padding (Grid.quarter + 2) × 2
-/// plus the ~16px row content (12px spinner / labelSmall text).
-const double _kBannerHeight = 24.0;
 const double _kChannelSectionInset = Grid.gutter;
 const double _kChannelLeadingWidth = 22.0;
 const double _kChannelIconSize = 18.0;
@@ -68,12 +74,17 @@ const double _kChannelLabelInset =
 /// sections while the labels stay on [_kChannelLabelInset].
 const double _kDmAvatarSize = _kChannelIconSize;
 
+const double _kTopSectionAvatarSize = 32.0;
+
 /// The top section's avatars are 32dp circles, which fill their box edge to
 /// edge; the channel rows below lead with an 18dp glyph left-aligned in a 22dp
 /// box at [_kChannelSectionInset]. Edge-aligning the two leaves the circles
 /// looking pushed outward, so the bar is pulled in to sit the avatar's centre
-/// on the channel-icon column (12 + 16 = 28dp against the glyph's ~29dp).
+/// on the channel-icon column (12 + 16 = 28dp against the glyph's ~29dp). Its
+/// label gap is derived separately so both labels land on the same 50dp column.
 const double _kTopSectionInset = Grid.twelve;
+const double _kTopSectionLabelGap =
+    _kChannelLabelInset - _kTopSectionInset - _kTopSectionAvatarSize;
 const Duration _kSectionExpandDuration = Duration(milliseconds: 220);
 const Duration _kSectionCollapseDuration = Duration(milliseconds: 170);
 const Curve _kSectionExpandCurve = Cubic(0.23, 1, 0.32, 1);
@@ -82,9 +93,8 @@ const double _kSectionCollapsedScaleY = 0.98;
 
 class _UnreadChannelState {
   final Set<String> ids;
-  final Map<String, int> counts;
 
-  const _UnreadChannelState({required this.ids, required this.counts});
+  const _UnreadChannelState({required this.ids});
 }
 
 _UnreadChannelState _computeUnreadChannelState({
@@ -93,19 +103,17 @@ _UnreadChannelState _computeUnreadChannelState({
   required ChannelsNotifier channelsNotifier,
 }) {
   if (!readState.isReady) {
-    return const _UnreadChannelState(ids: {}, counts: {});
+    return const _UnreadChannelState(ids: {});
   }
 
   final latestObservedByChannel = channelsNotifier.latestObservedByChannel;
   final observedEventsByChannel =
       channelsNotifier.observedUnreadEventsByChannel;
   final ids = <String>{};
-  final counts = <String, int>{};
 
   for (final channel in channels) {
     if (readState.locallyForcedChannelIds.contains(channel.id)) {
       ids.add(channel.id);
-      counts[channel.id] = 1;
       continue;
     }
 
@@ -131,13 +139,9 @@ _UnreadChannelState _computeUnreadChannelState({
     if (unreadCount == 0) continue;
 
     ids.add(channel.id);
-    counts[channel.id] = countUnreadBadgeObservedEvents(
-      observedEvents,
-      readAtForObservedEvent,
-    );
   }
 
-  return _UnreadChannelState(ids: ids, counts: counts);
+  return _UnreadChannelState(ids: ids);
 }
 
 class ChannelsPage extends HookConsumerWidget {
@@ -201,26 +205,26 @@ class ChannelsPage extends HookConsumerWidget {
       return timer.cancel;
     }, [canSurfaceError]);
 
-    // Match desktop's degraded-state debounce: cached content remains steady
-    // through brief socket flaps, and the banner appears only for a sustained
-    // reconnect.
-    final showConnectionBanner = useState(false);
+    // Keep cached content steady through brief socket flaps. A sustained
+    // reconnect swaps to element-shaped skeletons that match desktop.
+    final showConnectionSkeleton = useState(false);
     final isReconnectingWithContent =
         channels != null &&
         (sessionState.status == SessionStatus.connecting ||
             sessionState.status == SessionStatus.reconnecting);
     useEffect(() {
       if (!isReconnectingWithContent) {
-        showConnectionBanner.value = false;
+        showConnectionSkeleton.value = false;
         return null;
       }
       final timer = Timer(const Duration(seconds: 2), () {
-        showConnectionBanner.value = true;
+        showConnectionSkeleton.value = true;
       });
       return timer.cancel;
     }, [isReconnectingWithContent]);
 
     return FrostedScaffold(
+      backgroundColor: Colors.transparent,
       appBar: FrostedAppBar(
         horizontalInset: _kTopSectionInset,
         // Under a Buzz theme the community + account avatar strip carries the
@@ -228,11 +232,14 @@ class ChannelsPage extends HookConsumerWidget {
         // under every other theme, leaving the default frosted fill.
         gradient: context.appColors.topSectionGradient,
         leading: _CommunityIndicator(
-          onTap: () => showModalBottomSheet<void>(
-            context: context,
-            showDragHandle: true,
-            builder: (_) => const _CommunitySwitcherSheet(),
-          ),
+          onTap: () {
+            ref.invalidate(communityIconProvider);
+            showModalBottomSheet<void>(
+              context: context,
+              showDragHandle: true,
+              builder: (_) => const _CommunitySwitcherSheet(),
+            );
+          },
         ),
         title: const SizedBox.shrink(),
         actions: [
@@ -248,7 +255,7 @@ class ChannelsPage extends HookConsumerWidget {
         channelsAsync: channelsAsync,
         showError: showError.value,
         sessionStatus: sessionState.status,
-        showConnectionBanner: showConnectionBanner.value,
+        showConnectionSkeleton: showConnectionSkeleton.value,
         currentPubkey: currentPubkey,
         onRefresh: () => ref.read(channelsProvider.notifier).refresh(),
         onSelectChannel: openChannel,
