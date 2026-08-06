@@ -659,6 +659,16 @@ dir="/run/buzz-acp-$instance"
 out="$dir/secret.env"
 tmp="$dir/secret.env.tmp"
 
+# `ProtectHome=true` on this unit makes `/root` (and therefore
+# `/root/.config/gcloud`) unreadable. gcloud still wants a config directory
+# for its named-config bookkeeping even when auth is the metadata server, so
+# give it one inside the RuntimeDirectory this unit already owns. Measured:
+# with CLOUDSDK_CONFIG under /run the access succeeds; without it, gcloud dies
+# on Permission denied reading /root/.config/gcloud/active_config before it
+# ever reaches Secret Manager.
+export CLOUDSDK_CONFIG="$dir/gcloud"
+mkdir -p "$CLOUDSDK_CONFIG"
+
 umask 077
 trap 'rm -f "$tmp"' EXIT
 
@@ -829,6 +839,10 @@ mod tests {
         assert!(
             script.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             "a script run by systemd inherits systemd's environment, not a shell's"
+        );
+        assert!(
+            script.contains("CLOUDSDK_CONFIG="),
+            "ProtectHome blocks /root/.config/gcloud; gcloud needs a writable config dir under RuntimeDirectory"
         );
     }
 
