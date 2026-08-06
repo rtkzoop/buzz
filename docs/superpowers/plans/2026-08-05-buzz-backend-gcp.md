@@ -4383,7 +4383,7 @@ git add -A && git commit -s -m "feat(backend-gcp): capacity warning and durable 
 
 ## Task 9: `remote.rs` — the IAP SSH transport
 
-Resolves review **P1-2**, round 2's **P1-9** (atomic installs), the write half of **P1-4** (each install is fenced on its own target's marker) and the transport half of **P1-8** (the exit codes the deploy lease and the narrowed fence speak), and round 3's **P1-3**: the guard compared `grep -c` against a count, which counts matching input *lines* rather than distinct matched patterns.
+Resolves review **P1-2**, round 2's **P1-9** (atomic installs), the write half of **P1-4** (each install is fenced on its own target's marker) and the transport half of **P1-8** (the exit codes the deploy lease and the narrowed fence speak), round 3's **P1-3** (the guard compared `grep -c` against a count, which counts matching input *lines* rather than distinct matched patterns), and the transport half of round 4's **P1-1**: the marker guard proved provenance, not that the writer still held the lease.
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/remote.rs`
@@ -4393,20 +4393,27 @@ Resolves review **P1-2**, round 2's **P1-9** (atomic installs), the write half o
 - Produces:
   - `remote::Output { stdout: String, stderr: String, code: i32 }` with `ok(&self) -> bool`
   - `remote::Gcloud` — one method, `gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>`, implemented by `Remote`
-  - `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED}: i32` and `remote::MARKER_SCAN_LINES: usize`
+  - `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED}: i32`, `remote::MARKER_SCAN_LINES: usize`, `remote::LEASE_DIR: &str` and `remote::LEASE_FLOCK_WAIT_SECONDS: u64` (the last two `pub(crate)`, read by Task 12's acquire and release)
   - `remote::marker_fn(required: &[String]) -> String` — `pub(crate)`; emits the `marker_ok` shell function Task 13's `removal_script` also calls
+  - `remote::Held` — `pub(crate)`, one method `agent(&self) -> &str`, implemented only by `reconcile::DeployLease`
+  - `remote::lease_paths(agent: &str) -> (String, String)`, `remote::lease_gate(owner: &str, token: &str) -> String`, `remote::under_lease(agent: &str, token: &str, root_script: &str) -> String` and `remote::lease_lost(target: &str) -> String` — all `pub(crate)`; `under_lease` is the single spelling of `sudo -n flock -w W -E 75 <lock> sh -c '<gate><work>'`, and Task 12's `renew_lease_script` is it with an empty body
   - `remote::Remote::new(project: &str, zone: &str, instance: &str) -> Result<Remote, String>` with `token(&self) -> &str`
-  - `Remote::run(&self, script: &str) -> Result<Output, String>`
-  - `Remote::install(&self, file: &RemoteFile) -> Result<(), String>`
-  - `Remote::append(&self, file: &RemoteFile, record: &str) -> Result<(), String>`
+  - `Remote::run(&self, script: &str) -> Result<Output, String>` — unfenced, for the read-only scripts (`observe::look`, the listing, the ownership scan, the startup poll, the lease scripts themselves)
+  - `Remote::run_fenced(&self, lease: &dyn Held, root_script: &str) -> Result<Output, String>` — `pub(crate)`; the mutating counterpart, wrapping a root script in `under_lease`
+  - `Remote::install(&self, file: &RemoteFile, lease: &dyn Held) -> Result<(), String>` — `pub(crate)`
+  - `Remote::append(&self, file: &RemoteFile, record: &str, lease: &dyn Held) -> Result<(), String>` — `pub(crate)`
   - `remote::sq(value: &str) -> String` — POSIX single-quoting, reused by `observe`, `reconcile` and `operator`
-- Consumes: `crate::naming::BINDING_VERSION`, `crate::render::RemoteFile`, `buzz_backend_core::identity::new_generation`.
+- Consumes: `crate::naming::{BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY}`, `crate::render::RemoteFile`, `buzz_backend_core::identity::new_generation`.
 
 **Security rule for this module:** no secret value may ever appear in an argv element. Bodies go on stdin. That is enforced structurally by `install` taking the whole `RemoteFile` and never formatting `body` into a command string, and it is sound because `gcloud compute ssh` execs a real `ssh` that forwards local stdin to the remote command (measured — see Global Constraints).
 
-**Every install is atomic and self-fencing.** Two round-2 findings meet in one script, and neither is safe alone. P1-9: a dropped connection mid-install used to leave a truncated file at the *target* path. P1-4: the fence must refuse any present file whose own header is not this agent's — which would turn every such fragment into a permanent, operator-only jam. Writing to `<path>.<token>.tmp` and `mv`ing into place means the target is never observed half-written, so the fence can be strict without being a trap. The guard sits in the same shell as the write, which is also the narrowest place to put it: an ownership check performed in an earlier round trip is a TOCTOU with a four-round-trip window.
+**Exit codes the remote scripts speak.** Four numeric codes carry refusals back: a refusal is not a transport failure and must not read as one. The caller turns each into a sentence naming the path and the remedy; the script itself stays silent, because it does not know which of six callers is speaking or what the operator is trying to do. Codes are drawn from the `sysexits.h` range, well clear of the 1-2 that `sudo`, `install` and `systemctl` return and of 126/127 for exec failures. Round 4 gave `LOCK_UNAVAILABLE` a second home: it was the acquire's refusal, and it is now also every mutation's, because every mutation proves the lease itself.
 
-**Exit codes the remote scripts speak.** Four numeric codes carry refusals back: a refusal is not a transport failure and must not read as one. The caller turns each into a sentence naming the path and the remedy; the script itself stays silent, because it does not know which of six callers is speaking or what the operator is trying to do. Codes are drawn from the `sysexits.h` range, well clear of the 1-2 that `sudo`, `install` and `systemctl` return and of 126/127 for exec failures.
+**Every install is atomic and self-fencing, and it happens under a proven lease.** Three findings meet in one script, and none is safe alone. Round 2's P1-9: a dropped connection mid-install used to leave a truncated file at the *target* path. Round 2's P1-4: the fence must refuse any present file whose own header is not this agent's — which would turn every such fragment into a permanent, operator-only jam. Writing to `<path>.<token>.tmp` and `mv`ing into place means the target is never observed half-written, so the fence can be strict without being a trap. The guard sits in the same shell as the write, which is also the narrowest place to put it: an ownership check performed in an earlier round trip is a TOCTOU with a four-round-trip window. Round 4's P1-1 adds the third: the marker guard proves *provenance* and nothing else, so a provider whose lease had been legitimately taken over while it stalled could satisfy it and `mv` a stale render over the winner's files. The `mv` therefore runs inside `under_lease`, which takes the agent's `flock`, refuses `LOCK_UNAVAILABLE` unless the owner record still names this process, refreshes it, and only then lets the guard and the rename run — all in one `sh -c`. The record can only be changed under that same `flock`, so no takeover can interleave between the proof and the write.
+
+**Where the `flock` is *not* held: the stdin drain.** The body is staged before the lock is taken. Holding a lock across a read that waits on the network would make a rival's acquire wait for a body transfer rather than for three local file operations, and `LEASE_FLOCK_WAIT_SECONDS` is 5 s precisely because every critical section is local. Staging first also preserves the property that makes the refusals clean: stdin is drained before anything can exit, so a refusal never arrives as a broken pipe. The staged file is `trap`ped away on every exit path, including both refusals.
+
+**Why the lease's shell lives here and its policy lives in `reconcile`.** `LEASE_DIR`, `lease_paths`, `lease_gate` and `under_lease` are in this module because every mutating script this module renders has to carry the proof inside its own shell — that is a transport concern. `DEPLOY_LEASE_SECONDS`, the freshness arithmetic that decides when an abandoned record may be stolen, `acquire_lease`, the release and the `Drop` guard stay in `reconcile`, because they are about deploys. `Held` is the seam: one method, one implementor, and a `&dyn Held` parameter on `install`, `append` and `run_fenced` so a mutating call cannot be written without a lease in hand.
 
 **Why `PATH` is prepended.** The provider is exec'd by a Tauri app inheriting launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. `gcloud` installs to `/opt/homebrew/bin`, `/usr/local/bin`, or `~/.local/bin` — none of which are on that `PATH` — so a bare `Command::new("gcloud")` fails to resolve for a reason that has nothing to do with GCP. The Kubernetes binding already carries this exact fix and names the same cause (`crates/buzz-backend-kubernetes/src/client.rs:12-47`). Two details carry over verbatim because they are the parts that are easy to get wrong: mutating the process's own `PATH` is sound here (one process per operation, done before any child exists, `client.rs:36-40`), and empty entries in the inherited `PATH` are **dropped** rather than propagated, because POSIX resolves an empty entry as the current directory.
 
@@ -4420,6 +4427,11 @@ mod tests {
     use super::*;
     use crate::naming::{header_line, SHARED_SCOPE};
     use std::ffi::OsString;
+
+    /// The 12-lowercase-hex agent whose lease the fenced scripts prove. It is
+    /// only ever interpolated into the two lease paths, so any value the
+    /// naming grammar can produce does.
+    const AGENT: &str = "a1b2c3d4e5f6";
 
     /// The two identity lines a per-agent target must already carry.
     ///
@@ -4444,10 +4456,20 @@ mod tests {
         }
     }
 
+    /// A needle as it appears once a critical section has been `sq`-wrapped
+    /// for `sh -c`: every single quote becomes `'\''`. Asserting on the
+    /// wrapped form is the honest way to check a nested script — the
+    /// alternative is asserting only on fragments that happen to carry no
+    /// quotes, which silently stops covering the interesting ones.
+    fn nested(fragment: &str) -> String {
+        fragment.replace('\'', r"'\''")
+    }
+
     #[test]
     fn the_install_command_never_carries_the_body() {
         let script = install_script(
             &file("/etc/buzz/acp-abc.env", "0600", "SUPER_SENSITIVE=1\n"),
+            AGENT,
             "t0ken",
         );
         assert!(script.contains("/dev/stdin"));
@@ -4465,13 +4487,14 @@ mod tests {
     /// between.
     #[test]
     fn an_install_stages_and_renames_rather_than_writing_in_place() {
-        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        let script =
+            install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), AGENT, "t0ken");
         assert!(
             script.contains(&sq("/etc/buzz/acp-abc.env.t0ken.tmp")),
             "{script}"
         );
         assert!(script.contains("sudo -n install -m 0600 /dev/stdin"), "{script}");
-        assert!(script.contains("sudo -n mv -f"), "{script}");
+        assert!(script.contains(&nested("mv -f")), "{script}");
         let staged = script.find("install -m").expect("the staged write");
         let rename = script.find("mv -f").expect("the rename");
         assert!(
@@ -4489,10 +4512,11 @@ mod tests {
     /// refusal never surfaces as a broken pipe.
     #[test]
     fn an_install_refuses_a_target_carrying_somebody_elses_marker() {
-        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        let script =
+            install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), AGENT, "t0ken");
         for required in marker_lines() {
             assert!(
-                script.contains(&sq(&required)),
+                script.contains(&nested(&sq(&required))),
                 "the guard omits {required:?}"
             );
         }
@@ -4521,7 +4545,8 @@ mod tests {
     /// its own now, and the first miss returns.
     #[test]
     fn a_header_that_repeats_one_marker_line_does_not_satisfy_the_guard() {
-        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        let script =
+            install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), AGENT, "t0ken");
         assert!(
             !script.contains("grep -c"),
             "counting lines instead of patterns is the defect: {script}"
@@ -4533,7 +4558,7 @@ mod tests {
         );
         for line in marker_lines() {
             assert!(
-                script.contains(&format!("grep -Fqx -- {}", sq(&line))),
+                script.contains(&nested(&format!("grep -Fqx -- {}", sq(&line)))),
                 "{line:?} is not asserted on its own: {script}"
             );
         }
@@ -4563,7 +4588,8 @@ mod tests {
     /// that file's own fence — and a *newer* one still is.
     #[test]
     fn the_guard_admits_an_older_binding_version_and_refuses_a_newer_one() {
-        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        let script =
+            install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), AGENT, "t0ken");
         assert!(
             script.contains(&format!("-le {BINDING_VERSION_NUM}")),
             "{script}"
@@ -4576,6 +4602,11 @@ mod tests {
         assert!(script.contains("[!0-9]"), "{script}");
     }
 
+    /// Every privileged step is non-interactive, and there are exactly two of
+    /// them: the staging write outside the lock, and the one `sudo -n flock`
+    /// that elevates the whole critical section. A bare `sudo` on a prompting
+    /// host would consume the piped body as keystrokes and write a truncated
+    /// root-owned unit file.
     #[test]
     fn every_privileged_step_is_non_interactive() {
         let script = install_script(
@@ -4584,26 +4615,87 @@ mod tests {
                 "0644",
                 "",
             ),
+            AGENT,
             "t0ken",
         );
         assert!(script.contains("sudo -n mkdir -p '/etc/systemd/system/buzz-acp@abc.service.d'"));
         assert!(script.contains("sudo -n install"));
-        // A bare `sudo` on a prompting host would consume the piped body as
-        // keystrokes and write a truncated root-owned unit file.
+        assert!(script.contains("sudo -n flock"));
+        for bare in ["sudo mkdir", "sudo install", "sudo flock", "sudo mv"] {
+            assert!(
+                !script.contains(bare),
+                "a privileged step without -n can prompt: {bare}"
+            );
+        }
+        // Inside the wrapper everything is root already, so a nested `sudo`
+        // would be a second thing to get wrong — and on a host whose sudoers
+        // does not let root sudo, a second failure mode for no benefit.
+        let inner = script.find("sh -c '").expect("the critical section");
         assert!(
-            !script.contains("sudo mkdir") && !script.contains("sudo install"),
-            "a privileged step without -n can prompt"
+            !script[inner..].contains("sudo"),
+            "the critical section must not re-elevate: {script}"
         );
     }
 
     #[test]
     fn the_append_script_creates_the_file_once_then_appends_behind_the_same_fence() {
-        let script = append_script(&file("/etc/buzz/acp-abc.trail", "0644", "# managed-by: x\n"));
-        assert!(script.contains("if [ ! -e '/etc/buzz/acp-abc.trail' ]"));
-        assert!(script.contains("sudo -n install -m 0644 /dev/stdin '/etc/buzz/acp-abc.trail'"));
-        assert!(script.contains("sudo -n tee -a '/etc/buzz/acp-abc.trail'"));
+        let script = append_script(
+            &file("/etc/buzz/acp-abc.trail", "0644", "# managed-by: x\n"),
+            AGENT,
+            "t0ken",
+        );
+        assert!(script.contains(&nested("if [ ! -e '/etc/buzz/acp-abc.trail' ]")), "{script}");
+        assert!(
+            script.contains(&nested("install -m 0644 /dev/stdin '/etc/buzz/acp-abc.trail'")),
+            "{script}"
+        );
+        assert!(script.contains(&nested("tee -a '/etc/buzz/acp-abc.trail'")), "{script}");
         // A trail that is not ours must not be appended to either.
         assert!(script.contains(&OWNERSHIP_REFUSED.to_string()), "{script}");
+        // …and neither must one whose lease has moved on.
+        assert!(script.contains(&LOCK_UNAVAILABLE.to_string()), "{script}");
+    }
+
+    /// Round 4's P1-1. The marker guard proves *provenance*; it says nothing
+    /// about whether this process still holds the lease, so a stalled holder
+    /// that had been legitimately overtaken could satisfy it and `mv` a stale
+    /// render over the winner's files. The proof and the mutation now share
+    /// one `flock`, which is the only arrangement a takeover cannot slip
+    /// between: changing the owner record needs the same lock.
+    #[test]
+    fn an_install_proves_the_lease_in_the_same_shell_as_the_rename() {
+        let script =
+            install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), AGENT, "t0ken");
+        let (lock, owner) = lease_paths(AGENT);
+        assert!(script.contains(&sq(&lock)), "no lock is taken: {script}");
+        assert!(
+            script.contains("sudo -n flock -w"),
+            "the critical section is not elevated as one: {script}"
+        );
+        assert!(
+            script.contains(&nested(&sq(&owner))),
+            "the owner record is not read: {script}"
+        );
+        assert!(script.contains(&LOCK_UNAVAILABLE.to_string()), "{script}");
+
+        // Drain, then lock, then prove, then check the marker, then rename.
+        // The drain is outside the lock deliberately: holding it across a read
+        // that waits on the network would block a rival's acquire for as long
+        // as the body takes to arrive.
+        let drained = script.find("/dev/stdin").expect("the staged write");
+        let lock_at = script.find("flock -w").expect("the lock");
+        let gate = script.find("cut -d").expect("the lease proof");
+        let guard = script.find("marker_ok ||").expect("the ownership guard");
+        let rename = script.find("mv -f").expect("the rename");
+        assert!(
+            drained < lock_at && lock_at < gate && gate < guard && guard < rename,
+            "drain, lock, prove the lease, check the marker, rename: {script}"
+        );
+        assert_eq!(
+            script.matches("sh -c '").count(),
+            1,
+            "a second shell is a second chance to lose the lease: {script}"
+        );
     }
 
     /// `gcloud` already selects `StrictHostKeyChecking=yes` against its own
@@ -4774,6 +4866,147 @@ pub fn sq(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+/// The private directory both deploy-lease files live in.
+///
+/// Not `/run/lock` directly. `/run` is the right filesystem — a tmpfs systemd
+/// recreates on every boot, so a lease can never outlive the reboot that made
+/// its holder irrelevant — but `/run/lock` is world-readable and, on several
+/// distributions, group-writable, so a predictable `<agent>.owner` path there
+/// is a record an unprivileged local user can watch and, in the worst case,
+/// pre-create with contents of their choosing. `0700 root:root` puts the
+/// record where exactly the identity that enforces it can read or write it.
+///
+/// The *shape* of a lease lives in this module and its *policy* lives in
+/// `reconcile`, and the split is deliberate: every mutating script this module
+/// renders has to carry the ownership proof inside its own shell, which makes
+/// the proof a transport concern; how long a lease lives, when it is taken and
+/// when an abandoned one may be stolen are questions about deploys, which
+/// makes them the reconciler's.
+pub(crate) const LEASE_DIR: &str = "/run/buzz-backend-gcp";
+
+/// How long to wait for the lease's `flock`. Every critical section under it
+/// is a handful of local file operations — never a network read — so anything
+/// longer means a wedged holder rather than a busy one.
+pub(crate) const LEASE_FLOCK_WAIT_SECONDS: u64 = 5;
+
+/// Where one agent's deploy lease lives: `(lock, owner)`.
+///
+/// `agent` is the 12-lowercase-hex instance name derived from the pubkey
+/// (`naming::Names::instance`) — **not** the GCE instance this `Remote` is
+/// bound to — and the closed grammar it comes from is what makes it safe to
+/// interpolate into a path.
+pub(crate) fn lease_paths(agent: &str) -> (String, String) {
+    (
+        format!("{LEASE_DIR}/{agent}.lock"),
+        format!("{LEASE_DIR}/{agent}.owner"),
+    )
+}
+
+/// Evidence that the caller holds an agent's deploy lease.
+///
+/// One method, and exactly one implementor: `reconcile::DeployLease`, whose
+/// only constructor writes the owner record first. Every mutating entry point
+/// below takes `&dyn Held`, so "this write happens under a lease" is something
+/// the signature enforces rather than something a comment asks for — the same
+/// discipline round 3 applied to the authoritative observation, applied to the
+/// writes. Adding a second implementor is a deliberate act with a compiler
+/// error's worth of friction, which is the point.
+pub(crate) trait Held {
+    /// The 12-lowercase-hex agent whose lease is held.
+    fn agent(&self) -> &str;
+}
+
+/// The first thing inside every mutating shell: prove the owner record still
+/// names this process, then push its expiry out.
+///
+/// This is round 4's P1-1 in four lines. Renewing at phase boundaries proved
+/// only that the lease was ours *at the boundary*; the write that followed
+/// carried no lease check at all, because `marker_fn` proves provenance and
+/// `owner_marker` deliberately carries neither the create-intent nor the
+/// token. A holder that stalled past the TTL could therefore be legitimately
+/// overtaken and still land its `mv` on the winner's files. Here the proof and
+/// the mutation are one shell under one `flock`, and the record can only be
+/// changed under that same `flock`, so no takeover can interleave between
+/// them: either it completes first and this gate refuses, or this shell holds
+/// the lock and the rival's `flock -w` times out.
+///
+/// It refreshes as well as verifies, which is why `DeployLease::renew` no
+/// longer runs at every phase boundary — a window made of fenced mutations
+/// renews itself, and the one stretch that is not (the Secret Manager calls,
+/// which leave the instance entirely) keeps an explicit renewal.
+///
+/// [`LOCK_UNAVAILABLE`] for every failure, because the operator's remedy is
+/// the same in each case: another operation owns this agent right now.
+pub(crate) fn lease_gate(owner: &str, token: &str) -> String {
+    format!(
+        "now=$(date +%s)\n\
+         [ -f {owner} ] || exit {busy}\n\
+         [ \"$(cut -d' ' -f1 {owner})\" = {token} ] || exit {busy}\n\
+         printf '%s %s\\n' {token} \"$now\" > {owner}\n",
+        owner = sq(owner),
+        token = sq(token),
+        busy = LOCK_UNAVAILABLE,
+    )
+}
+
+/// Wrap a **root** script so it runs only while this process still holds
+/// `agent`'s deploy lease — the proof and the mutation in one shell, under one
+/// `flock`.
+///
+/// `sudo -n flock … sh -c` rather than `sudo -n sh -c 'exec 9>…'`: [`LEASE_DIR`]
+/// is `0700 root:root`, so the lock cannot be opened without elevating first,
+/// and `flock`'s command form elevates **once** for the whole critical section
+/// instead of once per command inside it. `-E` makes a lock we could not take
+/// exit [`LOCK_UNAVAILABLE`] rather than the `1` that a hundred other things
+/// also return. This is the single shape every critical section in this
+/// binding uses — acquire, renew, release, each install, the append, the
+/// fenced stop, the start and the removal are the same wrapper with a
+/// different body.
+///
+/// `root_script` carries no `sudo -n` and no `set` line of its own: everything
+/// inside the wrapper is already root, and a second `sudo` there is a second
+/// thing to get wrong. It runs under `/bin/sh` (dash on Debian and Ubuntu
+/// images), so no `pipefail`, no `[[`, no arrays — the outer script keeps
+/// those.
+///
+/// The body is `sq`-wrapped, so every single quote it carries appears as
+/// `'\''` in the emitted script. Tests that match on a quoted needle inside it
+/// have to account for that; the `nested` helper in Tasks 9 and 12 is that
+/// accounting, written down rather than worked around by matching only on
+/// quote-free fragments.
+pub(crate) fn under_lease(agent: &str, token: &str, root_script: &str) -> String {
+    let (lock, owner) = lease_paths(agent);
+    let inner = format!(
+        "set -u\n{gate}{root_script}",
+        gate = lease_gate(&owner, token),
+    );
+    format!(
+        "sudo -n flock -w {wait} -E {busy} {lock} sh -c {inner}\n",
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+        busy = LOCK_UNAVAILABLE,
+        lock = sq(&lock),
+        inner = sq(&inner),
+    )
+}
+
+/// The refusal for a mutation whose lease could not be proven in its own shell.
+///
+/// One sentence for both ways it fails — the record names somebody else, or
+/// the `flock` itself could not be taken within [`LEASE_FLOCK_WAIT_SECONDS`] —
+/// because the outcome is identical (nothing was written) and so is the
+/// remedy. It must not read like [`Remote::not_ours`]: that one tells the
+/// operator to move a file aside, and following that advice when the real
+/// cause is a concurrent deploy is how a healthy artifact gets deleted.
+pub(crate) fn lease_lost(target: &str) -> String {
+    format!(
+        "the deploy lease for {target} was not held at the instant the write \
+         reached the instance: another operation has taken it over, or it \
+         expired while this one was stalled. Nothing was written, and \
+         {target} was left exactly as it was. Re-run once the other operation \
+         finishes."
+    )
+}
+
 /// Compute the new `PATH` value: `gcloud` directories first, inherited entries
 /// after, in order. Pure, so the ordering is testable without mutating the
 /// process environment.
@@ -4873,6 +5106,11 @@ pub(crate) fn marker_fn(required: &[String]) -> String {
 /// which of several operations is speaking; the script knows none of that, and
 /// a generic sentence from the wrong layer is worse than a number.
 ///
+/// No `sudo -n` of its own: this fragment only ever appears inside
+/// [`under_lease`]'s `sudo -n flock … sh -c`, which is already root. One
+/// elevation for the whole critical section is also what lets the lock be
+/// opened at all — [`LEASE_DIR`] is `0700 root:root`.
+///
 /// An empty `required` means unguarded, which `render::plan` never produces —
 /// that invariant is asserted where it is established (Task 7), not defended
 /// again here.
@@ -4882,8 +5120,8 @@ fn marker_guard(path: &str, required: &[String]) -> String {
     }
     format!(
         "{marker_ok}\
-         if sudo -n test -e {path}; then\n\
-         h=$(sudo -n head -n {scan} {path} || true)\n\
+         if test -e {path}; then\n\
+         h=$(head -n {scan} {path} || true)\n\
          marker_ok || exit {refused}\n\
          fi\n",
         marker_ok = marker_fn(required),
@@ -4894,14 +5132,17 @@ fn marker_guard(path: &str, required: &[String]) -> String {
 }
 
 /// The remote script that installs one file: body from stdin, atomically, and
-/// only over a target whose own marker says it is ours.
+/// only over a target whose own marker says it is ours — while this process
+/// still holds the agent's deploy lease.
 ///
-/// Three properties, each load-bearing:
+/// Four properties, each load-bearing:
 ///
-/// * **stdin is drained first.** The body reaches the staging path *before* the
-///   guard can exit, so a refusal cannot close the pipe under a local
-///   `write_all` still in flight and turn a clean refusal into a transport
-///   error.
+/// * **stdin is drained first, and before the lock is taken.** The body
+///   reaches the staging path *before* anything can refuse, so a refusal
+///   cannot close the pipe under a local `write_all` still in flight and turn
+///   a clean refusal into a transport error — and the `flock` is never held
+///   across a read that depends on the network, so a rival's acquire waits on
+///   three local file operations rather than on a body transfer.
 /// * **The target is never observed half-written.** `mv` within one directory
 ///   is a `rename(2)`: the target goes from old bytes to new with nothing in
 ///   between. Without this a dropped connection leaves a truncated file with no
@@ -4910,29 +5151,42 @@ fn marker_guard(path: &str, required: &[String]) -> String {
 /// * **The guard runs in the same shell as the write.** An ownership check
 ///   performed in an earlier round trip is a TOCTOU with a four-round-trip
 ///   window; here it is one `rename`.
+/// * **So does the lease proof.** Round 4's P1-1: the marker guard establishes
+///   *provenance* — this provider, this agent, a binding version we may act on
+///   — and says nothing about whether we still hold the lease, so a stalled
+///   holder whose lease had been taken over could satisfy it and `mv` a stale
+///   render over the winner's files. [`under_lease`] wraps the check-and-mv
+///   pair in one `flock`, and the owner record can only change under that same
+///   `flock`, so a takeover cannot interleave between them.
 ///
 /// The staging path carries the per-process token, so two providers installing
 /// the same shared artifact at the same moment cannot collide on it, and the
-/// `trap` removes it on every exit path including the guard's refusal.
-fn install_script(file: &RemoteFile, token: &str) -> String {
+/// `trap` removes it on every exit path including both refusals.
+fn install_script(file: &RemoteFile, agent: &str, token: &str) -> String {
     let parent = Path::new(&file.path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
     let staged = sq(&format!("{}.{token}.tmp", file.path));
+    let critical = format!(
+        "set -e\n\
+         {guard}\
+         mv -f {staged} {path}\n",
+        guard = marker_guard(&file.path, &file.owner_marker),
+        staged = staged,
+        path = sq(&file.path),
+    );
     format!(
         "set -euo pipefail\n\
          sudo -n mkdir -p {parent}\n\
          trap \"sudo -n rm -f {staged}\" EXIT\n\
          sudo -n install -m {mode} /dev/stdin {staged}\n\
-         {guard}\
-         sudo -n mv -f {staged} {path}\n\
+         {fenced}\
          trap - EXIT\n",
         parent = sq(&parent),
         staged = staged,
         mode = file.mode,
-        guard = marker_guard(&file.path, &file.owner_marker),
-        path = sq(&file.path),
+        fenced = under_lease(agent, token, &critical),
     )
 }
 
@@ -4943,22 +5197,25 @@ fn install_script(file: &RemoteFile, token: &str) -> String {
 /// so passing it in argv is safe. The *record* travels on stdin along with
 /// everything a capacity warning might carry.
 ///
-/// Fenced like an install, but not staged: an append has no half-written-target
-/// failure mode, and the record is a few hundred bytes — well inside a pipe
-/// buffer — so a guard refusal returns long before the local write could block.
-fn append_script(file: &RemoteFile) -> String {
-    format!(
-        "set -euo pipefail\n\
+/// Fenced like an install — by the target's own marker and by the lease — but
+/// not staged: an append has no half-written-target failure mode, and the
+/// record is a few hundred bytes, well inside a pipe buffer, so the whole
+/// thing fits inside the critical section without the `flock` ever waiting on
+/// the network.
+fn append_script(file: &RemoteFile, agent: &str, token: &str) -> String {
+    let critical = format!(
+        "set -e\n\
          {guard}\
          if [ ! -e {path} ]; then \
-           printf '%s' {header} | sudo -n install -m {mode} /dev/stdin {path}; \
+           printf '%s' {header} | install -m {mode} /dev/stdin {path}; \
          fi\n\
-         sudo -n tee -a {path} > /dev/null\n",
+         tee -a {path} > /dev/null\n",
         guard = marker_guard(&file.path, &file.owner_marker),
         path = sq(&file.path),
         mode = file.mode,
         header = sq(&file.body),
-    )
+    );
+    format!("set -euo pipefail\n{}", under_lease(agent, token, &critical))
 }
 
 /// The full `gcloud` argv for running `script` on the instance over IAP.
@@ -5086,9 +5343,22 @@ impl Remote {
         )
     }
 
-    /// Install one file, body on stdin, atomically, behind its own guard.
-    pub fn install(&self, file: &RemoteFile) -> Result<(), String> {
-        let out = self.run_with_stdin(&install_script(file, &self.token), Some(&file.body))?;
+    /// Install one file, body on stdin, atomically, behind its own marker
+    /// guard **and** the deploy lease.
+    ///
+    /// `lease` is not decoration and it is not a `&str`: the only implementor
+    /// of [`Held`] is `reconcile::DeployLease`, whose sole constructor writes
+    /// the owner record first, so "this write happens under a lease" is a
+    /// thing the signature says rather than a thing a comment hopes.
+    /// [`LOCK_UNAVAILABLE`] and [`OWNERSHIP_REFUSED`] earn different
+    /// sentences: one tells the operator to re-run, the other tells them to
+    /// move a file aside, and acting on the wrong one deletes a healthy file.
+    pub(crate) fn install(&self, file: &RemoteFile, lease: &dyn Held) -> Result<(), String> {
+        let script = install_script(file, lease.agent(), &self.token);
+        let out = self.run_with_stdin(&script, Some(&file.body))?;
+        if out.code == LOCK_UNAVAILABLE {
+            return Err(lease_lost(&file.path));
+        }
         if out.code == OWNERSHIP_REFUSED {
             return Err(self.not_ours(&file.path, "overwrite"));
         }
@@ -5105,8 +5375,17 @@ impl Remote {
     }
 
     /// Append one record, creating the file with its marker header when absent.
-    pub fn append(&self, file: &RemoteFile, record: &str) -> Result<(), String> {
-        let out = self.run_with_stdin(&append_script(file), Some(record))?;
+    pub(crate) fn append(
+        &self,
+        file: &RemoteFile,
+        record: &str,
+        lease: &dyn Held,
+    ) -> Result<(), String> {
+        let script = append_script(file, lease.agent(), &self.token);
+        let out = self.run_with_stdin(&script, Some(record))?;
+        if out.code == LOCK_UNAVAILABLE {
+            return Err(lease_lost(&file.path));
+        }
         if out.code == OWNERSHIP_REFUSED {
             return Err(self.not_ours(&file.path, "append a deploy record to"));
         }
@@ -5120,6 +5399,26 @@ impl Remote {
         }
         Ok(())
     }
+
+    /// Run a **root** script on the instance under this agent's deploy lease.
+    ///
+    /// The counterpart to [`Remote::run`] for anything that mutates and is not
+    /// a file install: the fenced stop, the start, and `operator`'s removal
+    /// script. Callers write plain root commands — no `set` line, no `sudo -n`
+    /// — and [`under_lease`] supplies the elevation, the `flock` and the
+    /// ownership proof. The exit code reaches the caller untouched, because
+    /// each of those three speaks its own vocabulary on top of
+    /// [`LOCK_UNAVAILABLE`].
+    pub(crate) fn run_fenced(
+        &self,
+        lease: &dyn Held,
+        root_script: &str,
+    ) -> Result<Output, String> {
+        self.run(&format!(
+            "set -uo pipefail\n{}",
+            under_lease(lease.agent(), &self.token, root_script)
+        ))
+    }
 }
 ```
 
@@ -5128,7 +5427,7 @@ Add `mod remote;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing**
 
 Run: `cargo test -p buzz-backend-gcp remote`
-Expected: PASS — 12 tests.
+Expected: PASS — 13 tests (round 4 adds `an_install_proves_the_lease_in_the_same_shell_as_the_rename`).
 
 - [ ] **Step 5: Commit**
 
@@ -6373,9 +6672,18 @@ pub const SHARED_PATHS: [&str; 3] = [
 /// by the observer script, its parser, and `remove`.
 ///
 /// The env file is first, and [`MarkerState`] keeps it in its own field: it is
-/// the only artifact that records what the deploy *was*, so it is the only one
-/// anything classifies on. The other three are checked, written and deleted,
-/// never interrogated for intent.
+/// the artifact a deploy *classifies on*, because it is the one whose marker
+/// records what the previous deploy intended.
+///
+/// That does **not** mean its siblings are never read for intent — they were
+/// not, and round 4's P1-3 is what that cost. An install torn between the env
+/// write and a later per-agent write leaves the env marker carrying the new
+/// create-intent beside siblings carrying the old one, all of them still ours
+/// and still this agent's, and `classify` called it healthy and restarted the
+/// unit against stale drop-ins. `reconcile::classify` now reads every
+/// sibling's `create_intent` and lets `RestartSame` stand only when all four
+/// agree with the env file; the env file's primacy is that it supplies the
+/// intent the others are compared against, not that the others are ignored.
 pub fn agent_paths(names: &Names) -> [String; 4] {
     [
         names.env_path(),
@@ -6768,7 +7076,7 @@ git add -A && git commit -s -m "feat(backend-gcp): observe systemd state and mar
 
 ## Task 12: `reconcile.rs` — the I4 state machine, the fence, and the startup poll
 
-Resolves the classification half of review **P1-5**, round 2's **P1-2** (startup confirmation), **P1-4** (the per-artifact fence), the classification half of **P1-6** (the tamper verdict is gone), **P1-7** (credential rotation), **P1-8** (serialization and the narrowed fence) and **P2-3** (shared repair on `RestartSame`), and round 3's **P1-4** (the lease was acquired after the decision it protects), the `classify` half of **P1-1** (a prior-version artifact read as foreign), and **P2-1** (the lease TTL was shorter than the deploy budget) and **P2-3** (the lease record was a trust boundary without controls).
+Resolves the classification half of review **P1-5**, round 2's **P1-2** (startup confirmation), **P1-4** (the per-artifact fence), the classification half of **P1-6** (the tamper verdict is gone), **P1-7** (credential rotation), **P1-8** (serialization and the narrowed fence) and **P2-3** (shared repair on `RestartSame`), round 3's **P1-4** (the lease was acquired after the decision it protects), the `classify` half of **P1-1** (a prior-version artifact read as foreign), and **P2-1** (the lease TTL was shorter than the deploy budget) and **P2-3** (the lease record was a trust boundary without controls), and round 4's **P1-1** (the lease was renewed between mutations but not proved inside them), **P1-3** (a torn install classified as `RestartSame`) and **P2** (a previewed-live agent was returned as a success without being re-observed).
 
 **Files:**
 - Modify: `crates/buzz-backend-gcp/src/reconcile.rs` (replaces the Task 5 skeleton wholesale)
@@ -6781,21 +7089,38 @@ Resolves the classification half of review **P1-5**, round 2's **P1-2** (startup
   - `reconcile::Startup` — `Confirmed | Failed(String) | Pending`
   - `reconcile::parse_startup(stdout: &str) -> Startup`
   - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, String>` (signature unchanged from Task 5, so `main.rs` needs no edit)
-- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, Ownership, BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::observe::{AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` and `crate::naming::AgentMarker` — the parent module never names those, so importing them there would be an unused import under `-D warnings`. `Ownership` needs no test import: the parent names it, so `use super::*` carries it.
+- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, Ownership, BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{lease_lost, lease_paths, sq, under_lease, Held, Remote, AGENT_STARTED, LEASE_DIR, LEASE_FLOCK_WAIT_SECONDS, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::observe::{AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` and `crate::naming::AgentMarker` — the parent module never names those, so importing them there would be an unused import under `-D warnings`. `Ownership` needs no test import: the parent names it, so `use super::*` carries it, and that is also how the tests reach `lease_paths`, `under_lease` and `lease_lost`.
 
-**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes fifteen or so `gcloud` round trips (a pre-lease look, the lease, the authoritative look under it, four lease renewals, three secret calls, up to seven installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 50-110 s of the budget is gone before the first poll. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is about 8× an observed warm start and still leaves ≥ 250 s of slack, so a stuck agent produces this provider's actionable error rather than the desktop's opaque one.
+**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes a dozen or so `gcloud` round trips (a pre-lease look, the lease, the authoritative look under it, one renewal before the secret calls, three secret calls, up to seven installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 40-90 s of the budget is gone before the first poll. Round 4 removed three of round 3's four standalone renewals, because the lease gate every mutation carries refreshes the record itself. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is about 8× an observed warm start and still leaves ≥ 250 s of slack, so a stuck agent produces this provider's actionable error rather than the desktop's opaque one.
 
 **Why the startup poll is scoped to one attempt.** The harness's startup line carries no generation and no start nonce (`crates/buzz-acp/src/config.rs:1119-1146`), and `enable --now` on a `Type=simple` unit returns before the new process logs anything. A poll that counts any `buzz-acp starting:` line in a fixed lookback window is therefore *confirmed by the previous run* whenever an agent is restarted soon after a success — the deploy reports a healthy start it never observed. Two independent bounds close it: `_SYSTEMD_INVOCATION_ID`, which systemd re-mints on every start, and `--since @<epoch>` taken **on the instance** immediately before `enable --now`. The first pins the query to this invocation; the second covers the case the first cannot see, where the unit was already running and `enable --now` was a no-op, so the "current" invocation id is the *old* run's.
 
 **Why the fence and the stop share one shell.** [L2] item 4 requires a destructive write fenced to the exact observation that authorized it. The previous shape read the observation in one `gcloud` round trip and performed the stop in the next, with the installs four to six round trips after that; a competing `enable --now` anywhere in that window starts a unit over a half-rewritten file set. A fence that wide is a TOCTOU with more steps. The re-read and the stop now execute in a single remote shell, and every write after it carries its **own** marker guard inside its own install script — so no later step leans on a check that ran earlier.
 
-**Why the mutating window takes a lease, and why it is taken first.** `flock` cannot span the window on its own: every round trip is a separate SSH session, so the descriptor holding the lock closes when the session ends. What `flock` *can* do is make the read-modify-write of a lease record atomic, which is exactly what a lease needs. The lock file is the mutex; a sibling owner file holds `<token> <epoch>` and expires after `DEPLOY_LEASE_SECONDS`, so a provider killed mid-window blocks the next deploy for minutes rather than forever. Both live in a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp` rather than directly under `/run/lock`: `/run` is a tmpfs systemd recreates on every boot, so a lease can never outlive the reboot that made its holder irrelevant, but `/run/lock` is world-readable and a predictable record path there is one an unprivileged local user can watch or pre-create.
+**Why the mutating window takes a lease, and why it is taken first.** `flock` cannot be *held* across the window from here: every round trip is a separate SSH session, so the descriptor holding the lock closes when the session ends. What `flock` *can* do is make each read-modify-write of a lease record atomic — the acquire, and the gate every mutation carries — which is exactly what a lease needs and, as the round-4 section below argues, is enough to make the whole class of stale writes unreachable. The lock file is the mutex; a sibling owner file holds `<token> <epoch>` and expires after `DEPLOY_LEASE_SECONDS`, so a provider killed mid-window blocks the next deploy for minutes rather than forever. Both live in a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp` rather than directly under `/run/lock`: `/run` is a tmpfs systemd recreates on every boot, so a lease can never outlive the reboot that made its holder irrelevant, but `/run/lock` is world-readable and a predictable record path there is one an unprivileged local user can watch or pre-create.
 
-The lease is now acquired **before the observation the deploy acts on**, not after it. The previous ordering ran `observe::look` and `classify` first and then took the lease and acted on that pre-lease verdict — a deploy could observe "absent/stopped", lose the race, and mutate on stale state. What survives of the old reasoning is the cheap part: a *pre-lease* look still runs, because refusing an unowned file or no-opping a live agent should cost nobody a lease. Everything the deploy then acts on comes from `DeployLease::observe`, a method on the guard, so there is no way to reach the authoritative observation without holding the lease and the ordering is a property of the type rather than of the order somebody wrote two statements in. The lease is released before the startup poll, which mutates nothing and may run for four minutes.
+The lease is now acquired **before the observation the deploy acts on**, not after it. The previous ordering ran `observe::look` and `classify` first and then took the lease and acted on that pre-lease verdict — a deploy could observe "absent/stopped", lose the race, and mutate on stale state. What survives of the old reasoning is the cheap part, narrowed by round 4's P2: a *pre-lease* look still runs, and a **refusal** from it still exits early, because refusing an unowned file changes nothing and should cost nobody a lease. A pre-lease `NoOp` no longer exits, because reporting success is a claim rather than a refusal. Everything the deploy acts on — and everything it reports — comes from `DeployLease::observe`, a method on the guard, so there is no way to reach the authoritative observation without holding the lease and the ordering is a property of the type rather than of the order somebody wrote two statements in. The lease is released before the startup poll, which mutates nothing and may run for four minutes.
 
-**Why the lease is renewed rather than merely long.** `DEPLOY_LEASE_SECONDS` was 300 s against a desktop provider timeout of 600 s (`backend.rs:528`) and against direct CLI runs with no bound at all, so a slow-but-live holder aged out and a second deploy began mutating the same agent. Both halves are fixed, because each covers a case the other cannot: the TTL is raised to **900 s**, above every enforced lifetime, which handles the desktop; and `DeployLease::renew` — a verify-then-refresh of the owner record under the same `flock` — runs at each phase boundary of the window, which handles the unbounded case by making the longest un-renewed gap one phase instead of the whole window. Renewal *verifies before it refreshes*: if the record no longer names this holder, the deploy stops with `LOCK_UNAVAILABLE` rather than continuing to mutate under a lease it has lost.
+**Why the lease is proved inside every mutation, and why not one long session.** Round 3 raised `DEPLOY_LEASE_SECONDS` to 900 s and added `DeployLease::renew` at each phase boundary. Round 4 found that neither is a fence. A renewal proves the lease *at the boundary*; the remote step that follows carried no lease check of its own, because `marker_fn` proves provider identity and `binding-version <= current` and `owner_marker` deliberately excludes both the intent and the token. So a holder that renewed and then stalled past the TTL was legitimately overtaken by a second provider — and its delayed `mv` still landed, over the winner's current files, with every marker guard satisfied. Provenance is not ownership of the lease.
+
+The finding's recommended fix was architectural: hold the lease for the whole mutating window inside one long-lived remote session — a single SSH invocation that takes `flock` and then performs the mutations while holding it — instead of N round trips each re-checking a record. **That shape was evaluated and rejected, and the reason is not taste.** A single session cannot contain the mutating window, because two of its steps are not remote: `secrets::instance_service_account` and `secrets::store` are `gcloud` API calls issued from the operator's machine with the operator's own credentials. They cannot move onto the VM, because the instance's service account holds per-secret `secretAccessor` only — deliberately, so that a compromised instance can neither mint nor read another agent's secret — and granting it secret-admin to get the call under the lock would trade this binding's central security property for a concurrency one. So the "single session" is really two sessions with a local gap between them, and a gap is precisely what must not exist. The only way to close it is to have the remote shell *block on stdin* while the Mac does the Secret Manager work and then release it — which needs an interleaved, streaming stdin/stdout handshake in place of `wait_with_output`, a reader thread, a line protocol, and a bet on ssh's flushing behaviour that cannot be verified offline. It would also collapse the per-step error vocabulary: six install refusals, `MARKER_CHANGED`, `AGENT_STARTED` and `LOCK_UNAVAILABLE` currently reach the operator as distinct sentences naming a path and a remedy, and one session has one exit code, so distinguishing them needs a step-tag protocol on stdout *and* a story for which writes landed before the failure. Its genuine advantage — about ten fewer IAP tunnel setups, 30-50 s — is real and is recorded as residual risk 5, where it belongs beside the SSH master connection that would deliver it without any of this.
+
+**What replaces it, and why the same stall cannot defeat it.** Every mutating script now carries the lease proof *in its own shell, under the same `flock`*: `remote::under_lease` emits `sudo -n flock -w 5 -E 75 <lock> sh -c '<gate><work>'`, where the gate reads the owner record, refuses `LOCK_UNAVAILABLE` unless it still names this process's token, and refreshes its timestamp — and only then does the `mv`, the `tee -a`, the `systemctl` or the `rm` run. The argument that this is not merely a narrower TOCTOU:
+
+1. **The owner record can only change while the `flock` is held.** `acquire_lease`, `renew_lease_script`, `release_lease_script` and the gate are the only writers, and all four take it.
+2. **The gate and the mutation hold that same `flock` for their whole duration.** They are one `sh -c` argument, so there is no round trip between them to stall inside.
+3. Therefore a takeover **cannot interleave** between our check and our write. Either the takeover completes first, and our gate reads a record naming somebody else and refuses before touching anything; or our shell holds the lock, and the would-be taker's `flock -w 5` times out and *it* refuses. A stall before we reach `flock` makes the first case; a stall after we hold it makes the second. There is no third.
+4. So a lost lease **prevents** the mutation rather than reporting it afterwards, which is what the finding demanded, and the loser's message says nothing was written — because nothing was.
+
+A useful corollary, and the reason multi-round-trip is *sound* rather than merely safer: because acquire and every write are mutually exclusive under one lock, a loser's writes form a **prefix that strictly precedes the winner's acquire** in lock order. The winner's authoritative observation therefore sees everything the loser managed to write, and reconciles it. That is convergence by re-entry, which is what [L2] asks for.
+
+`DeployLease::renew` survives, with a smaller job: the gate renews as a side effect of acting, so the only standalone renewals left are `DeployLease::observe`'s opening proof and the one before the Secret Manager calls — the single stretch of the window that performs no remote mutation, and the one thing the fence structurally cannot cover (residual risk 2). Three round trips leave the window as a result.
+
+**Why a live no-op is decided under the lease.** `deploy` used to return `Ok(agent_id)` on a *pre-lease* `NoOp`. That reported "running" from an observation nothing serialized: an agent that a concurrent `remove` had just stopped — or that had simply crashed — was reported as a healthy success with an `agent_id` for something no longer there. Round 4's P2. The `NoOp` early return is deleted; the `Refuse` one stays, because a refusal changes nothing and costs the operator only a re-run, whereas a success is a claim. The cost is two round trips on a path that had one, which is noise against a 600 s budget, and the benefit is categorical: under the lease, "live" cannot be stale *with respect to another provider*, because nobody else can stop this unit while we hold the record. What remains stale — the agent crashing on its own, or a root user on the instance stopping it — is bounded by the microseconds between the classification and the return, and is irreducible: no observation is true after it is taken. Taking the lease for a no-op does mean a live-agent deploy can now fail with `another operation … is already in progress` where it previously succeeded; that is the right answer when the other operation is a `remove` tearing the agent down.
 
 **Why `RestartSame` is safe to skip the secret with.** Secret *values* are excluded from the create-intent's readable content, but a **digest** of the secret payload is folded into it (`render::plan`). A rotated `auth_tag` or API key therefore diverges the intent, `classify` returns `FencedReplace`, and the secret is re-stored before the unit starts. Without that digest `RestartSame` would restart an agent against the previous secret version while reporting success — the operator sees a healthy restart and the relay sees the old identity.
+
+**Why `RestartSame` has to look at all four artifacts.** `RestartSame` is a claim that everything this deploy would write is already on the instance and already says the same thing, and it acts on that claim by skipping `secrets::store` and every per-agent install and starting the unit. Round 4's P1-3: it used to be decided from the env marker alone, and this plan said outright that siblings are never interrogated for intent. But an install torn between the env write and a later per-agent write — a dropped SSH is enough — leaves the env marker carrying the **new** create-intent beside surviving siblings carrying the **old** one, all of them plainly ours and plainly this agent's. That state read as healthy, and the retry started the unit against stale drop-ins, a stale `project` among them, which points the fetcher at the wrong Secret Manager project and fails in a way that looks nothing like the deploy that caused it. So `RestartSame` now additionally requires every expected per-agent artifact to be present and to carry the same create-intent as the env marker; anything else is `FencedReplace`, which rewrites all four. The refusal loop above already establishes that every present artifact is ours-or-older and names this pubkey, so the added condition is exactly "none missing, and all agreeing" — and `observe::agent_paths`' doc comment, which asserted the opposite, is rewritten in Task 11.
 
 - [ ] **Step 1: Write the failing classification tests**
 
@@ -6859,13 +7184,32 @@ mod tests {
         }
     }
 
-    /// Siblings default to absent; the tests that exercise the per-artifact
-    /// fence make one present and say what is wrong with it.
+    /// The healthy fixture is a **coherent** four-artifact set: the siblings
+    /// mirror whatever the env file carries.
+    ///
+    /// Round 4's P1-3 is why. The helper used to leave all three siblings
+    /// absent, which is not a steady state at all — it is a torn install — and
+    /// `classify` now says so. Tests that exercise the per-artifact fence
+    /// still overwrite the one entry they care about and say what is wrong
+    /// with it.
     fn obs(
         systemd: SystemdState,
         env_present: bool,
         marker: Option<AgentMarker>,
     ) -> Observation {
+        let siblings = SIBLING_PATHS
+            .iter()
+            .map(|path| AgentFileState {
+                path: (*path).to_string(),
+                present: marker.is_some(),
+                ownership: if marker.is_some() {
+                    Ownership::Ours
+                } else {
+                    Ownership::NotOurs
+                },
+                marker: marker.clone(),
+            })
+            .collect();
         Observation {
             systemd,
             markers: MarkerState {
@@ -6884,15 +7228,7 @@ mod tests {
                     },
                     marker,
                 },
-                siblings: SIBLING_PATHS
-                    .iter()
-                    .map(|path| AgentFileState {
-                        path: (*path).to_string(),
-                        present: false,
-                        ownership: Ownership::NotOurs,
-                        marker: None,
-                    })
-                    .collect(),
+                siblings,
                 shared: healthy_shared(),
             },
             harness_installed: true,
@@ -6977,6 +7313,7 @@ mod tests {
     fn a_marked_env_file_does_not_authorize_writing_an_unmarked_sibling() {
         let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
         o.markers.siblings[0].present = true;
+        o.markers.siblings[0].ownership = Ownership::NotOurs;
         o.markers.siblings[0].marker = None;
         let action = classify(&o, &pubkey(), INTENT);
         let Action::Refuse(why) = action else {
@@ -7021,6 +7358,38 @@ mod tests {
             sibling.ownership = Ownership::Ours;
             sibling.marker = ours("stale");
         }
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
+    }
+
+    /// Round 4's P1-3. The env install lands, a later per-agent install fails
+    /// on a dropped SSH, and the retry sees a **new** create-intent on the env
+    /// marker beside surviving **old** siblings that are still ours and still
+    /// this agent's. Comparing only the env marker returned `RestartSame`,
+    /// which skips `secrets::store` and every per-agent install and starts the
+    /// unit against stale drop-ins — a stale `project` among them, pointing
+    /// the fetcher at the wrong Secret Manager project. A torn install is a
+    /// replace.
+    #[test]
+    fn a_torn_install_is_replaced_not_restarted() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours(INTENT));
+        for sibling in &mut o.markers.siblings {
+            sibling.marker = ours("the-intent-before-this-one");
+        }
+        // Every artifact is present, ours, and this agent's — the refusal loop
+        // has nothing to say — and the env marker matches the request exactly.
+        // Only the siblings' *intent* disagrees.
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
+    }
+
+    /// The other half of a torn install: the write never happened at all, so
+    /// the sibling is simply missing. `RestartSame` would start the unit with
+    /// a drop-in that does not exist.
+    #[test]
+    fn a_missing_sibling_is_replaced_not_restarted() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours(INTENT));
+        o.markers.siblings[1].present = false;
+        o.markers.siblings[1].ownership = Ownership::NotOurs;
+        o.markers.siblings[1].marker = None;
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
     }
 
@@ -7361,8 +7730,9 @@ Append to the same test module:
             script.contains(&LOCK_UNAVAILABLE.to_string()),
             "losing the lease must stop the deploy, not warn: {script}"
         );
-        // The whole critical section is `sq`-wrapped for `sudo -n sh -c`, so
-        // match on fragments that carry no single quotes of their own.
+        // The whole critical section is `sq`-wrapped as the argument to
+        // `sudo -n flock … sh -c`, so match on fragments that carry no single
+        // quotes of their own — or wrap the needle with `nested`.
         let verify = script.find("cut -d").expect("the holder check");
         let refresh = script.rfind("printf").expect("the refreshed record");
         assert!(
@@ -7404,6 +7774,101 @@ Append to the same test module:
             "the re-read must precede the stop it authorizes: {script}"
         );
     }
+
+    /// A needle as it appears once a critical section has been `sq`-wrapped
+    /// for `sh -c`: every single quote becomes `'\''`. Asserting on the
+    /// wrapped form is the honest way to check a nested script — the
+    /// alternative is asserting on fragments that happen to carry no quotes,
+    /// which silently stops covering the interesting ones.
+    fn nested(fragment: &str) -> String {
+        fragment.replace('\'', r"'\''")
+    }
+
+    /// Round 4's P1-1. Every remote mutation carries the lease proof inside
+    /// its own shell — not in a round trip that preceded it — so a lease lost
+    /// or taken over while this provider was stalled *prevents* the write
+    /// rather than being noticed afterwards.
+    #[test]
+    fn every_mutating_script_proves_the_lease_in_its_own_shell() {
+        let names = Names::from_pubkey_hex(&pubkey()).unwrap();
+        let (lock, owner) = lease_paths(names.instance());
+        let fenced = [
+            under_lease(names.instance(), "tok3n", "systemctl daemon-reload\n"),
+            renew_lease_script(names.instance(), "tok3n"),
+        ];
+        for script in &fenced {
+            assert!(script.contains(&sq(&lock)), "no lock is taken: {script}");
+            assert!(
+                script.contains(&nested(&sq(&owner))),
+                "the owner record is not read: {script}"
+            );
+            assert!(script.contains("tok3n"), "the record must name us: {script}");
+            assert!(
+                script.contains(&LOCK_UNAVAILABLE.to_string()),
+                "a lost lease must exit with the code the caller explains: \
+                 {script}"
+            );
+            // One elevation for the whole critical section: the lock lives in
+            // a `0700 root:root` directory, so `flock` has to be root before
+            // it can open it, and everything it runs is root already.
+            assert!(
+                script.contains("sudo -n flock -w"),
+                "the critical section is not elevated as one: {script}"
+            );
+        }
+    }
+
+    /// …and the proof and the mutation cannot be separated, because they are
+    /// one `sh -c` argument. A takeover needs the same `flock` this shell
+    /// holds, so no second provider can slip between the check and the write
+    /// however long this one stalls.
+    #[test]
+    fn the_lease_proof_and_the_mutation_cannot_be_separated() {
+        let names = Names::from_pubkey_hex(&pubkey()).unwrap();
+        let (_, owner) = lease_paths(names.instance());
+        let script = under_lease(
+            names.instance(),
+            "tok3n",
+            &fenced_stop_script(&names, &pubkey(), INTENT),
+        );
+        let gate = script.find("cut -d").expect("the holder check");
+        // The gate's own redirect, not just any `printf`: the stop script has
+        // a `printf` of its own inside `field()`.
+        let refresh = script
+            .find(&nested(&format!("> {}", sq(&owner))))
+            .expect("the refreshed record");
+        let stop = script.find("disable --now").expect("the stop");
+        assert!(
+            gate < refresh && refresh < stop,
+            "prove the holder, refresh, then act — in that order: {script}"
+        );
+        // One shell: everything after the wrapper's opening quote is a single
+        // argument to `sh -c`, so there is no round trip to stall inside.
+        let opener = script.find("sh -c '").expect("the critical section");
+        assert!(opener < gate, "the gate is outside the wrapper: {script}");
+        assert_eq!(
+            script.matches("sh -c '").count(),
+            1,
+            "a second shell is a second chance to lose the lease: {script}"
+        );
+    }
+
+    /// The two refusals must not be confused. "Somebody else's file" tells the
+    /// operator to move a file aside; "the lease moved" tells them to re-run.
+    /// Acting on the first when the second is true is how an operator deletes
+    /// a healthy artifact.
+    #[test]
+    fn a_lost_lease_reads_as_a_lease_loss_not_an_ownership_refusal() {
+        let message = lease_lost("buzz-acp@a1b2c3d4e5f6.service");
+        assert!(message.contains("buzz-acp@a1b2c3d4e5f6.service"), "{message}");
+        assert!(message.contains("Nothing was written"), "{message}");
+        assert!(message.contains("Re-run"), "{message}");
+        assert!(
+            !message.contains("Move it aside"),
+            "that is the ownership refusal's remedy, and it is the wrong one \
+             here: {message}"
+        );
+    }
 ```
 
 - [ ] **Step 3: Run to verify failure**
@@ -7429,7 +7894,8 @@ use crate::config::ProviderConfig;
 use crate::naming::{Names, Ownership, BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY};
 use crate::observe::{self, property, section, Observation};
 use crate::remote::{
-    sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES,
+    lease_lost, lease_paths, sq, under_lease, Held, Remote, AGENT_STARTED, LEASE_DIR,
+    LEASE_FLOCK_WAIT_SECONDS, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES,
 };
 use crate::render::{self, Plan, RemoteFile};
 use crate::secrets;
@@ -7460,16 +7926,15 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// desktop kills the provider at 600 s (`backend.rs:528`), so a
 /// desktop-driven deploy can never age out its own lease, which is what 300 s
 /// allowed. A direct CLI run has no enforced lifetime at all, and no TTL can
-/// cover that — [`DeployLease::renew`] does, by refreshing the record at each
-/// phase boundary so the longest un-renewed gap is one phase rather than the
-/// whole window. The TTL still bounds the other direction: a provider killed
+/// cover that — the record is refreshed instead, by
+/// [`crate::remote::lease_gate`] inside every mutation's own shell and by
+/// [`DeployLease::renew`] across the one stretch that performs no remote
+/// mutation. The TTL still bounds the other direction: a provider killed
 /// between acquire and release blocks the next deploy for minutes, not
-/// forever.
+/// forever. It is **not** what keeps a stalled holder from writing after a
+/// takeover — the per-mutation gate is; expiry only decides when an abandoned
+/// record may be stolen.
 const DEPLOY_LEASE_SECONDS: u64 = 900;
-
-/// How long to wait for the lease's `flock` itself. The critical section under
-/// it is three file operations, so anything longer means a wedged holder.
-const LEASE_FLOCK_WAIT_SECONDS: u64 = 5;
 
 /// The harness's own first log line. Its presence is what distinguishes
 /// "systemd accepted the unit" from "the agent started".
@@ -7634,7 +8099,34 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
         return Action::FencedReplace;
     }
 
-    if marker.create_intent == intent {
+    // `RestartSame` claims that everything this deploy would write is already
+    // on the instance and already says the same thing. That is a claim about
+    // **all four** artifacts, so it has to be checked against all four —
+    // round 4's P1-3. An install torn between the env file and a later
+    // per-agent write (a dropped SSH, say) leaves the env marker carrying the
+    // *new* create-intent beside surviving siblings that still carry the
+    // *old* one and are still perfectly ours and this agent's. Comparing only
+    // the env marker called that state healthy: `RestartSame` skips
+    // `secrets::store` and every per-agent install, then starts the unit
+    // against stale drop-ins — including a stale `project`, which points the
+    // fetcher at the wrong Secret Manager project and produces a start
+    // failure that looks nothing like the deploy that caused it.
+    //
+    // The refusal loop above has already established, for every *present*
+    // artifact, that it is ours (or ours-but-older) and that its marker names
+    // this pubkey. So what remains to require is exactly: none is missing, and
+    // they all agree with the env file about which deploy wrote them. The env
+    // file is compared against itself here, harmlessly, because `agent_files`
+    // yields it first and special-casing it would be a second rule.
+    let coherent = obs.markers.agent_files().all(|file| {
+        file.present
+            && file
+                .marker
+                .as_ref()
+                .is_some_and(|found| found.create_intent == marker.create_intent)
+    });
+
+    if marker.create_intent == intent && coherent {
         Action::RestartSame
     } else {
         Action::FencedReplace
@@ -7742,34 +8234,14 @@ pub fn parse_startup(stdout: &str) -> Startup {
     Startup::Pending
 }
 
-/// The private directory both lease files live in.
-///
-/// Not `/run/lock` directly. `/run` is the right filesystem — a tmpfs systemd
-/// recreates on every boot, so a lease can never outlive the reboot that made
-/// its holder irrelevant — but `/run/lock` is world-readable and, on several
-/// distributions, group-writable, so a predictable `<agent>.owner` path there
-/// is a record an unprivileged local user can watch and, in the worst case,
-/// pre-create with contents of their choosing. `0700 root:root` puts the
-/// record where exactly the identity that enforces it can read or write it.
-const LEASE_DIR: &str = "/run/buzz-backend-gcp";
-
-/// Where a deploy lease lives. `instance` is the 12-lowercase-hex name derived
-/// from the pubkey (`naming.rs`), which is what makes it safe to interpolate
-/// into a path.
-fn lease_paths(instance: &str) -> (String, String) {
-    (
-        format!("{LEASE_DIR}/{instance}.lock"),
-        format!("{LEASE_DIR}/{instance}.owner"),
-    )
-}
-
 /// The shell that reads a lease record and decides whether it is *held by
 /// somebody else, right now*.
 ///
-/// Only [`acquire_lease_script`] needs it — [`renew_lease_script`] asks a
-/// narrower question, "is this record still ours", which needs no freshness
-/// arithmetic at all. It is a function rather than an inline block so the
-/// three controls below sit next to the reasoning for them.
+/// Only [`acquire_lease_script`] needs it — [`crate::remote::lease_gate`], which
+/// renewal and every fenced mutation share, asks the narrower question "is
+/// this record still ours", which needs no freshness arithmetic at all. It is
+/// a function rather than an inline block so the three controls below sit next
+/// to the reasoning for them.
 ///
 /// Three controls, each closing a way a record could lie:
 ///
@@ -7805,31 +8277,29 @@ fn lease_preamble(owner: &str, ttl_check: &str) -> String {
 
 /// Take the per-agent deploy lease, or exit [`LOCK_UNAVAILABLE`].
 ///
-/// `flock` cannot span the mutating window on its own: every round trip is a
-/// separate SSH session, so the descriptor holding the lock closes when the
-/// session ends. What `flock` *can* do is make the read-modify-write of a lease
-/// record atomic, which is exactly what a lease needs. The lock file is the
-/// mutex; the owner file is the lease, and it carries a timestamp so an
+/// `flock` cannot be *held* across the whole mutating window from here: every
+/// round trip is a separate SSH session, so the descriptor holding the lock
+/// closes when the session ends. What `flock` can do is make each
+/// read-modify-write of the lease record atomic — this one, and the one
+/// [`crate::remote::lease_gate`] performs inside every mutation. The lock file
+/// is the mutex; the owner file is the lease, and it carries a timestamp so an
 /// abandoned one expires instead of wedging the instance.
 ///
-/// The whole critical section runs under one `sudo -n sh -c` because
-/// [`LEASE_DIR`] is root-owned and `exec 9>` cannot be elevated on its own.
+/// `sudo -n flock … sh -c` rather than `sudo -n sh -c 'exec 9>…'`: the whole
+/// critical section has to run as root because [`LEASE_DIR`] is `0700
+/// root:root`, and `flock`'s command form elevates once for the section
+/// instead of once per command inside it. Round 4 made that the single shape
+/// for every critical section in this binding, so acquire, renew, release and
+/// each fenced mutation are the same thing with a different body.
 fn acquire_lease_script(instance: &str, token: &str) -> String {
     let (lock, owner) = lease_paths(instance);
     let inner = format!(
         "set -u\n\
-         install -d -m 0700 -o root -g root {dir}\n\
-         exec 9>{lock}\n\
-         flock -w {wait} 9 || exit {busy}\n\
          now=$(date +%s)\n\
          {preamble}\
          printf '%s %s\\n' {token} \"$now\" > {owner}\n",
-        dir = sq(LEASE_DIR),
-        lock = sq(&lock),
         owner = sq(&owner),
         token = sq(token),
-        wait = LEASE_FLOCK_WAIT_SECONDS,
-        busy = LOCK_UNAVAILABLE,
         preamble = lease_preamble(
             &sq(&owner),
             &format!(
@@ -7843,56 +8313,62 @@ fn acquire_lease_script(instance: &str, token: &str) -> String {
             ),
         ),
     );
-    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+    format!(
+        "set -uo pipefail\n\
+         sudo -n install -d -m 0700 -o root -g root {dir}\n\
+         sudo -n flock -w {wait} -E {busy} {lock} sh -c {inner}\n",
+        dir = sq(LEASE_DIR),
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+        busy = LOCK_UNAVAILABLE,
+        lock = sq(&lock),
+        inner = sq(&inner),
+    )
 }
 
 /// Refresh the lease's timestamp — but only after proving we still hold it.
 ///
-/// This is the half of P2-1 that a longer TTL cannot cover. `DEPLOY_LEASE_SECONDS`
-/// is above every *enforced* lifetime, but a direct CLI run has none, so the
-/// window can in principle outlive any fixed number. Renewing at each phase
-/// boundary makes the longest un-renewed gap one phase.
+/// Nothing but [`crate::remote::under_lease`] with an empty body, and
+/// deliberately so: the gate every mutation carries *is* a verify-then-refresh,
+/// and a second spelling of "is this record still ours" is a second thing to
+/// get wrong.
+/// What is left for a standalone call is the stretch of the window that
+/// performs no remote mutation at all — the Secret Manager calls — plus
+/// [`DeployLease::observe`]'s opening proof.
 ///
 /// It **verifies before it refreshes**: a record that no longer names this
 /// token means the lease was stolen or expired and somebody else is mutating
 /// this agent, and the only safe answer is [`LOCK_UNAVAILABLE`] — extending a
 /// lease we do not hold would be worse than having none.
 fn renew_lease_script(instance: &str, token: &str) -> String {
-    let (lock, owner) = lease_paths(instance);
-    let inner = format!(
-        "set -u\n\
-         exec 9>{lock}\n\
-         flock -w {wait} 9 || exit {busy}\n\
-         now=$(date +%s)\n\
-         [ -f {owner} ] || exit {busy}\n\
-         [ \"$(cut -d' ' -f1 {owner})\" = {token} ] || exit {busy}\n\
-         printf '%s %s\\n' {token} \"$now\" > {owner}\n",
-        lock = sq(&lock),
-        owner = sq(&owner),
-        token = sq(token),
-        wait = LEASE_FLOCK_WAIT_SECONDS,
-        busy = LOCK_UNAVAILABLE,
-    );
-    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+    format!(
+        "set -uo pipefail\n{}",
+        under_lease(instance, token, "")
+    )
 }
 
 /// Release the lease — but only if we still hold it. A release that stole
 /// somebody else's would be worse than having no lease at all.
+///
+/// No `-E`: the only caller is `Drop`, which discards the result, so a
+/// contended lock needs no distinguishable exit code. The record expires on
+/// its own after [`DEPLOY_LEASE_SECONDS`] either way.
 fn release_lease_script(instance: &str, token: &str) -> String {
     let (lock, owner) = lease_paths(instance);
     let inner = format!(
         "set -u\n\
-         exec 9>{lock}\n\
-         flock -w {wait} 9 || exit 0\n\
          if [ \"$(cut -d' ' -f1 {owner} 2>/dev/null || true)\" = {token} ]; then\n\
            rm -f {owner}\n\
          fi\n",
-        lock = sq(&lock),
         owner = sq(&owner),
         token = sq(token),
-        wait = LEASE_FLOCK_WAIT_SECONDS,
     );
-    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+    format!(
+        "set -uo pipefail\n\
+         sudo -n flock -w {wait} {lock} sh -c {inner}\n",
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+        lock = sq(&lock),
+        inner = sq(&inner),
+    )
 }
 
 /// The lease, released when it leaves scope.
@@ -7900,7 +8376,8 @@ fn release_lease_script(instance: &str, token: &str) -> String {
 /// The guard exists so that every `?` in the mutating window releases on the
 /// way out — including the ones added after it was written. `pub(crate)`
 /// because `operator::remove` takes the same lease around its own destructive
-/// window.
+/// window. It carries the 12-hex agent rather than the GCE instance name: the
+/// lease is per agent, and [`Held::agent`] hands exactly that to `remote`.
 pub(crate) struct DeployLease<'a> {
     remote: &'a Remote,
     instance: String,
@@ -7909,9 +8386,14 @@ pub(crate) struct DeployLease<'a> {
 impl DeployLease<'_> {
     /// Prove we still hold the lease and push its expiry out.
     ///
-    /// Called at each phase boundary of the mutating window. Cheap — one round
-    /// trip against three file operations — and the only way a deploy learns
-    /// it lost a lease it thought it had.
+    /// Round 4 narrowed this from "called at each phase boundary" to "called
+    /// where nothing else proves the lease", which is one place in `deploy`
+    /// and one in `remove`: the stretch spent talking to Secret Manager from
+    /// this machine. Every *remote* mutation now carries
+    /// [`crate::remote::lease_gate`] inside its own shell, which is the same
+    /// verify-then-refresh — so it renews as a side effect of acting, and a
+    /// renewal that merely precedes an unfenced write is exactly the shape
+    /// round 4's P1-1 rejected.
     pub(crate) fn renew(&self) -> Result<(), String> {
         let out = self
             .remote
@@ -7951,6 +8433,21 @@ impl DeployLease<'_> {
     fn observe(&self, names: &Names, harness: &str) -> Result<Observation, String> {
         self.renew()?;
         observe::look(self.remote, names, harness)
+    }
+}
+
+/// The one implementor of [`Held`].
+///
+/// `Remote::{install, append, run_fenced}` take `&dyn Held`, so a mutating
+/// call cannot be written without a lease in hand — the same discipline
+/// `observe` uses for the authoritative observation, applied to the writes.
+/// The value handed over is the 12-hex agent, which is all `remote` needs to
+/// find the lock and the owner record; the token comes from the `Remote`
+/// itself, because the record holds `remote.token()` and there is exactly one
+/// per provider process.
+impl Held for DeployLease<'_> {
+    fn agent(&self) -> &str {
+        &self.instance
     }
 }
 
@@ -8022,10 +8519,17 @@ pub(crate) fn acquire_lease<'a>(
 /// [`MARKER_CHANGED`] means the marker moved, [`AGENT_STARTED`] means the agent
 /// started. Both are clean refusals that changed nothing, and each earns its
 /// own message.
+///
+/// The **root** half only: no `set` line and no `sudo -n`, because
+/// [`Remote::run_fenced`] runs it inside [`crate::remote::under_lease`]'s
+/// `sudo -n flock … sh -c`, already elevated and already holding the lease. So
+/// the shell that stops the unit proves three things at once — the marker is
+/// the one that authorized this, the agent is not running, and the lease is
+/// still ours — and a competing provider cannot slip between any two of them,
+/// because taking the lease over needs the `flock` this shell is holding.
 fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String {
     format!(
-        "set -uo pipefail\n\
-         h=$(sudo -n sed -n '1,{scan}p' {env} 2>/dev/null || true)\n\
+        "h=$(sed -n '1,{scan}p' {env} 2>/dev/null || true)\n\
          field() {{ printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }}\n\
          if [ \"$(field managed-by)\" != {managed_by} ] \
             || [ \"$(field agent-pubkey-full)\" != {pubkey} ] \
@@ -8038,8 +8542,8 @@ fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String 
          if [ \"$(systemctl is-active {unit} 2>/dev/null || true)\" = active ]; then\n\
            exit {started}\n\
          fi\n\
-         sudo -n systemctl disable --now {unit} 2>/dev/null || true\n\
-         sudo -n systemctl stop {secret_unit} 2>/dev/null || true\n",
+         systemctl disable --now {unit} 2>/dev/null || true\n\
+         systemctl stop {secret_unit} 2>/dev/null || true\n",
         scan = MARKER_SCAN_LINES,
         env = sq(&names.env_path()),
         managed_by = sq(MANAGED_BY),
@@ -8056,12 +8560,14 @@ fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String 
 /// Run the fenced stop and translate its exit code into the operator's terms.
 fn fenced_stop(
     remote: &Remote,
+    lease: &DeployLease<'_>,
     names: &Names,
     pubkey_full: &str,
     intent: &str,
 ) -> Result<(), String> {
-    let out = remote.run(&fenced_stop_script(names, pubkey_full, intent))?;
+    let out = remote.run_fenced(lease, &fenced_stop_script(names, pubkey_full, intent))?;
     match out.code {
+        LOCK_UNAVAILABLE => Err(lease_lost(&names.unit())),
         MARKER_CHANGED => Err(format!(
             "{} changed while this deploy was preparing: its management marker \
              no longer matches the one that authorized the replacement. \
@@ -8170,16 +8676,22 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     let harness = render::harness_basename(agent);
 
     // ---- Transport phase: the lease-free look. ----------------------------
-    // Refusing an unowned file, or no-opping a live agent, should cost nobody
-    // a lease — so a first, cheap observation answers those. Nothing this
-    // deploy *acts* on comes from it: it is a fast exit, not a decision.
+    // Refusing an unowned file should cost nobody a lease, so a first, cheap
+    // observation answers that. Nothing this deploy *acts* on comes from it: it
+    // is a fast exit, not a decision.
     let remote = Remote::new(&cfg.project, &cfg.zone, &cfg.instance)?;
     let preview = observe::look(&remote, &names, &harness)?;
     require_harness(&preview, &harness, &cfg.instance)?;
     match classify(&preview, identity.pubkey_hex(), &plan.create_intent) {
         Action::Refuse(why) => return Err(why),
-        Action::NoOp => return Ok(names.unit()),
-        Action::Create | Action::RestartSame | Action::FencedReplace => {}
+        // A pre-lease `NoOp` deliberately does **not** return here — round 4's
+        // P2. Returning on it reported "running, here is your agent_id" from an
+        // observation taken outside the lease, so an agent that a concurrent
+        // `remove` had just stopped, or that had crashed, was reported as a
+        // healthy success. A refusal is conservative and changes nothing, which
+        // is why it keeps its fast exit; a success is a claim, and this
+        // provider makes claims from the authoritative observation only.
+        Action::NoOp | Action::Create | Action::RestartSame | Action::FencedReplace => {}
     }
 
     // ---- Mutating window, serialized per agent. ---------------------------
@@ -8189,9 +8701,11 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     // "absent/stopped", lose the race, and mutate on state that had already
     // moved. `lease.observe` is the only way to reach the authoritative
     // observation, so the ordering is enforced by the type rather than by the
-    // order two statements happen to be written in. The lease is released at
-    // the end of this block rather than after `confirm_started`, because the
-    // poll mutates nothing and may run for four minutes.
+    // order two statements happen to be written in. The block is entered even
+    // for a no-op, because that is the only way the no-op is answered from
+    // state no other provider can be changing. The lease is released at the end
+    // of this block rather than after `confirm_started`, because the poll
+    // mutates nothing and may run for four minutes.
     let started_at = {
         let lease = acquire_lease(&remote, &names)?;
         let obs = lease.observe(&names, &harness)?;
@@ -8202,6 +8716,14 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         let action = classify(&obs, identity.pubkey_hex(), &plan.create_intent);
         match &action {
             Action::Refuse(why) => return Err(why.clone()),
+            // The only place a no-op is answered. Under the lease, "live"
+            // cannot be stale with respect to another provider: nobody else
+            // can stop this unit while we hold the record, because `remove`
+            // and `deploy` both take it and every stop is fenced on it. What
+            // remains stale is the agent crashing on its own, or a root user
+            // on the instance stopping it — bounded by the microseconds
+            // between this classification and the return, and irreducible:
+            // no observation is true after it is taken.
             Action::NoOp => return Ok(names.unit()),
             Action::Create | Action::RestartSame | Action::FencedReplace => {}
         }
@@ -8235,7 +8757,13 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
                 .marker
                 .as_ref()
                 .map_or("", |marker| marker.create_intent.as_str());
-            fenced_stop(&remote, &names, identity.pubkey_hex(), authorizing_intent)?;
+            fenced_stop(
+                &remote,
+                &lease,
+                &names,
+                identity.pubkey_hex(),
+                authorizing_intent,
+            )?;
         }
 
         // Shared artifacts are repaired on every acting path, `RestartSame`
@@ -8243,13 +8771,28 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         // not for a stopped one — and the agent unit `Requires=` the fetcher
         // unit, so a shared template deleted out of band is a start failure
         // that re-entry would otherwise never converge on. Written before the
-        // per-agent files because the agent unit depends on them.
-        lease.renew()?;
+        // per-agent files because the agent unit depends on them. No `renew`
+        // ahead of the loop: each install proves and refreshes the lease inside
+        // its own shell, which is strictly stronger than a renewal that
+        // preceded it by a round trip.
         for file in shared_writes(&plan, &obs) {
-            remote.install(file)?;
+            remote.install(file, &lease)?;
         }
 
         if action != Action::RestartSame {
+            // The one standalone renewal left in the window. Everything else
+            // here proves the lease from inside its own shell, but
+            // `instance_service_account` and `store` are `gcloud` calls from
+            // *this* machine against Secret Manager — a service the instance's
+            // lock knows nothing about — so no fenced shell covers them. They
+            // stay here because the instance's service account holds per-secret
+            // `secretAccessor` only, deliberately: moving them onto the VM to
+            // get them under the lock would hand a compromised instance the
+            // ability to mint and read every agent's secret. Renewing first at
+            // least means a deploy that has already lost the lease stops before
+            // it adds a version, and every step after this one is fenced, so a
+            // deploy that loses it *during* the call cannot start an agent
+            // against what it added.
             lease.renew()?;
             let service_account = secrets::instance_service_account(
                 &remote,
@@ -8266,7 +8809,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
                 &service_account,
             )?;
             for file in &plan.per_agent {
-                remote.install(file)?;
+                remote.install(file, &lease)?;
             }
         }
         // `RestartSame` skipping the secret is sound only because the intent
@@ -8275,8 +8818,8 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         // and no agent is ever restarted against a stale secret version.
 
         // The durable record, written before the start attempt so a deploy that
-        // then fails to start still leaves its capacity warning behind.
-        lease.renew()?;
+        // then fails to start still leaves its capacity warning behind. Fenced
+        // like every other write, so it needs no renewal ahead of it.
         remote.append(
             &plan.trail,
             &capacity::trail_record(
@@ -8285,21 +8828,30 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
                 &plan.create_intent,
                 &warnings,
             ),
+            &lease,
         )?;
 
         // The instance's own clock, printed after the reload and before the
         // start, is what bounds the startup query. It cannot be read on this
-        // machine: the two clocks are unrelated.
-        lease.renew()?;
-        let out = remote.run(&format!(
-            "set -euo pipefail\n\
-             sudo -n systemctl daemon-reload\n\
-             echo '---STARTEDAT---'\n\
-             date +%s\n\
-             echo '---START---'\n\
-             sudo -n systemctl enable --now {unit}\n",
-            unit = sq(&names.unit()),
-        ))?;
+        // machine: the two clocks are unrelated. Fenced like every other
+        // mutation, and this is the one that matters most — `enable --now`
+        // starts an agent, and a provider that has lost the lease must not
+        // start one over the winner's files.
+        let out = remote.run_fenced(
+            &lease,
+            &format!(
+                "set -e\n\
+                 systemctl daemon-reload\n\
+                 echo '---STARTEDAT---'\n\
+                 date +%s\n\
+                 echo '---START---'\n\
+                 systemctl enable --now {unit}\n",
+                unit = sq(&names.unit()),
+            ),
+        )?;
+        if out.code == LOCK_UNAVAILABLE {
+            return Err(lease_lost(&names.unit()));
+        }
         if !out.ok() {
             return Err(format!(
                 "starting {} failed (exit {}): {}",
@@ -8329,7 +8881,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 30 new `reconcile` tests plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
+Expected: PASS — 35 `reconcile` tests (round 4 adds `a_torn_install_is_replaced_not_restarted`, `a_missing_sibling_is_replaced_not_restarted`, `every_mutating_script_proves_the_lease_in_its_own_shell`, `the_lease_proof_and_the_mutation_cannot_be_separated` and `a_lost_lease_reads_as_a_lease_loss_not_an_ownership_refusal`) plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
 
 - [ ] **Step 6: Commit**
 
@@ -8341,15 +8893,15 @@ git add -A && git commit -s -m "feat(backend-gcp): I4 reconciler with a full-tup
 
 ## Task 13: Operator subcommands — `list`, `remove`, `dry-run`
 
-Resolves review **P2-4**, **P2-6**, P3's "`dry-run` is exercised by no acceptance criterion", round 2's **P1-4** (`remove`'s fence must read each file it deletes) and **P2-2** (an agent whose env file is gone must still be visible and still be removable), and round 3's **P1-2** (`remove` stops a unit it has not proven it owns), the `remove` halves of **P1-1** (a prior-version agent must stay removable), **P1-3** (the delete veto counted lines, not patterns) and **P1-4** (`remove` took no lease at all).
+Resolves review **P2-4**, **P2-6**, P3's "`dry-run` is exercised by no acceptance criterion", round 2's **P1-4** (`remove`'s fence must read each file it deletes) and **P2-2** (an agent whose env file is gone must still be visible and still be removable), round 3's **P1-2** (`remove` stops a unit it has not proven it owns), the `remove` halves of **P1-1** (a prior-version agent must stay removable), **P1-3** (the delete veto counted lines, not patterns) and **P1-4** (`remove` took no lease at all), and round 4's **P1-2** (the pre-stop gate authorised a half-migrated fleet) and the `remove` half of **P1-1** (the removal script ran on a renewal rather than under a held lease).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/operator.rs`
 - Modify: `crates/buzz-backend-gcp/src/main.rs` (add `mod operator;` and the argv branch)
 
 **Interfaces:**
-- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`, and the private `instance_of`, `resolve_target`, `listing_script`, `ownership_scan_script`, `verify_removable`, `removal_script`
-- Consumes: `crate::capacity`, `crate::config::{self, ProviderConfig}`, `crate::naming::{self, Names, MANAGED_BY}`, `crate::observe::{self, AgentFileState}`, `crate::reconcile::acquire_lease`, `crate::remote::{marker_fn, sq, Remote, MARKER_SCAN_LINES}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`. The test module additionally imports `crate::naming::{agent_ownership, AgentMarker, Ownership}` and reaches `crate::observe::{agent_paths, SHARED_PATHS}` by path — the parent names none of them, and an import only the tests use is an unused import under `-D warnings`.
+- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`, and the private `instance_of`, `resolve_target`, `listing_script`, `ownership_scan_script`, `refusal`, `verify_removable`, `removal_script`
+- Consumes: `crate::capacity`, `crate::config::{self, ProviderConfig}`, `crate::naming::{self, Names, Ownership, MANAGED_BY}`, `crate::observe::{self, AgentFileState}`, `crate::reconcile::acquire_lease`, `crate::remote::{lease_lost, marker_fn, sq, Remote, LOCK_UNAVAILABLE, MARKER_SCAN_LINES}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`. The test module additionally imports `crate::naming::{agent_ownership, AgentMarker}` and reaches `crate::observe::{agent_paths, SHARED_PATHS}` by path — the parent names none of those, and an import only the tests use is an unused import under `-D warnings`. `Ownership` is **not** in the test import: round 4's `verify_removable` matches on it, so the parent names it and `use super::*` carries it, and naming it again would be a duplicate import rather than a redundant one.
 
 The desktop passes no argv, so argv presence unambiguously selects operator mode. With empty argv the binary behaves exactly as the protocol requires.
 
@@ -8359,9 +8911,9 @@ The desktop passes no argv, so argv presence unambiguously selects operator mode
 
 **A missing env file is not "nothing to remove".** Both `list` and `remove` used to key off `/etc/buzz/acp-*.env`. Delete that one file — by hand, by a half-finished cleanup, by an interrupted `remove` — and a running, secret-bearing agent becomes invisible to `list` while `remove` answers "there is nothing here to remove". That is the operator's only reclamation path lying to them in a reachable state. `list` now unions three enumerations (the env glob, `systemctl list-units`/`list-unit-files`, and the drop-in directories) and recovers the pubkey from whichever per-agent artifact still carries a marker; `remove` proceeds without the env file, because authorization comes from `--pubkey` plus each file's own header, neither of which lives there exclusively.
 
-**Nothing is stopped before ownership is proven.** Deleting a file was fenced; *stopping a unit* was not. With the env file absent, `remove` used to run `systemctl disable --now buzz-acp@<id>.service` before reading a single marker, on the strength of `--pubkey` sharing its first twelve hex with the unit id — which is exactly the collision the full pubkey exists to close, and [L2] item 4 requires full-identity evidence before *any* action, not only before a delete. `remove` therefore opens with a read-only scan of all four per-agent artifacts in one shell and requires at least one present marker carrying this pubkey. Only then does it destroy the secret and run the removal script. A refusal names the four paths it looked at and the manual commands that reclaim the agent, because "refusing without a way forward" is how an operator ends up doing it with `rm -rf`.
+**Nothing is stopped before ownership is proven, and a mixed fleet is not "ownership".** Deleting a file was fenced; *stopping a unit* was not. With the env file absent, `remove` used to run `systemctl disable --now buzz-acp@<id>.service` before reading a single marker, on the strength of `--pubkey` sharing its first twelve hex with the unit id — which is exactly the collision the full pubkey exists to close, and [L2] item 4 requires full-identity evidence before *any* action, not only before a delete. `remove` therefore opens with a read-only scan of all four per-agent artifacts in one shell. Round 4's P1-2 then fixed what that scan was allowed to conclude. "At least one present artifact carries a matching marker" is not a proof of ownership over the *unit*: `AgentMarker::parse` yields nothing for `OursButNewer`, so a half-migrated agent — an older-or-current env file this build owns, beside a drop-in a newer provider wrote — satisfied it by looking past the sibling entirely, and `remove` went on to destroy the secret and run a script whose first act is `systemctl disable --now`. The newer deployment was stopped and its key destroyed, and only *then* did the per-file fences politely keep its files. So `verify_removable` now takes the shape `classify` has: **every present artifact is checked for refusal first — foreign, unparseable, newer-than-this-build, ours-without-an-identity-line, or marked for another pubkey — and only then does one surviving present artifact authorise the removal.** `OursButOlder` stays accepted, because a uniform prior-version agent is this provider's own work and refusing it would close the reclamation path round 3 opened. A refusal names the offending path, the four paths it looked at, and the manual commands that reclaim the agent, because "refusing without a way forward" is how an operator ends up doing it with `rm -rf`.
 
-**`remove` holds the same lease `deploy` takes.** It destroys a Secret Manager secret and four files while a concurrent deploy may be installing them; taking no lease made the two freely interleavable. The lease is acquired *before* the ownership scan, so the state that authorizes the removal cannot move between the read and the act, and it is held across `secrets::destroy` and the removal script.
+**`remove` holds the same lease `deploy` takes — and proves it inside the shell that stops things.** It destroys a Secret Manager secret and four files while a concurrent deploy may be installing them; taking no lease made the two freely interleavable. The lease is acquired *before* the ownership scan, so the state that authorizes the removal cannot move between the read and the act. Holding it is not enough on its own, though — round 4's P1-1 — because "we renewed a moment ago" is not "we hold it now": `removal_script` therefore returns only the **root** half of the work, and `Remote::run_fenced` runs it inside the same `sudo -n flock … sh -c` wrapper the installs use, so the proof that the owner record still names this process and the `systemctl disable --now` it authorizes are one shell under one `flock`. The single standalone `renew` that remains sits before `secrets::destroy`, which is the only step here that leaves the instance.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8371,7 +8923,10 @@ The desktop passes no argv, so argv presence unambiguously selects operator mode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::naming::{agent_ownership, AgentMarker, Ownership};
+    // `Ownership` is deliberately absent: round 4's `verify_removable` matches
+    // on it, so the parent names it and `use super::*` carries it here. Naming
+    // it again would be a duplicate import (E0252), not a redundant one.
+    use crate::naming::{agent_ownership, AgentMarker};
 
     #[test]
     fn an_agent_id_yields_its_instance() {
@@ -8735,6 +9290,85 @@ mod tests {
         assert!(!script.contains("systemctl"), "{script}");
         assert!(!script.contains("rm -f"), "{script}");
     }
+
+    /// Round 4's P1-2, the case the version rule existed for and got wrong.
+    /// A half-migrated agent — an env file this build owns, for this pubkey,
+    /// beside a drop-in a *newer* provider wrote — used to pass the gate,
+    /// because the gate authorised on "any artifact carries a matching
+    /// marker" and `AgentMarker::parse` yields nothing for `OursButNewer`, so
+    /// the newer sibling was simply looked past. `remove` then destroyed the
+    /// secret and ran a script whose first act is `systemctl disable --now`:
+    /// the newer deployment was stopped and its key destroyed, and only then
+    /// were its *files* politely kept. The gate must refuse.
+    #[test]
+    fn a_half_migrated_agent_is_refused_before_anything_stops() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let newer = format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: 99\n\
+             # agent-pubkey-full: {pubkey}\n# create-intent: ci\n"
+        );
+        let files = [
+            // Ours, this build's own layout, and unambiguously this agent's.
+            scanned(&names.env_path(), our_marker(&pubkey)),
+            AgentFileState {
+                path: names.dropin_path(),
+                present: true,
+                ownership: agent_ownership(&newer),
+                marker: AgentMarker::parse(&newer),
+            },
+            scanned(&names.secret_dropin_path(), None),
+            scanned(&names.trail_path(), None),
+        ];
+        let err = verify_removable(&files, &pubkey, &names)
+            .expect_err("a newer sibling must block the whole removal");
+        assert!(err.contains(&names.dropin_path()), "{err}");
+        assert!(err.contains("99"), "the refusal must name the version: {err}");
+        assert!(err.contains("Nothing was stopped"), "{err}");
+        assert!(
+            !err.contains("somebody else"),
+            "a newer build of this provider is not a stranger: {err}"
+        );
+    }
+
+    /// …and a uniform prior-version fleet is still removable, so the stricter
+    /// gate did not close the reclamation path round 3's P1-1 opened.
+    #[test]
+    fn a_uniform_prior_version_fleet_is_still_removable() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let older = format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: 0\n\
+             # agent-pubkey-full: {pubkey}\n# create-intent: ci\n"
+        );
+        let at_version_zero = |path: String| AgentFileState {
+            path,
+            present: true,
+            ownership: agent_ownership(&older),
+            marker: AgentMarker::parse(&older),
+        };
+        let files: Vec<AgentFileState> = crate::observe::agent_paths(&names)
+            .into_iter()
+            .map(at_version_zero)
+            .collect();
+        verify_removable(&files, &pubkey, &names)
+            .expect("a uniform prior-version agent is this provider's own work");
+    }
+
+    /// Round 4's P1-1, the `remove` half. The removal script is the **root**
+    /// half only — `Remote::run_fenced` supplies the elevation, the `flock`
+    /// and the ownership proof — so it must carry no `set` line and no `sudo`
+    /// of its own, or it would run privileged commands outside the wrapper
+    /// that proves the lease.
+    #[test]
+    fn the_removal_script_is_the_root_half_of_a_fenced_shell() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let script = removal_script(&names, &pubkey);
+        assert!(!script.contains("sudo"), "the wrapper elevates once: {script}");
+        assert!(!script.contains("set -"), "the wrapper sets the shell: {script}");
+        assert!(script.starts_with("marker_ok()"), "{script}");
+    }
 }
 ```
 
@@ -8756,10 +9390,10 @@ Prepend to `crates/buzz-backend-gcp/src/operator.rs`:
 //! relay — and because a success-path capacity warning has nowhere else to go.
 
 use crate::config::{self, ProviderConfig};
-use crate::naming::{self, Names, MANAGED_BY};
+use crate::naming::{self, Names, Ownership, MANAGED_BY};
 use crate::observe::{self, AgentFileState};
 use crate::reconcile::acquire_lease;
-use crate::remote::{marker_fn, sq, Remote, MARKER_SCAN_LINES};
+use crate::remote::{lease_lost, marker_fn, sq, Remote, LOCK_UNAVAILABLE, MARKER_SCAN_LINES};
 use crate::secrets;
 use clap::{Parser, Subcommand};
 
@@ -9008,9 +9642,34 @@ fn list(remote: &Remote) -> Result<(), String> {
     Ok(())
 }
 
+/// Every pre-stop refusal, in one shape.
+///
+/// The reason varies; the tail never does — the four paths the gate looked at,
+/// and the manual reclamation. A refusal with no way forward is how an
+/// operator ends up doing it with `rm -rf`, and a refusal whose text depends
+/// on which arm produced it is four messages to keep actionable instead of
+/// one.
+fn refusal(reason: &str, names: &Names) -> String {
+    let looked_at = observe::agent_paths(names)
+        .iter()
+        .map(|path| format!("  {path}\n"))
+        .collect::<String>();
+    format!(
+        "refusing to touch {unit}: {reason} Nothing was stopped, disabled or \
+         destroyed. Looked at:\n{looked_at}\
+         The 12-hex instance name is collision-resistant, not collision-free, \
+         so a unit whose name matches is not evidence that this agent is \
+         yours. If you are certain it is and you accept what the reason above \
+         says, reclaim it by hand: `sudo systemctl disable --now {unit}`, \
+         delete those paths, then `gcloud secrets delete {secret}`.",
+        unit = names.unit(),
+        secret = names.secret_name(),
+    )
+}
+
 /// The pre-stop gate: **before** anything is stopped, disabled or destroyed,
-/// at least one of this agent's four artifacts must carry a marker naming this
-/// pubkey.
+/// every present per-agent artifact must be this provider's and this agent's,
+/// and at least one of them must be there at all.
 ///
 /// Deleting a file was already fenced on that file's own header. Stopping a
 /// unit was not: with the env file absent, `remove` ran
@@ -9019,12 +9678,28 @@ fn list(remote: &Remote) -> Result<(), String> {
 /// unit id — the exact collision the full pubkey exists to close. [L2] item 4
 /// requires full-identity evidence before *any* action.
 ///
-/// Any one artifact is enough, and that is the point: the env file is the one
-/// most likely to be missing, and a marked drop-in or trail proves the same
-/// thing it would have. A `marker` is `Some` only for a header this build owns
-/// at its own binding version or an older one (`naming::agent_ownership`), so a
-/// prior-version agent stays removable while a *newer* one — a layout this
-/// build cannot reason about — does not authorize a stop either.
+/// **Refusals first, over every present artifact; authorisation second** — the
+/// same order and the same four arms `reconcile::classify` uses, and for the
+/// same reason: a stop cannot be undone by a later check. Round 4's P1-2 is
+/// what forced the first half. The gate used to authorise as soon as *any*
+/// present artifact carried a matching marker, and [`crate::naming::AgentMarker::parse`]
+/// yields nothing at all for [`Ownership::OursButNewer`], so a half-migrated
+/// agent — an older-or-current env file this build owns, beside a sibling a
+/// *newer* provider wrote — walked straight through. `remove` then destroyed
+/// the secret and ran a script whose first act is `systemctl disable --now`,
+/// and the newer deployment was stopped and its secret destroyed before the
+/// per-file fences got as far as politely "keeping" its files. The downgrade
+/// refusal was sound for a uniform fleet and on the deploy path; it was unsound
+/// here, in exactly the mixed state it exists for.
+///
+/// [`Ownership::OursButOlder`] is still accepted, and must be: a uniform
+/// prior-version agent is this provider's own work at a layout this build
+/// supersedes, and refusing it would close the operator's only reclamation
+/// path for every agent installed before a version bump.
+///
+/// Once the loop has passed, "any one artifact is enough" is safe, and it is
+/// still the point: the env file is the one most likely to be missing, and a
+/// marked drop-in or trail proves the same thing it would have.
 ///
 /// Pure, so it can refuse without a transport. That is what makes "nothing was
 /// stopped" structural rather than a promise in a comment.
@@ -9033,31 +9708,68 @@ fn verify_removable(
     pubkey_full: &str,
     names: &Names,
 ) -> Result<(), String> {
-    if files.iter().any(|file| {
-        file.present
-            && file
-                .marker
-                .as_ref()
-                .is_some_and(|marker| marker.pubkey_full == pubkey_full)
-    }) {
+    for file in files.iter().filter(|file| file.present) {
+        match file.ownership {
+            Ownership::Ours | Ownership::OursButOlder(_) => {}
+            Ownership::OursButNewer(found) => {
+                return Err(refusal(
+                    &format!(
+                        "{path} was written by a newer {MANAGED_BY} (binding \
+                         version {found}; this build writes {version}), so this \
+                         build cannot tell what stopping the unit would destroy \
+                         — and stopping it is the first thing a removal does. \
+                         Upgrade this provider and remove the agent with it.",
+                        path = file.path,
+                        version = naming::BINDING_VERSION,
+                    ),
+                    names,
+                ))
+            }
+            Ownership::NotOurs => {
+                return Err(refusal(
+                    &format!(
+                        "{} exists but carries no {MANAGED_BY} marker at a \
+                         binding version this build recognises, so it is not \
+                         this provider's to tear down. Move it aside first.",
+                        file.path
+                    ),
+                    names,
+                ))
+            }
+        }
+        let Some(marker) = file.marker.as_ref() else {
+            return Err(refusal(
+                &format!(
+                    "{} carries the {MANAGED_BY} marker but no \
+                     agent-pubkey-full line, so which agent it belongs to \
+                     cannot be established.",
+                    file.path
+                ),
+                names,
+            ));
+        };
+        if marker.pubkey_full != pubkey_full {
+            return Err(refusal(
+                &format!(
+                    "short-name collision: {} belongs to pubkey {}, not \
+                     {pubkey_full}.",
+                    file.path, marker.pubkey_full
+                ),
+                names,
+            ));
+        }
+    }
+
+    if files.iter().any(|file| file.present) {
         return Ok(());
     }
-    let looked_at = observe::agent_paths(names)
-        .iter()
-        .map(|path| format!("  {path}\n"))
-        .collect::<String>();
-    Err(format!(
-        "refusing to touch {unit}: none of its per-agent artifacts carries a \
-         {MANAGED_BY} marker for pubkey {pubkey_full} at a binding version this \
-         build recognises. Nothing was stopped, disabled or destroyed. Looked \
-         at:\n{looked_at}\
-         The 12-hex instance name is collision-resistant, not collision-free, \
-         so a unit whose name matches is not evidence that this agent is \
-         yours. If you are certain it is, reclaim it by hand: `sudo systemctl \
-         disable --now {unit}`, delete those paths, then `gcloud secrets \
-         delete {secret}`.",
-        unit = names.unit(),
-        secret = names.secret_name(),
+    Err(refusal(
+        &format!(
+            "none of its per-agent artifacts is present, so nothing carries a \
+             {MANAGED_BY} marker for pubkey {pubkey_full} at a binding version \
+             this build recognises."
+        ),
+        names,
     ))
 }
 
@@ -9099,34 +9811,40 @@ fn ownership_scan_script(names: &Names) -> String {
 /// patterns: a header repeating `# managed-by:` reached the count while
 /// carrying no `# agent-pubkey-full:` at all, so the veto authorized deleting a
 /// file that never named this agent.
+///
+/// This returns the **root** half only: no `set`, no `sudo -n`, because
+/// `Remote::run_fenced` runs it inside `remote::under_lease`'s
+/// `sudo -n flock … sh -c`, already elevated and already holding the lease.
+/// That is round 4's P1-1 — the `systemctl disable --now` on the first line is
+/// the most destructive thing this binding does, and it must not execute
+/// unless the owner record still names this process at the instant it runs.
 fn removal_script(names: &Names, pubkey_full: &str) -> String {
     let required = [
         naming::header_line("managed-by", MANAGED_BY),
         naming::header_line("agent-pubkey-full", pubkey_full),
     ];
     format!(
-        "set -uo pipefail\n\
-         {marker_ok}\
-         sudo -n systemctl disable --now {unit} 2>/dev/null || true\n\
-         sudo -n systemctl stop {secret_unit} 2>/dev/null || true\n\
+        "{marker_ok}\
+         systemctl disable --now {unit} 2>/dev/null || true\n\
+         systemctl stop {secret_unit} 2>/dev/null || true\n\
          for p in {env} {trail} {dropin} {secret_dropin}; do\n\
-           sudo -n test -f \"$p\" || continue\n\
-           h=$(sudo -n head -n {scan} \"$p\" || true)\n\
+           test -f \"$p\" || continue\n\
+           h=$(head -n {scan} \"$p\" || true)\n\
            if marker_ok; then\n\
-             sudo -n rm -f \"$p\"\n\
+             rm -f \"$p\"\n\
            else\n\
              echo \"kept $p: it carries no {managed_by} marker for this agent at \
 a binding version this build may act on\"\n\
            fi\n\
          done\n\
          for d in {dropin_dir} {secret_dropin_dir}; do\n\
-           if sudo -n test -d \"$d\"; then\n\
-             if sudo -n rmdir \"$d\" 2>/dev/null; then :; else\n\
+           if test -d \"$d\"; then\n\
+             if rmdir \"$d\" 2>/dev/null; then :; else\n\
                echo \"kept $d: it still holds files this provider did not write\"\n\
              fi\n\
            fi\n\
          done\n\
-         sudo -n systemctl daemon-reload\n",
+         systemctl daemon-reload\n",
         marker_ok = marker_fn(&required),
         unit = sq(&names.unit()),
         secret_unit = sq(&names.secret_unit()),
@@ -9192,11 +9910,26 @@ fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Resul
     // Ordered this way an interrupted remove is idempotent: a re-run finds the
     // marked files present, the secret already absent, and treats
     // delete-of-absent as success ([L2] item 4).
+    //
+    // This is the one standalone renewal `remove` keeps, and for the same
+    // reason `deploy` keeps its one: `secrets::destroy` is a `gcloud` call
+    // from this machine against a service the instance's lock knows nothing
+    // about, so it is the only step here that no fenced shell covers. Every
+    // other mutation below proves the lease itself.
     lease.renew()?;
     secrets::destroy(remote, project, &names.secret_name(), &pubkey)?;
 
-    lease.renew()?;
-    let out = remote.run(&removal_script(&names, &pubkey))?;
+    // The removal itself runs *inside* the lease, not merely after a renewal
+    // that preceded it: `run_fenced` wraps the script in the same
+    // `sudo -n flock … sh -c` the installs use, so the proof that the record
+    // still names this process and the `systemctl disable --now` it authorizes
+    // share one shell. Round 4's P1-1 — a renewal that succeeds and is then
+    // followed by a stall long enough for the lease to be taken over leaves
+    // the mutation unguarded, and this one stops units and deletes files.
+    let out = remote.run_fenced(&lease, &removal_script(&names, &pubkey))?;
+    if out.code == LOCK_UNAVAILABLE {
+        return Err(lease_lost(&names.unit()));
+    }
     if !out.ok() {
         return Err(format!(
             "removing {agent_id} failed (exit {}): {}",
@@ -9269,7 +10002,7 @@ fn main() {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 17 `operator` tests, and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
+Expected: PASS — 20 `operator` tests (round 4 adds `a_half_migrated_agent_is_refused_before_anything_stops`, `a_uniform_prior_version_fleet_is_still_removable` and `the_removal_script_is_the_root_half_of_a_fenced_shell`), and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
 
 - [ ] **Step 6: Exercise `dry-run` as the acceptance criterion the design asks for**
 
@@ -9486,12 +10219,17 @@ The second binding's realization of the two lists above, in its own vocabulary:
    ever observed half-written and the fence never has a truncated fragment to
    refuse forever. The mutating window is serialized by a per-agent lease on
    the instance (`flock` over a lease record in a private `0700 root:root`
-   `/run/buzz-backend-gcp`, renewed at each phase boundary), acquired
-   **before** the observation the deploy acts on and held by `remove` across
-   the secret destroy and the file deletions; a deploy that loses it mutates
-   nothing and says so. `remove` additionally proves ownership before it stops
-   anything: at least one of the four per-agent artifacts must carry a marker
-   naming this pubkey, or nothing is stopped, disabled or destroyed. The
+   `/run/buzz-backend-gcp`), acquired **before** the observation the deploy
+   acts on and held by `remove` across the secret destroy and the file
+   deletions. Every mutation re-proves that lease *inside its own shell, under
+   the same `flock` the record can only be changed under*, and refreshes it
+   there — so a holder that stalls past the TTL and is legitimately overtaken
+   has its next write refused rather than landed, and a deploy that loses the
+   lease mutates nothing and says so. `remove` additionally proves ownership
+   before it stops anything: at least one of the four per-agent artifacts must
+   be present, and **every** present one must carry this provider's marker at
+   this binding version or older and name this pubkey, or nothing is stopped,
+   disabled or destroyed. The
    auto-repair fence is the marker itself — no destructive action touches a
    file lacking the marker of its own tier.
 2. **Two marker tiers.** Per-agent artifacts carry `managed-by`,
@@ -9734,9 +10472,12 @@ wait
 jq -r '.ok, (.error // .agent_id)' /tmp/race-a.json /tmp/race-b.json
 ```
 Expected: at most one `true`, and any `false` carries
-`another deploy of buzz-acp@<id> is already in progress`. A second failure with
-any *other* message — a half-installed file, a marker refusal, a `systemctl`
-error — means the lease is not covering the window it must.
+`another operation on buzz-acp@<id>.service is already in progress`. A second
+failure with any *other* message — a half-installed file, a marker refusal, a
+`systemctl` error — means the lease is not covering the window it must. A
+`the deploy lease for … was not held` message is also acceptable and is the
+per-mutation gate doing its job: it means the loser reached a write, proved the
+record no longer named it, and refused before touching anything.
 
 - [ ] **Step 11: Exercise the agent end to end**
 
@@ -9830,7 +10571,7 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | Design section | Task |
 |---|---|
 | §Where the Provider Runs, §Transport `PATH` | Task 9 (`Remote::new`, `prepended_path`, the named not-found refusal) |
-| §Transport host trust, `sudo -n` | Task 9 (`ssh_argv` asserts no `StrictHostKeyChecking`; `install_script`/`append_script`/`removal_script` all use `sudo -n`) |
+| §Transport host trust, `sudo -n` | Task 9 (`ssh_argv` asserts no `StrictHostKeyChecking`; every privileged step is non-interactive — `install_script` and `append_script` reach `sudo -n` directly for the staging write and through `under_lease`'s single `sudo -n flock … sh -c` for the critical section, and Task 12's fenced stop and start step and Task 13's `removal_script` reach it through the same wrapper. `every_privileged_step_is_non_interactive` asserts no bare `sudo ` survives in any of them) |
 | §`crates/buzz-backend-core` | Tasks 1-3 |
 | §`crates/buzz-backend-gcp` module table | Tasks 4-13, one module per task or per half-task |
 | §`info` | Task 4 |
@@ -9875,7 +10616,7 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | P1-5 Secret Manager verified once, mutated twice | Task 10 `describe_owned` immediately precedes each mutation with nothing between; `ALREADY_EXISTS` on create is a re-read-and-verify rather than a failure; a `Recorder` implementing the new `remote::Gcloud` trait asserts the exact command sequences, including that a secret swapped before the IAM grant never receives it. |
 | P1-6 the shared-artifact tamper check | **Deleted.** No `content-hash` line, no `SharedMarker` type, no `sed` strip, no `tampered()`, no tamper classification arm, no tamper tests. Shared artifacts are write-if-absent-or-content-differs, comparing `sha256sum` of the installed file against `sha256_hex` of the rendered body — both hashes of real bytes. The rationale is recorded in Global Constraints, in Task 6's preamble, in `naming.rs`'s module doc, and in the spec §Two marker tiers. Deleting it removed the tamper verdict; round 3's P1-1 removed the *other* half of the upgrade lockout, which had survived inside `is_ours`. |
 | P1-7 credential rotation silently fails on `RestartSame` | Task 7 folds `sha256` of the rendered secret body — hash, never value — into the create-intent, so a rotated `auth_tag` or API key diverges the intent and classifies as `FencedReplace`, which does re-store the secret. `a_rotated_credential_diverges_the_intent_without_exposing_it` asserts both halves, and round 3 adds `a_value_that_changes_side_diverges_the_intent` for the case where nothing changes except which half of the split a value lands in. |
-| P1-8 concurrent deploys interleave | Task 12 takes a per-agent lease on the instance for the mutating window (`flock` making a lease record's read-modify-write atomic under a private `0700 root:root /run/buzz-backend-gcp`, TTL 900 s, renewed at each phase boundary, released by a `Drop` guard), and a loser fails cleanly with `another deploy … is already in progress`. Round 3's P1-4 moved the acquire **before** the observation the deploy acts on, and gave `operator::remove` the same lease. The destructive fence is narrowed from "re-read, then stop four to six round trips before the writes" to a single remote shell that re-reads the marker tuple and the running state and performs the stop; every later write carries its own guard. Task 15 Step 10 races two real deploys. |
+| P1-8 concurrent deploys interleave | Task 12 takes a per-agent lease on the instance for the mutating window (`flock` making a lease record's read-modify-write atomic under a private `0700 root:root /run/buzz-backend-gcp`, TTL 900 s, released by a `Drop` guard), and a loser fails cleanly with `another operation on buzz-acp@<id>.service is already in progress`. Round 3's P1-4 moved the acquire **before** the observation the deploy acts on, and gave `operator::remove` the same lease. Round 4's P1-1 moved the *proof* inside each mutation's own shell, so the lease is not merely renewed between steps but re-established under `flock` at the instant of every write. The destructive fence is narrowed from "re-read, then stop four to six round trips before the writes" to a single remote shell that re-reads the marker tuple and the running state and performs the stop; every later write carries its own marker guard and its own lease gate. Task 15 Step 10 races two real deploys. |
 | P1-9 partial writes are unmarked and unrecoverable | Task 9's `install_script` stages to `<path>.<token>.tmp` with the final mode and `mv`s into place, so no target path is ever observed half-written; `an_install_stages_and_renames_rather_than_writing_in_place` asserts the ordering, and the `trap` removes the staging file on every exit path including the ownership refusal. |
 
 **Round 2's P2s.** Folded in: P2-1 (writer→reader loop closed in Task 13 Step 1 against `capacity`'s real output, prefix contract asserted at the source in Task 8, over-capacity smoke at Task 15 Step 9, README says the desktop will not show it), P2-2 (`list` unions three enumerations and `remove` proceeds without the env file), P2-3 (`shared_writes` runs on `RestartSame`), P2-4 (`FETCHER_UNIT` carries the full set, with three documented deviations, asserted offline in Task 7 and against the loaded unit in Task 15 Step 7), P2-7 (the relay-mesh golden asserts the exact sentence). Not folded in, and recorded as residual risk below: P2-5 (capacity computed once, acted on later) and P2-6 (the standing `buzz-acp.service` is counted but not fenced).
@@ -9885,12 +10626,20 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | Finding | Answer |
 |---|---|
 | P1-1 the upgrade lockout moved rather than died | Ownership is version-aware, not version-blind. Task 6 replaces the `is_ours` boolean with `naming::Ownership` — `Ours`, `OursButOlder(v)`, `OursButNewer(v)`, `NotOurs` — computed by one rule, `ownership_of`, for file headers and Secret Manager labels alike. `OursButOlder` is an **authorised upgrade target** everywhere: Task 12's `classify` forces `FencedReplace` on a per-agent artifact carrying it, Task 12's `shared_writes` takes the ordinary write-if-different path for a shared one, Task 10's `store` rolls the labels forward with `secrets update --update-labels` and then adds a version, Task 13's `verify_removable` accepts it, and Task 9's `marker_fn` compares the version with `-le` rather than `=` so the install that rewrites the file is not refused by its own fence. Refusal is reserved for `OursButNewer` — a downgrade this build cannot reason about — and for a foreign or absent `managed-by`, and the two get different sentences. The two tests that enshrined the old behaviour are gone, replaced by `an_older_binding_version_is_ours_and_an_upgrade_target`, `a_future_binding_version_is_refused_at_both_tiers`, `a_binding_version_that_is_not_a_number_is_not_ours`, Task 12's `a_prior_version_agent_is_upgraded_not_refused`, Task 10's `a_secret_from_an_older_binding_version_is_rolled_forward`, and Task 13's `a_prior_version_agent_is_still_removable`. |
-| P1-2 `remove` stops a unit it has not proven it owns | Task 13's `remove` now opens with a **pre-stop gate**: one remote shell reads all four per-agent artifacts (`observe::agent_file_rows`, the same emitter the observer uses), and `verify_removable` requires at least one present artifact whose own `agent-pubkey-full` equals `--pubkey`. It runs before `secrets::destroy` and before `removal_script`, so nothing is stopped, disabled or destroyed on the strength of a 12-hex prefix match. A refusal names the four paths it looked at and tells the operator how to reclaim the agent by hand. `an_env_absent_agent_with_a_marked_sibling_is_removable` and `an_agent_with_no_matching_marker_is_refused_before_anything_stops` cover both directions, and the second also asserts the refusal is reached before any `systemctl` verb is sent. |
+| P1-2 `remove` stops a unit it has not proven it owns | Task 13's `remove` now opens with a **pre-stop gate**: one remote shell reads all four per-agent artifacts (`observe::agent_file_rows`, the same emitter the observer uses), and `verify_removable` requires at least one artifact to be present and **every** present one to be this provider's, at this binding version or older, and marked for `--pubkey` (round 4's P1-2 added the "every present one" half). It runs before `secrets::destroy` and before `removal_script`, so nothing is stopped, disabled or destroyed on the strength of a 12-hex prefix match. A refusal names the four paths it looked at and tells the operator how to reclaim the agent by hand. `an_env_absent_agent_with_a_marked_sibling_is_removable`, `an_agent_with_no_matching_marker_is_refused_before_anything_stops` and `a_half_migrated_agent_is_refused_before_anything_stops` cover the directions, and the second also asserts the refusal is reached before any `systemctl` verb is sent. |
 | P1-3 the marker guard counts lines, not distinct patterns | `grep -c -F -x{needles}` compared against `required.len()` is gone from both sites. Task 9's `marker_fn` emits a `marker_ok` shell function that captures the header once and asserts **each needle on its own** with `printf '%s\n' "$h" \| grep -Fqx -- <needle>`, returning non-zero on the first miss, then checks the binding version numerically. Task 9's `marker_guard` and Task 13's `removal_script` both call it, so there is one implementation rather than two copies of the same bug. `a_header_that_repeats_one_marker_line_does_not_satisfy_the_guard` and `a_repeated_marker_line_does_not_authorize_a_delete` feed a header whose first lines duplicate `# managed-by:` and omit `# agent-pubkey-full:` — and, for the shared tier, `# scope:` — and require a refusal. |
-| P1-4 the lease is acquired after the decision it protects | Task 12's `deploy` keeps a cheap **pre-lease look** — it costs no lease to refuse an unowned file or to no-op a live agent — and then takes the lease and observes and classifies **again** under it, acting only on that second observation: the fenced stop, the shared writes, the secret, the per-agent writes, the trail and `enable --now` all read from it. The authoritative observation is `DeployLease::observe`, a method on the guard, so it is unreachable without one and the ordering is a compile-time property rather than a convention; its first act is `renew`, a verify-then-refresh of the owner record, so a lease lost between acquire and observe stops the deploy instead of feeding it stale state. `operator::remove` takes the same per-agent lease and holds it across the ownership scan, `secrets::destroy` and the removal script. `the_authoritative_observation_cannot_run_without_a_held_lease` asserts the verify-before-refresh ordering and the `LOCK_UNAVAILABLE` exit. |
+| P1-4 the lease is acquired after the decision it protects | Task 12's `deploy` keeps a cheap **pre-lease look** — it costs no lease to refuse an unowned file — and then takes the lease and observes and classifies **again** under it, acting only on that second observation: the fenced stop, the shared writes, the secret, the per-agent writes, the trail, `enable --now` and (since round 4) the live no-op all read from it. The authoritative observation is `DeployLease::observe`, a method on the guard, so it is unreachable without one and the ordering is a compile-time property rather than a convention; its first act is `renew`, a verify-then-refresh of the owner record, so a lease lost between acquire and observe stops the deploy instead of feeding it stale state. `operator::remove` takes the same per-agent lease and holds it across the ownership scan, `secrets::destroy` and the removal script. `the_authoritative_observation_cannot_run_without_a_held_lease` asserts the verify-before-refresh ordering and the `LOCK_UNAVAILABLE` exit. |
 
-**Round 3's P2s.** All four folded in. P2-1: `DEPLOY_LEASE_SECONDS` is raised to 900 s — above the desktop's 600 s provider timeout — **and** `DeployLease::renew` is called at each phase boundary of the mutating window, which is the half that covers an unbounded direct CLI run; the renewal verifies the record still names this holder before refreshing it, so losing the lease stops the deploy rather than being papered over. P2-2: `render::plan` refuses a `secret_body()` over `SECRET_MANAGER_MAX_PAYLOAD_BYTES` (64 KiB) in the **pure** phase, before a transport exists, and the core's 2 MiB test is kept and re-documented to say exactly what it does and does not claim. P2-3: the lease record moved to a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp`, a non-regular or non-root-owned record is treated as corrupt and replaced, and a future-dated timestamp is corrupt rather than fresh. P2-4: `a_value_that_changes_side_diverges_the_intent` holds the key set and the value multiset fixed and swaps which half of the split each value lands in.
+**Round 3's P2s.** All four folded in. P2-1: `DEPLOY_LEASE_SECONDS` is raised to 900 s — above the desktop's 600 s provider timeout — **and** the owner record is refreshed with a verify-then-refresh that runs inside every mutation's own shell (round 4 moved it there from the standalone phase-boundary calls), which is the half that covers an unbounded direct CLI run; losing the lease stops the operation rather than being papered over. P2-2: `render::plan` refuses a `secret_body()` over `SECRET_MANAGER_MAX_PAYLOAD_BYTES` (64 KiB) in the **pure** phase, before a transport exists, and the core's 2 MiB test is kept and re-documented to say exactly what it does and does not claim. P2-3: the lease record moved to a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp`, a non-regular or non-root-owned record is treated as corrupt and replaced, and a future-dated timestamp is corrupt rather than fresh. P2-4: `a_value_that_changes_side_diverges_the_intent` holds the key set and the value multiset fixed and swaps which half of the split each value lands in.
 
+### Round 4's three P1s and its P2, and where each is answered
+
+| Finding | Answer |
+|---|---|
+| P1-1 the lease is renewed, but not *held*, across each mutation | Every remote mutation now carries the lease proof **in its own shell, under the same `flock` the owner record can only be changed under**. Task 9 adds `under_lease(agent, token, root_script)` — `sudo -n flock -w 5 -E 75 <lock> sh -c '<gate><root_script>'` — where the gate is a verify-then-refresh of the record; `install_script`, `append_script`, `Remote::run_fenced`, Task 12's `fenced_stop_script` and start step, and Task 13's `removal_script` all run inside it, and `Remote::{install, append, run_fenced}` take `&dyn Held`, whose only implementor is `DeployLease`. A lost lease therefore **prevents** the write: the `mv`, the `tee -a`, the `systemctl` and the `rm` never execute, and the caller gets `remote::lease_lost`. The stall the finding describes cannot defeat it, because a takeover requires the same `flock` — Task 12's "Why the lease is proved inside every mutation, and why not one long session" records the argument in full, including how the single-session alternative was evaluated and why it was rejected. Tests: `every_mutating_script_proves_the_lease_in_its_own_shell`, `the_lease_proof_and_the_mutation_cannot_be_separated`, `a_lost_lease_reads_as_a_lease_loss_not_an_ownership_refusal`. |
+| P1-2 `remove` stops and destroys before noticing a mixed-version fleet | Task 13's `verify_removable` is now the same shape as `classify`: **refusals over every present artifact first**, authorisation second. A present artifact that is `OursButNewer`, `NotOurs`, ours-without-an-identity-line, or marked for a different pubkey refuses the whole `remove` — even when a sibling proves the requested pubkey — and `OursButOlder` is still accepted, so a uniform prior-version agent stays removable. The gate still runs before `secrets::destroy` and before `removal_script`, so nothing is stopped, disabled or destroyed. Tests: `a_half_migrated_agent_is_refused_before_anything_stops` (an older-or-current env for this pubkey beside a newer sibling), plus the four pre-existing ones, unchanged. |
+| P1-3 a torn install is misread as healthy | Task 12's `classify` now lets `RestartSame` hold only when **every** expected per-agent artifact is present and its marker carries the **same** create-intent as the env marker's; anything else is `FencedReplace`. The refusal loop above it already establishes that every present artifact is actionable and names this pubkey, so the added condition is exactly "none missing, and all agreeing". Task 11's `agent_paths` doc — which said the siblings are "never interrogated for intent" — is rewritten to say what is now true. Tests: `a_torn_install_is_replaced_not_restarted`, `a_missing_sibling_is_replaced_not_restarted`, and the `obs` fixture is now a coherent four-artifact set rather than an env file with three absent siblings. |
+| P2 a previewed-live agent is never rechecked | **Revalidated**, not accepted. The pre-lease look keeps its `Refuse` fast exit — a refusal is conservative, changes nothing, and should cost nobody a lease — but the `NoOp` early return is deleted, so a live no-op is decided from `DeployLease::observe` like every other verdict. The reasoning, and the bound on what remains stale, is in Task 12's "Why a live no-op is decided under the lease". |
 
 ### The three rejected findings
 
@@ -9907,13 +10656,14 @@ Each is recorded in Global Constraints with its evidence, and repeated at the co
 - `naming::header_line(name, value)` — defined Task 6; the single renderer of every marker line, used by Task 7 (`agent_owner_marker`, `shared_owner_marker`), Task 9's tests, Task 11 (`observe_script`, `parse_agent_file_row`), and Task 13 (`listing_script`, `removal_script`). Every reader matches strings this produces.
 - `Names` — defined Task 6 with both constructors; `new(&AgentIdentity)` used in Tasks 7 and 12; `from_pubkey_hex(&str)` in Task 13's `remove` and in Tasks 11 and 12's tests. Its eleven accessors are used in Tasks 7, 11 (via `agent_paths`), 12 (`unit`, `secret_unit`, `env_path`, `instance`), and 13 (all of them plus `dropin_dir`, `secret_dropin_dir`).
 - `AgentMarker { pubkey_full, create_intent }` — defined Task 6; rendered Task 7, parsed Tasks 11 and 13, compared Task 12. `AgentMarker::parse` returns `Some` for a header this build may act on — its own version *or older* — and `None` otherwise, so a parsed marker is by construction actionable and the version question is answered separately by `agent_ownership`. `shared_marker()` / `shared_ownership()` replace the former `SharedMarker` type and the former `is_shared_marker` boolean: rendered Task 7, matched line-wise by Tasks 11 and 9.
-- `RemoteFile { path, mode, body, owner_marker }` and `SharedArtifact { file, sha256 }` — defined Task 7; consumed Tasks 9 (`install`, `append`) and 12 (`shared_writes`, and both test constructors, which pass `owner_marker: Vec::new()` because those files are never installed). `owner_marker` carries the tier's **identity** lines only — `managed-by` plus `agent-pubkey-full` or `scope` — because the binding version is compared as an ordering by `marker_fn`, not matched as a literal line; an exact `# binding-version: N` needle is what made an install refuse the very file it was upgrading.
-- `Plan { per_agent, shared, secret_env, create_intent, trail }` with `secret_body()` / `redacted_secret_body()` — defined Task 7; consumed Tasks 12 and 13. `trail` is a `RemoteFile` rather than the former `trail_header: String`, which is what lets `Remote::append` carry the same fence as `Remote::install` without a fifth parameter.
+- `RemoteFile { path, mode, body, owner_marker }` and `SharedArtifact { file, sha256 }` — defined Task 7; consumed Tasks 9 (`install`, `append`) and 12 (`shared_writes`, and both test constructors, which pass `owner_marker: Vec::new()` because those files are never installed). `owner_marker` carries the tier's **identity** lines only — `managed-by` plus `agent-pubkey-full` or `scope` — because the binding version is compared as an ordering by `marker_fn`, not matched as a literal line; an exact `# binding-version: N` needle is what made an install refuse the very file it was upgrading. Round 4 changed only the *signatures* that consume it: `Remote::install(&self, file, lease: &dyn Held)` and `Remote::append(&self, file, record, lease: &dyn Held)`, so the struct itself is unchanged and Task 7 needs no edit.
+- `Plan { per_agent, shared, secret_env, create_intent, trail }` with `secret_body()` / `redacted_secret_body()` — defined Task 7; consumed Tasks 12 and 13. `trail` is a `RemoteFile` rather than the former `trail_header: String`, which is what lets `Remote::append` carry the same marker fence and the same lease gate as `Remote::install` without extra parameters.
 - `Observation { systemd, markers, harness_installed, reserved_bytes, available_bytes }` and `MarkerState { env, siblings, shared }` with `agent_files()` — defined Task 11; consumed Task 12. `SHARED_PATHS` is the shared ordering between Tasks 11, 12 and 13, and matches the three `shared_artifact` calls in Task 7; `agent_paths` is the shared ordering between Task 11's script and its parser.
 - `remote::Gcloud` — defined Task 9, implemented for `Remote` there, consumed by Task 10 (`&dyn Gcloud`) and implemented again by Task 10's test `Recorder`. `&Remote` coerces at every call site (Tasks 12 and 13).
-- `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED, MARKER_SCAN_LINES}` — defined Task 9; `OWNERSHIP_REFUSED` mapped by `Remote::install`/`append` in the same task, the other three by Task 12, and `MARKER_SCAN_LINES` used by Tasks 11, 12 and 13. `remote::marker_fn(required) -> String` is `pub(crate)`, defined Task 9 and consumed by Task 9's own `marker_guard` and Task 13's `removal_script` — one definition of "does the header in `$h` carry every needle, at a binding version this build may act on", because `grep -c` counting lines rather than patterns was the same defect in both.
+- `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED, MARKER_SCAN_LINES}` — defined Task 9. `OWNERSHIP_REFUSED` is mapped by `Remote::install`/`append` in the same task; `LOCK_UNAVAILABLE` is mapped in **both** tasks now, because round 4 made it a per-mutation outcome rather than only an acquire/renew one — Task 9's `install`/`append` and Task 12's `fenced_stop`, start step and `DeployLease::renew`, and Task 13's removal step, all translate it through the one sentence `remote::lease_lost` renders; `MARKER_CHANGED` and `AGENT_STARTED` are Task 12's alone; `MARKER_SCAN_LINES` is used by Tasks 11, 12 and 13. `remote::marker_fn(required) -> String` is `pub(crate)`, defined Task 9 and consumed by Task 9's own `marker_guard` and Task 13's `removal_script` — one definition of "does the header in `$h` carry every needle, at a binding version this build may act on", because `grep -c` counting lines rather than patterns was the same defect in both.
+- `remote::{Held, under_lease, lease_gate, lease_paths, lease_lost, LEASE_DIR, LEASE_FLOCK_WAIT_SECONDS}` — defined Task 9, added in round 4. `Held` has one method, `agent(&self) -> &str`, and exactly one implementor, `reconcile::DeployLease`; `Remote::{install, append, run_fenced}` all take `&dyn Held`, so "this write happens under a lease" is a signature rather than a comment — the same discipline round 3 applied to the authoritative observation. `under_lease(agent, token, root_script)` is the single place the `sudo -n flock -w W -E 75 <lock> sh -c '<gate><root_script>'` shape is spelled; it is consumed by Task 9's `install_script`/`append_script`/`Remote::run_fenced` and by Task 12's `renew_lease_script`, which is now nothing but `under_lease(instance, token, "")` — one definition of "prove the record still names us, then push its expiry out". The *policy* stays in Task 12: `DEPLOY_LEASE_SECONDS`, `lease_preamble`'s freshness arithmetic, `acquire_lease`, `release_lease_script` and the `Drop` guard. The split is deliberate — the proof is a transport concern because every mutating script this binding sends has to carry it, and the policy is the reconciler's because it is about deploys.
 - `secrets::{verify_owned, store, destroy}` take `pubkey_full: &str` — defined Task 10; `deploy` passes `identity.pubkey_hex()` (Task 12), `remove` passes the operator's normalized value (Task 13). `naming::normalize_pubkey` (Task 6) is the single validation point. `verify_owned` returns `Result<Ownership, String>` so `store` can tell an upgrade from a steady state; `destroy` discards it.
-- `naming::{Ownership, ownership_of, agent_ownership, shared_ownership, BINDING_VERSION_NUM}` — defined Task 6. `ownership_of` is the single rule turning a `managed-by`/`binding-version` pair into a verdict, fed by both file-header tiers (Task 6) and by Secret Manager's two labels (Task 10), so the four states have one definition per binding rather than one per storage medium. `Ownership` is consumed by Task 10 (`verify_owned`), Task 11 (`AgentFileState::ownership`, `SharedFileState::ownership`), Task 12 (`classify`) and Task 13 (`verify_removable`). `BINDING_VERSION_NUM` additionally reaches the shell, in Task 9's `marker_fn`, Task 12's `fenced_stop_script` and Task 13's `listing_script`, as the right-hand side of a `-le` comparison.
+- `naming::{Ownership, ownership_of, agent_ownership, shared_ownership, BINDING_VERSION_NUM}` — defined Task 6. `ownership_of` is the single rule turning a `managed-by`/`binding-version` pair into a verdict, fed by both file-header tiers (Task 6) and by Secret Manager's two labels (Task 10), so the four states have one definition per binding rather than one per storage medium. `Ownership` is consumed by Task 10 (`verify_owned`), Task 11 (`AgentFileState::ownership`, `SharedFileState::ownership`), Task 12 (`classify`) and Task 13 (`verify_removable`, which round 4 turned from a marker-only scan into the same four-arm match `classify` uses — so it is imported into `operator`'s **parent** module now, and the test module's `use crate::naming::{…}` drops it to avoid a duplicate import beside `use super::*`). `BINDING_VERSION_NUM` additionally reaches the shell, in Task 9's `marker_fn`, Task 12's `fenced_stop_script` and Task 13's `listing_script`, as the right-hand side of a `-le` comparison.
 - `observe::{FIELD_HELPER, agent_file_rows, parse_agent_file_row}` — `pub(crate)`, defined Task 11 and consumed by Task 13's pre-stop ownership scan. Factored out of `observe_script` rather than re-spelled there: the row format is a contract between an emitter and a parser, and a second emitter is a second thing to keep in sync.
 - `capacity::{GIB, warning_lines, trail_record, now_rfc3339, parse_reported_bytes}` — defined Task 8; used in Task 7's leak test, Task 11's parser, Task 12, and Task 13 (both `dry_run` and the writer→reader test).
 - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload)` — signature fixed in Task 5 and unchanged by Task 12, so `main.rs` is written once.
@@ -9922,28 +10672,29 @@ Each is recorded in Global Constraints with its evidence, and repeated at the co
 
 Every block was walked again after this round's edits:
 
-- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile. Both now sit inside the mutating block, beside the `obs` they were computed from. The block is an expression whose value is `started_at: u64`; `lease` is dropped at its closing brace and on every `?` inside it, and the two `return`s inside it exit `deploy` — dropping the lease — rather than yielding a block value, which is why the block's type stays `u64`. `plan.per_agent`, `plan.shared` and `plan.trail` are disjoint field borrows. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared. `authorizing_intent` is a `&str` borrowed out of `obs` and read by `fenced_stop` before any later statement touches `obs` mutably — nothing does.
-- Task 12 `DeployLease` holds `&'a Remote` and a `String`; `Drop` takes `&mut self` and calls `self.remote.run(…)`, which needs only `&Remote` — no aliasing conflict. `acquire_lease` returns the guard with the `remote` borrow it was given, so the lease cannot outlive the transport. `DeployLease::observe` and `DeployLease::renew` take `&self` and call `self.remote.run(…)`, another shared borrow, so they compose with the `&Remote` every other call in the window already holds. The struct is `pub(crate)` because `acquire_lease` is — a private type in a `pub(crate)` signature does not compile — and Task 13's `remove` names neither type: `let lease = acquire_lease(remote, &names)?;` and inference does the rest. `renew` is `pub(crate)` for the same reason; `observe` stays private because only `deploy` takes it.
-- Task 12 `fenced_stop` matches `out.code` against three `const i32` patterns plus a guarded `_` and a binding arm; constants are legal patterns and the arms are exhaustive because the last binds.
+- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile. Both sit inside the mutating block, beside the `obs` they were computed from. The block is an expression whose value is `started_at: u64`; `lease` is dropped at its closing brace and on every `?` inside it, and the two `return`s inside it exit `deploy` — dropping the lease — rather than yielding a block value, which is why the block's type stays `u64`. The pre-lease match now has one `return` (the refusal) and one fall-through arm covering `NoOp` as well, so the only `NoOp` success comes from inside the block. `plan.per_agent`, `plan.shared` and `plan.trail` are disjoint field borrows. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared. `authorizing_intent` is a `&str` borrowed out of `obs` and read by `fenced_stop` before any later statement touches `obs` mutably — nothing does. Every mutating call in the block passes `&lease` alongside the `&remote` it is invoked on; both are shared borrows and `lease` outlives all of them.
+- Task 12 `DeployLease` holds `&'a Remote` and a `String`; `Drop` takes `&mut self` and calls `self.remote.run(…)`, which needs only `&Remote` — no aliasing conflict. `acquire_lease` returns the guard with the `remote` borrow it was given, so the lease cannot outlive the transport. `DeployLease::observe` and `DeployLease::renew` take `&self` and call `self.remote.run(…)`, another shared borrow, so they compose with the `&Remote` every other call in the window already holds. `impl Held for DeployLease<'_>` returns `&self.instance` as `&str`, borrowed for the call it is passed into and no longer; `remote.install(file, &lease)` therefore holds two shared borrows of the same `Remote` (one direct, one through the guard), which is fine. The struct is `pub(crate)` because `acquire_lease` is — a private type in a `pub(crate)` signature does not compile — and Task 13's `remove` names neither type: `let lease = acquire_lease(remote, &names)?;` and inference does the rest. `renew` is `pub(crate)` for the same reason; `observe` stays private because only `deploy` takes it.
+- Task 12 `fenced_stop` matches `out.code` against four `const i32` patterns plus a guarded `_` and a binding arm; constants are legal patterns, the four are distinct values (75/76/77/78), and the arms are exhaustive because the last binds.
 - Task 11 `parse_observation`: `agent_files.remove(0)` moves the env row out of the `Vec` before the remainder becomes `siblings`; every `section(...)` borrow of `stdout` ends at the `String` conversion. `MarkerState::agent_files` returns `impl Iterator<Item = &AgentFileState>` borrowing `&self`, which every caller consumes inside one expression.
 - Task 10 `store` takes `&dyn Gcloud`; `labels`/`annotations`/`member` are locals whose `&str` views live to the end of their `gcloud` call. The `match describe(...)?` arms both end before the first mutation, so no borrow of the described value survives into it. `verify_owned` now returns `Result<Ownership, String>`; `Ownership` is `Copy`, so the `if let Ownership::OursButOlder(from)` binding in `store` copies out of a temporary rather than borrowing it, and `destroy` discards the value with a plain `?;`.
 - Task 9 `Gcloud for Remote`: `pipe` is a named binding so the `BrokenPipe` branch can inspect the error, and it is `drop`ped explicitly before `wait_with_output` — without that the child would never see EOF.
-- Task 9 `install_script`/`append_script`/`marker_guard`/`marker_fn` are pure `String` builders over `&RemoteFile`; `staged` is computed before the `format!` that consumes it by value. `marker_fn` returns the `marker_ok` shell definition and `marker_guard` prepends it, so a caller cannot emit the call without the definition.
+- Task 9 `install_script`/`append_script`/`marker_guard`/`marker_fn`/`lease_gate`/`under_lease` are pure `String` builders; `staged` is computed before the two `format!`s that read it, and `critical` before the `format!` that `sq`-wraps it. `marker_fn` returns the `marker_ok` shell definition and `marker_guard` prepends it, so a caller cannot emit the call without the definition. `under_lease` takes `&str` and returns an owned `String`, so the temporary `(lock, owner)` pair from `lease_paths` is consumed inside it and nothing borrows out.
 - Task 7 `plan`: `agent` is shadowed by the owned `with_instance_harness(agent)` copy and then borrowed as `&agent` for `build_env` — the parameter is not used after the shadow. `for (key, value) in env` consumes the map **after** the newline scan that borrows it. `secret_body` is computed before the hasher and read once. `owner_marker` is cloned into each of the three `per_agent` files and moved into `trail` last.
 - Task 7 `feed` is a `FnMut` closure capturing `hasher` mutably; it is dropped before `hasher.finalize()` because its last call is in a `for` loop that ends first. **If the borrow checker objects, replace the closure with a plain `fn feed(hasher: &mut Sha256, label: &str, value: &str)` and pass `&mut hasher` at each call** — same behavior, no capture.
 - Task 13 `run`: `Cli` is destructured first, so `command` moves while `project`/`zone`/`instance` remain owned locals.
-- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String`; `removal_script(&names, &pubkey)` borrows both after `secrets::destroy` has finished with them. The lease is bound to `lease` before the ownership scan and lives to the end of `remove` — it is *used* (two `renew` calls), so no leading underscore — and `secrets::destroy` and the removal script both run under it; it borrows the same `&Remote` the later `remote.run(…)` calls take, which is a shared borrow either way. `files` is an owned `Vec<AgentFileState>`, so the `verify_removable(&files, …)` slice borrow ends before the `files.iter()` check below it.
+- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String`; `removal_script(&names, &pubkey)` borrows both after `secrets::destroy` has finished with them. The lease is bound to `lease` before the ownership scan and lives to the end of `remove` — it is *used* (one `renew` call plus the `&lease` every fenced call takes), so no leading underscore — and `secrets::destroy` and the removal script both run under it; `remote.run_fenced(&lease, …)` passes `&DeployLease` where `&dyn Held` is expected, which is an unsized coercion of a shared borrow, so it composes with the `&Remote` the same expression already holds. `files` is an owned `Vec<AgentFileState>`, so the `verify_removable(&files, …)` slice borrow ends before the `files.iter()` check below it.
 - Task 5 `respond`: `raw` is borrowed by `refuse_relay_mesh(&raw)` and then **moved** into `serde_json::from_value(raw)` — the borrow has ended. Same shape as `crates/buzz-backend-kubernetes/src/main.rs:65-77`, which compiles.
 
 ### Remaining risk, stated honestly
 
-1. **The deploy lease is advisory and TTL-bounded, not a mutex.** A provider killed between acquire and release blocks the next deploy of that agent for up to `DEPLOY_LEASE_SECONDS` (900 s), and a lease older than that is stolen rather than waited on. Round 3's P2-1 raised the TTL above the desktop's 600 s provider timeout and added `DeployLease::renew` at each phase boundary of the mutating window, so a live holder cannot age its own lease out and a dead one still expires — but the longest un-renewed gap is still one phase (up to seven installs), and a direct CLI run whose link stalls for 900 s inside a phase can be overtaken. The loser's failure is clean either way, because every write carries its own marker guard. A real mutex would need a long-lived SSH master connection, which is the same change residual risk 4 wants.
-2. **Capacity is computed once and acted on up to 240 s later** (round 2, P2-5). `warning_lines` runs against the observation taken before the mutating window; another agent started in between is not counted. The warning is advisory and never vetoes, so the failure mode is an under-reported warning rather than a wrong action.
-3. **The pre-existing non-instanced `buzz-acp.service` is counted in capacity but never fenced** (round 2, P2-6). It contributes its declared `MemoryMax` to `reserved_bytes` and is otherwise invisible to this provider — it carries no marker, is not named `buzz-acp@*`, and is itself non-conforming (`Restart=always`). Nothing this binding does can touch it; nothing it does protects it either.
-4. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups, and round 3's lease renewals add four more round trips to the mutating window. Correct but wasteful; a future revision should hold one SSH master connection open, which would also let the lease be a real `flock` and make renewal free.
-5. **`list` enumerates from the instance, never from Secret Manager.** It now unions the env glob, `systemctl list-units`/`list-unit-files` and the drop-in directories, so a deleted env file no longer hides a running agent — but an agent whose *entire* on-instance footprint is gone while its secret survives is still invisible, and the operator has to run the `gcloud secrets list --filter="labels.managed_by=buzz-backend-gcp"` the README prints. The labels exist precisely so a follow-up can cross-check both sides; this revision does not.
-6. **No test proves the fetcher script actually runs.** Its content is asserted byte-wise offline, but its behavior — arity refusal, shape refusal, the chmod/chown ordering that keeps `CapabilityBoundingSet=CAP_CHOWN` sufficient, the atomic rename — is only exercised by Task 15's live deploy succeeding. Task 15 Step 7 reads the loaded unit's directives back, which catches a documentation/unit divergence but not a script defect. A shellcheck step or a container-based script test would close it; neither is in scope here.
-7. **The desktop still cannot render a success-path warning.** Task 8 works around it durably and Task 14's README tells the operator so, but closing it properly needs a `warning` field added to `docs/remote-agents.md:421` and rendered desktop-side. Recorded as design §Follow-ups item 4, deliberately not attempted here.
-8. **A stale `<path>.<token>.tmp` can survive a hard connection loss.** The install script's `trap` removes it on every shell exit, but a connection dropped mid-write leaves the remote shell killed by SIGHUP with the staging file behind. It is inert — never at a target path, never loaded by systemd, and reaped from `/run` on reboot for the fetcher's own temp — but a `/etc` one persists until an operator removes it. This is the cost of P1-9's fix, and it is the right side of the trade: a stray `.tmp` is visible and harmless, a truncated unit file is neither.
-9. **A future binding version is refused, and that refusal is one-directional.** Round 3's P1-1 made ownership version-aware: an artifact written at an *older* `binding-version` is an upgrade target, and one written at a *newer* one is a refusal in both `deploy` and `remove`. That is deliberate — a build that does not understand a layout must not overwrite or delete it — but it means an operator who installs a newer provider, deploys, and then rolls back to an older binary cannot remove those agents with the old binary. The recovery is to run the newer binary's `remove`, which the refusal names. There is no in-band downgrade path and this revision does not invent one.
-10. **`list` reports a newer-version agent as unmarked.** `listing_script` recovers a pubkey from any header at a binding version this build may act on, which now includes older ones; a *newer* one is skipped, so the row appears with `<pubkey unknown>`. The rendered note says "no marker this build recognises" rather than "no marker", so the text is not a lie, but the operator still has to reach for `gcloud secrets list` or a newer binary. Distinguishing the two would need a fourth flag value on the row and a fourth render arm; the failure is visible and recoverable, so it is recorded rather than built.
+1. **The mutating window is a sequence of leased writes, not one atomic transaction.** Round 4's P1-1 closed what made that unsafe: every remote mutation now proves the owner record still names this process **inside its own shell, under the same `flock` the record can only be changed under**, so a holder that stalls past the TTL and is legitimately overtaken has its next write *refused* rather than landed. What remains is that the window is still a sequence. A loser's writes are a **prefix**: it can have installed the shared templates and then be refused at the per-agent installs, and because its last write strictly precedes the winner's acquire in lock order, the winner's authoritative observation sees that prefix and reconciles it. That is convergence by re-entry, which is what [L2] asks for — not a rollback, and this revision does not invent one. A provider killed between acquire and release still blocks the next deploy of that agent for up to `DEPLOY_LEASE_SECONDS` (900 s), and a lease older than that is stolen rather than waited on.
+2. **One mutation in the window cannot carry the lease: the Secret Manager version add.** `secrets::instance_service_account` and `secrets::store` are `gcloud` API calls issued from the operator's machine with the operator's own credentials, against a service the instance's lock knows nothing about — and they have to stay there, because the instance's service account deliberately holds per-secret `secretAccessor` only, so a compromised VM cannot mint or read another agent's secret. A `flock` on the VM cannot fence a call that never reaches the VM. The exposure is bounded on both sides: `deploy` renews immediately before it (the only standalone renewal left in the window, precisely because this is the only stretch no fenced mutation covers), and every step after it — the per-agent installs, the trail, `enable --now` — is fenced, so a provider that lost the lease during the call cannot start an agent against what it added. What can survive is a superseded `latest` version added by a loser whose `gcloud secrets versions add` stalled past the takeover. A *running* agent is unaffected: the fetcher unit reads `latest` once, at unit start. A later `RestartSame` would fetch it, and the next `FencedReplace` re-stores and clears it. Closing this properly needs the fetcher to pin a version the deploy names, which is a design change rather than a patch.
+3. **Capacity is computed once and acted on up to 240 s later** (round 2, P2-5). `warning_lines` runs against the observation taken before the mutating window; another agent started in between is not counted. The warning is advisory and never vetoes, so the failure mode is an under-reported warning rather than a wrong action.
+4. **The pre-existing non-instanced `buzz-acp.service` is counted in capacity but never fenced** (round 2, P2-6). It contributes its declared `MemoryMax` to `reserved_bytes` and is otherwise invisible to this provider — it carries no marker, is not named `buzz-acp@*`, and is itself non-conforming (`Restart=always`). Nothing this binding does can touch it; nothing it does protects it either.
+5. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups. The mutating window itself is cheaper than round 3's — the lease gate refreshes the record from inside each mutation, so three of the four standalone renewals are gone — but it is still a dozen round trips. Correct but wasteful; a future revision should hold one SSH master connection open, which is also the only shape in which the lease could be a `flock` *held* across the whole window rather than re-proved per write (Task 12 records why that shape was not taken here).
+6. **`list` enumerates from the instance, never from Secret Manager.** It now unions the env glob, `systemctl list-units`/`list-unit-files` and the drop-in directories, so a deleted env file no longer hides a running agent — but an agent whose *entire* on-instance footprint is gone while its secret survives is still invisible, and the operator has to run the `gcloud secrets list --filter="labels.managed_by=buzz-backend-gcp"` the README prints. The labels exist precisely so a follow-up can cross-check both sides; this revision does not.
+7. **No test proves the fetcher script actually runs.** Its content is asserted byte-wise offline, but its behavior — arity refusal, shape refusal, the chmod/chown ordering that keeps `CapabilityBoundingSet=CAP_CHOWN` sufficient, the atomic rename — is only exercised by Task 15's live deploy succeeding. Task 15 Step 7 reads the loaded unit's directives back, which catches a documentation/unit divergence but not a script defect. A shellcheck step or a container-based script test would close it; neither is in scope here.
+8. **The desktop still cannot render a success-path warning.** Task 8 works around it durably and Task 14's README tells the operator so, but closing it properly needs a `warning` field added to `docs/remote-agents.md:421` and rendered desktop-side. Recorded as design §Follow-ups item 4, deliberately not attempted here.
+9. **A stale `<path>.<token>.tmp` can survive a hard connection loss.** The install script's `trap` removes it on every shell exit, but a connection dropped mid-write leaves the remote shell killed by SIGHUP with the staging file behind. It is inert — never at a target path, never loaded by systemd, and reaped from `/run` on reboot for the fetcher's own temp — but a `/etc` one persists until an operator removes it. This is the cost of P1-9's fix, and it is the right side of the trade: a stray `.tmp` is visible and harmless, a truncated unit file is neither.
+10. **A future binding version is refused, and that refusal is one-directional.** Round 3's P1-1 made ownership version-aware: an artifact written at an *older* `binding-version` is an upgrade target, and one written at a *newer* one is a refusal in both `deploy` and `remove`. That is deliberate — a build that does not understand a layout must not overwrite or delete it — but it means an operator who installs a newer provider, deploys, and then rolls back to an older binary cannot remove those agents with the old binary. Round 4's P1-2 widens that refusal to a *mixed* fleet: one newer sibling now blocks `remove` for the whole agent, which is the point, because the alternative was stopping the newer deployment and destroying its secret while politely keeping its files. The recovery is the same in both cases and the refusal names it: run the newer binary's `remove`. There is no in-band downgrade path and this revision does not invent one.
+11. **`list` reports a newer-version agent as unmarked.** `listing_script` recovers a pubkey from any header at a binding version this build may act on, which now includes older ones; a *newer* one is skipped, so the row appears with `<pubkey unknown>`. The rendered note says "no marker this build recognises" rather than "no marker", so the text is not a lie, but the operator still has to reach for `gcloud secrets list` or a newer binary. Distinguishing the two would need a fourth flag value on the row and a fourth render arm; the failure is visible and recoverable, so it is recorded rather than built.
