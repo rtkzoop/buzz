@@ -1657,7 +1657,10 @@ The second binding's realization of the two lists above, in its own vocabulary:
    rather than empty, because the fetched file is `chown`ed to `buzzacp` so the
    agent unit's manager can hand it over as an `EnvironmentFile=` while the
    agent *process* cannot reach it; and `ReadWritePaths=-/run/buzz-acp-%i`
-   rather than `/var/lib/buzzacp`.
+   rather than `/var/lib/buzzacp`. The fetcher script exports
+   `CLOUDSDK_CONFIG` to a directory under that runtime path: `ProtectHome`
+   makes `/root/.config/gcloud` unreadable, and gcloud still needs a writable
+   config directory even when authenticating via the metadata server.
 
 ## Known Defects (at `28ae6cd21`)
 
