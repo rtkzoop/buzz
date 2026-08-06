@@ -9,6 +9,7 @@
 //! have a second, redundant error channel to keep in sync ([L2] item 1).
 
 mod config;
+mod naming;
 mod reconcile;
 
 use buzz_backend_core::wire::{self, Request, Response};
