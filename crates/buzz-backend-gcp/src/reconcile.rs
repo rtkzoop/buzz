@@ -16,6 +16,9 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     // transport exists — so every refusal reachable without GCP stays
     // reachable without GCP.
     let identity = AgentIdentity::from_nsec(&agent.private_key_nsec)?;
-    let _ = (cfg, identity);
+    let names = crate::naming::Names::new(&identity);
+    let generation = buzz_backend_core::identity::new_generation();
+    let plan = crate::render::plan(agent, cfg, &names, &identity, &generation)?;
+    let _ = plan;
     Err("deploy is not implemented yet".to_string())
 }

@@ -103,7 +103,6 @@ fn local(name: &str) -> String {
 /// Every deploy response fixture, compared after parsing so a field rename
 /// fails here rather than in a desktop reading `undefined`.
 #[test]
-#[ignore = "enabled in Task 7, when render::plan supplies these two refusals"]
 fn deploy_responses_match_their_fixtures() {
     // (case, request comes from the shared fixture directory)
     let cases = [
@@ -156,7 +155,6 @@ fn deploy_responses_match_their_fixtures() {
 /// ordinary provider value must not trip the shared-compute backstop, and the
 /// request must reach the deploy path's own gates.
 #[test]
-#[ignore = "enabled in Task 7, when render::plan supplies these two refusals"]
 fn an_ordinary_provider_is_not_refused_as_shared_compute() {
     let (stdout, _) = run(&binary(), &local("deploy-ordinary-provider.request.json"));
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();

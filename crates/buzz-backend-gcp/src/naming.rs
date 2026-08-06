@@ -53,7 +53,6 @@ pub const BINDING_VERSION_NUM: u32 = 1;
 pub const SHARED_SCOPE: &str = "provider-shared";
 
 /// Lowercase hex SHA-256 of `bytes`.
-#[allow(dead_code)] // Called once render::plan hashes a shared artifact's rendered body.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -76,7 +75,6 @@ pub struct Names {
 
 impl Names {
     /// Derive every name from a provider-decoded identity.
-    #[allow(dead_code)] // Called once reconcile's pure phase builds a Names for render::plan.
     pub fn new(identity: &AgentIdentity) -> Self {
         Self {
             instance: identity.short12().to_string(),
@@ -90,7 +88,6 @@ impl Names {
     }
 
     /// Full agent unit name — also the `agent_id` returned to the desktop.
-    #[allow(dead_code)] // Called once render::dry_run_report prints the agent_id line.
     pub fn unit(&self) -> String {
         format!("buzz-acp@{}.service", self.instance)
     }
@@ -102,13 +99,11 @@ impl Names {
     }
 
     /// Allowlisted environment, 0600 root, on the persistent boot disk.
-    #[allow(dead_code)] // Called once render::plan places the env file at it.
     pub fn env_path(&self) -> String {
         format!("/etc/buzz/acp-{}.env", self.instance)
     }
 
     /// The durable deploy trail, 0644 root (spec §Capacity).
-    #[allow(dead_code)] // Called once render::plan places the deploy trail at it.
     pub fn trail_path(&self) -> String {
         format!("/etc/buzz/acp-{}.trail", self.instance)
     }
@@ -120,7 +115,6 @@ impl Names {
     }
 
     /// This provider's drop-in on the agent unit: `MemoryMax` and `CPUQuota`.
-    #[allow(dead_code)] // Called once render::plan places the agent drop-in at it.
     pub fn dropin_path(&self) -> String {
         format!("{}/agent.conf", self.dropin_dir())
     }
@@ -135,14 +129,12 @@ impl Names {
 
     /// This provider's drop-in on the fetcher unit: the project and secret
     /// name the shared fetcher script reads from its environment.
-    #[allow(dead_code)] // Called once render::plan places the fetcher drop-in at it.
     pub fn secret_dropin_path(&self) -> String {
         format!("{}/agent.conf", self.secret_dropin_dir())
     }
 
     /// Secret Manager resource name. Its payload is the whole
     /// secret-classified environment, not just the key.
-    #[allow(dead_code)] // Called once render::plan names the Secret Manager resource.
     pub fn secret_name(&self) -> String {
         format!("buzz-agent-{}-private-key", self.instance)
     }
@@ -299,7 +291,6 @@ impl AgentMarker {
     /// Four contiguous lines beginning with `# managed-by: `, which is what
     /// lets every reader take the first `remote::MARKER_SCAN_LINES` of a file
     /// and have the whole marker.
-    #[allow(dead_code)] // Called once render::plan stamps a per-agent file with it.
     pub fn render(&self) -> String {
         format!(
             "{}\n{}\n{}\n{}\n",
@@ -345,7 +336,6 @@ impl AgentMarker {
 /// **nothing that is not**: no pubkey and no create-intent, because a shared
 /// file belongs to no single agent, and no content digest, for the reason in
 /// the module preamble.
-#[allow(dead_code)] // Called once render::plan stamps a shared file with it.
 pub fn shared_marker() -> String {
     format!(
         "{}\n{}\n{}\n",
