@@ -926,6 +926,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-backend-gcp"
+version = "0.1.0"
+dependencies = [
+ "buzz-backend-core",
+ "chrono",
+ "clap",
+ "hex",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "buzz-backend-kubernetes"
 version = "0.1.0"
 dependencies = [

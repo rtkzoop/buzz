@@ -1,0 +1,19 @@
+[package]
+name = "buzz-backend-gcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GCE/systemd backend provider for Buzz remote agents (docs/remote-agents.md)"
+
+[[bin]]
+name = "buzz-backend-gcp"
+path = "src/main.rs"
+
+[dependencies]
+buzz-backend-core = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+clap = { version = "4", features = ["derive"] }
