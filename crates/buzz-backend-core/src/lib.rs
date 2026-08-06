@@ -6,4 +6,6 @@
 //! providers must produce interchangeable launches from the same payload, so
 //! these live in one place rather than being reimplemented per binding.
 
+pub mod env;
+pub mod identity;
 pub mod wire;

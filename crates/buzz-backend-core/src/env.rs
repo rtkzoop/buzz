@@ -5,7 +5,7 @@
 //! two tiers supplied the same key, whichever entry landed in the map would
 //! win silently. Resolving in-provider makes later-wins explicit and testable.
 
-use buzz_backend_core::wire::{AgentPayload, LaunchBlock};
+use crate::wire::{AgentPayload, LaunchBlock};
 use std::collections::BTreeMap;
 
 /// Keys the authoritative tier owns.
@@ -20,7 +20,12 @@ use std::collections::BTreeMap;
 /// silent on. Clearing is also what the local spawn does: the desktop strips
 /// reserved keys from user env before the authoritative layer is written
 /// (`env_vars.rs:54-57`), so absent-means-absent in both paths.
-const AUTHORITATIVE_KEYS: &[&str] = &[
+///
+/// This list is **not** a secrecy classification. Three of its twelve entries
+/// (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_AUTH_TAG`) are credentials;
+/// the rest are public. A binding that splits the environment by sensitivity
+/// must use its own allowlist, not this one.
+pub const AUTHORITATIVE_KEYS: &[&str] = &[
     "BUZZ_RELAY_URL",
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",
@@ -45,12 +50,6 @@ pub const START_NONCE_KEY: &str = "BUZZ_MANAGED_AGENT_START_NONCE";
 /// suppresses it is non-conforming (L1 item 2) — and unlike a reserved-key
 /// collision, there is no "authoritative value" to overwrite it with. Refuse.
 const FORBIDDEN_KEY: &str = "BUZZ_ACP_NO_PRESENCE";
-
-/// Kubernetes' own cap on the summed value bytes of a Secret
-/// (`MaxSecretSize`, `pkg/apis/core/types.go`). Enforced here so an oversized
-/// env surfaces as a named provider error rather than an apiserver rejection
-/// partway through a deploy.
-const MAX_SECRET_BYTES: usize = 1024 * 1024;
 
 /// A POSIX-shaped env var name: `[A-Za-z_][A-Za-z0-9_]*`.
 ///
@@ -150,12 +149,18 @@ fn validate_respond_to_gate(respond_to: &str, allowlist: Option<&[String]>) -> R
 
 /// Inputs the provider itself supplies to the authoritative tier.
 pub struct AuthoritativeInputs<'a> {
-    /// The attempt's generation token — also the Secret's name suffix, so the
-    /// lifecycle correlator and the Secret generation are one identity.
+    /// The attempt's generation token — the lifecycle correlator, and on
+    /// substrates with per-generation objects also their name suffix.
     pub generation: &'a str,
-    /// Resolved from `provider_config.inactivity_seconds`; `None` when the
-    /// indefinite opt-in was chosen (which this version refuses elsewhere).
+    /// Resolved from the binding's inactivity config; `None` means the
+    /// indefinite opt-in.
     pub inactivity_seconds: Option<u64>,
+    /// Substrate cap on the summed environment value bytes, enforced here so
+    /// an oversized environment surfaces as a named provider error rather
+    /// than a rejection partway through a deploy. `None` when the substrate
+    /// imposes no such limit — a systemd `EnvironmentFile` on an ordinary
+    /// filesystem, for instance.
+    pub max_env_bytes: Option<usize>,
 }
 
 /// Resolve the full pod environment.
@@ -285,12 +290,13 @@ pub fn build_env(
     // logs and observer frames share one identity (§K8s Secrets).
     env.insert(START_NONCE_KEY.into(), auth.generation.to_string());
 
-    let total: usize = env.values().map(String::len).sum();
-    if total > MAX_SECRET_BYTES {
-        return Err(format!(
-            "agent environment is {total} bytes; Kubernetes caps Secret data \
-             at {MAX_SECRET_BYTES}"
-        ));
+    if let Some(cap) = auth.max_env_bytes {
+        let total: usize = env.values().map(String::len).sum();
+        if total > cap {
+            return Err(format!(
+                "agent environment is {total} bytes; this substrate caps it at {cap}"
+            ));
+        }
     }
 
     Ok(env)
@@ -322,6 +328,9 @@ mod tests {
             AuthoritativeInputs {
                 generation: "gen0001",
                 inactivity_seconds: Some(7200),
+                // Kubernetes' own cap, so every test routed through this
+                // helper keeps exactly the behavior it had before the move.
+                max_env_bytes: Some(1024 * 1024),
             },
         )
     }
@@ -551,10 +560,44 @@ mod tests {
             AuthoritativeInputs {
                 generation: "g",
                 inactivity_seconds: None,
+                max_env_bytes: Some(1024 * 1024),
             },
         )
         .unwrap();
         assert!(!env.contains_key("BUZZ_ACP_EXIT_AFTER_INACTIVITY"));
+    }
+
+    /// A substrate with no cap must not inherit Kubernetes' 1 MiB rule: a
+    /// systemd `EnvironmentFile` on a 38 GB boot disk has no such boundary to
+    /// respect, and `MAX_SECRET_BYTES` was an apiserver limit, not a law.
+    ///
+    /// What this does **not** say is that any environment this accepts is
+    /// deployable. `max_env_bytes: None` means "this core has no opinion", not
+    /// "no limit applies": each binding still owes its own substrate's rules.
+    /// The 2 MiB below is a case in point — `BIG` is not on the GCP binding's
+    /// non-secret allowlist, so that binding classifies it as secret, and the
+    /// secret half travels as one Secret Manager version, whose payload is
+    /// capped at 64 KiB. `buzz_backend_gcp::render::plan` therefore **refuses**
+    /// this exact environment, in its pure phase, before any mutation
+    /// (`a_secret_payload_over_secret_managers_cap_is_refused_before_any_mutation`).
+    /// That division is the point of the parameter: the core stops asserting a
+    /// limit it cannot know, and each binding asserts the one it can.
+    #[test]
+    fn an_uncapped_substrate_leaves_the_size_rule_to_its_binding() {
+        let big = "x".repeat(2 * 1024 * 1024);
+        let agent = payload_json(serde_json::json!({
+            "launch": { "owner_pubkey": "a".repeat(64), "env": { "BIG": big } }
+        }));
+        let env = build_env(
+            &agent,
+            AuthoritativeInputs {
+                generation: "g",
+                inactivity_seconds: Some(7200),
+                max_env_bytes: None,
+            },
+        )
+        .expect("no cap here means no refusal here");
+        assert_eq!(env["BIG"].len(), 2 * 1024 * 1024);
     }
 
     /// Structural guard over the whole authoritative list at once: whatever

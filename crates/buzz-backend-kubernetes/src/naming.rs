@@ -4,8 +4,6 @@
 //! provider decoded itself from `private_key_nsec` — never from a
 //! caller-supplied pubkey (§Deploy State Machine step 0).
 
-use nostr::nips::nip19::FromBech32;
-
 /// `app.kubernetes.io/managed-by` value: the management marker's identity half.
 pub const MANAGED_BY: &str = "buzz-backend-kubernetes";
 
@@ -34,53 +32,50 @@ pub const ANNOTATION_CREATE_INTENT: &str = "buzz.block.xyz/create-intent";
 /// for post-hoc attribution (§Image).
 pub const ANNOTATION_IMAGE: &str = "buzz.block.xyz/image";
 
-/// An agent identity the provider derived itself, plus every name it implies.
+/// An agent identity the provider derived itself, plus every Kubernetes name
+/// it implies.
 ///
-/// Constructing this type is the *only* way to obtain the names — so a
+/// A newtype over the shared [`buzz_backend_core::identity::AgentIdentity`]
+/// rather than a re-export: the five methods below are inherently Kubernetes'
+/// and the orphan rule forbids attaching them to a type from another crate.
+/// Constructing this is still the *only* way to obtain the names, so a
 /// caller-supplied pubkey cannot reach a selector by any path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentIdentity {
-    pubkey_hex: String,
-}
+pub struct AgentIdentity(buzz_backend_core::identity::AgentIdentity);
 
 impl AgentIdentity {
     /// Derive from the payload's `private_key_nsec`.
     ///
     /// Accepts bech32 `nsec1…`; a malformed or undecodable key is an
-    /// immediate error, before any substrate read or mutation
+    /// immediate error, before any cluster read or mutation
     /// (§Deploy State Machine step 0).
     pub fn from_nsec(nsec: &str) -> Result<Self, String> {
-        let secret = nostr::SecretKey::from_bech32(nsec.trim())
-            .map_err(|_| "private_key_nsec is not a decodable nsec1 key".to_string())?;
-        let keys = nostr::Keys::new(secret);
-        Ok(Self {
-            pubkey_hex: keys.public_key().to_hex(),
-        })
+        buzz_backend_core::identity::AgentIdentity::from_nsec(nsec).map(Self)
     }
 
     /// Full 64-hex public key — the annotation value and the comparison
     /// operand for candidate authentication.
     pub fn pubkey_hex(&self) -> &str {
-        &self.pubkey_hex
+        self.0.pubkey_hex()
     }
 
     /// Selector label value: first 32 hex chars (128 bits). A full hex pubkey
     /// is 64 chars and label values cap at 63, which is why this is truncated
     /// and why the annotation check is normative rather than decorative.
     pub fn label_pubkey(&self) -> &str {
-        &self.pubkey_hex[..32]
+        self.0.short32()
     }
 
     /// Deterministic pod name, also the returned `agent_id`.
     pub fn pod_name(&self) -> String {
-        format!("buzz-agent-{}", &self.pubkey_hex[..12])
+        format!("buzz-agent-{}", self.0.short12())
     }
 
     /// Per-attempt Secret name. `generation` is a fresh random token per
     /// create attempt — never reused — which is what makes payload and Secret
     /// atomic at the pod-spec boundary (§K8s Secrets).
     pub fn secret_name(&self, generation: &str) -> String {
-        format!("buzz-agent-{}-{}", &self.pubkey_hex[..12], generation)
+        format!("buzz-agent-{}-{}", self.0.short12(), generation)
     }
 
     /// Label selector matching this identity's objects *and* our management
@@ -111,16 +106,9 @@ impl AgentIdentity {
     }
 }
 
-/// A fresh generation token: 8 lowercase hex chars from the OS RNG.
-///
-/// Appears in the Secret name and as `BUZZ_MANAGED_AGENT_START_NONCE`, so the
-/// Secret generation and the harness's lifecycle-frame correlator are one
-/// identity (§Launch data tier 3).
-pub fn new_generation() -> String {
-    use rand::RngExt;
-    let n: u32 = rand::rng().random();
-    format!("{n:08x}")
-}
+/// A fresh generation token, shared with every other binding so the
+/// correlator has one spelling across substrates.
+pub use buzz_backend_core::identity::new_generation;
 
 #[cfg(test)]
 mod tests {

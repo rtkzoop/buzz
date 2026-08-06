@@ -12,7 +12,6 @@ mod classify;
 mod client;
 mod cluster;
 mod config;
-mod env;
 mod gc;
 mod image;
 mod intent;
@@ -124,11 +123,13 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
 
     // One generation for this operation's first attempt; the reconciler mints
     // its own per attempt and restamps the correlator to match.
-    let env = env::build_env(
+    let env = buzz_backend_core::env::build_env(
         &request.agent,
-        env::AuthoritativeInputs {
+        buzz_backend_core::env::AuthoritativeInputs {
             generation: &naming::new_generation(),
             inactivity_seconds: cfg.inactivity_seconds,
+            // Kubernetes' own `MaxSecretSize` (`pkg/apis/core/types.go`).
+            max_env_bytes: Some(1024 * 1024),
         },
     )?;
 
