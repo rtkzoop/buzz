@@ -27,6 +27,7 @@
 - Object names derive from the pubkey the provider decodes itself, never from a caller-supplied pubkey or a display name.
 - Run `just fmt` and `cargo clippy --workspace --all-targets -- -D warnings` before each commit. Do not run the full `just ci` per task; run it once at the end (Task 15).
 - **`--workspace` does not mean the whole repo.** Root `Cargo.toml:33` has `exclude = ["desktop/src-tauri"]`, so the desktop crate is a *separate* Cargo workspace that no `--workspace` or `-p` command in this plan reaches (AGENTS.md gotcha 5). It nonetheless depends on things this plan moves: `desktop/src-tauri/src/commands/agents_tests.rs:417` reads the shared `deploy-full-launch.request.json` fixture by relative path, because that fixture is the arbiter of a contract the desktop and every provider share. **Any task that moves, renames, or changes a shared fixture must also run** `cargo test --manifest-path desktop/src-tauri/Cargo.toml deploy_payload_matches_the_shared_full_launch_fixture` **and report the result.** Task 3 discovered this the hard way: the extraction broke that test, every plan-scoped command stayed green, and only a clean-cutover sweep for callers caught it.
+- **Interim `#[allow(dead_code)]` is permitted, and must come due.** `buzz-backend-gcp` is a binary crate with no `[lib]` target, so dead-code analysis is rooted at `main()`. Tasks 6-10 each add a module (`naming.rs`, `render.rs`, `capacity.rs`, `remote.rs`, `secrets.rs`) that nothing outside its own tests calls until the reconciler wires it, so `cargo clippy --all-targets -- -D warnings` will fail on the non-test build in between. Two rules, decided once so it is not rediscovered five times. **First:** annotate per item, never per module or crate, and give every annotation a comment naming the condition that removes it — a condition, not a guess ("once `reconcile::deploy` calls it", not "by Task N", because task numbers move). **Second: the task that wires a module deletes the annotations it makes live, in the same commit.** Do not leave one behind on the grounds that clippy still passes; an allow that outlives its reason is a permanent suppression wearing a promise. Task 14 sweeps for stragglers and fails if any remain.
 
 ### Three facts that were verified and must not be "fixed"
 
@@ -10309,7 +10310,28 @@ Expected: the install line prints, and `list` prints either agent rows or
 reported with a nonzero exit, not swallowed — if it prints nothing and exits
 0, Task 13's `out.ok()` check regressed.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Sweep for suppressions that never came due**
+
+Every `#[allow(dead_code)]` in this crate was interim, added because a module
+landed a task or more before the code that calls it, and each carries a comment
+naming the condition that retires it (Global Constraints). By this point every
+module is wired, so every one of them should be gone.
+
+Run:
+```bash
+grep -rn "allow(dead_code)" crates/buzz-backend-gcp/ && echo "STRAGGLERS ABOVE" || echo "clean"
+```
+Expected: `clean`, with no matches printed.
+
+A match is one of exactly two things, and they need opposite responses. Either
+the item **is** now reachable and the annotation is stale — delete it, and
+confirm `cargo clippy -p buzz-backend-gcp --all-targets -- -D warnings` still
+passes. Or the item is genuinely still unreachable, which means the plan
+shipped code nothing calls: say so in the report rather than deleting the
+annotation to make the grep quiet. Do not silence this step; a suppression that
+outlived its stated reason is precisely what it exists to catch.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -s -m "docs(backend-gcp): L3 conformance, README and install target"
