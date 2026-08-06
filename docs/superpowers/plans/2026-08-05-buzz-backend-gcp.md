@@ -10,7 +10,7 @@
 
 **Design:** [`docs/superpowers/specs/2026-08-05-buzz-backend-gcp-design.md`](../specs/2026-08-05-buzz-backend-gcp-design.md) — **approved**. Where this plan and the design disagree, the design wins.
 **Normative spec:** [`docs/remote-agents.md`](../../remote-agents.md)
-**Review this revision answers:** [`docs/superpowers/reviews/2026-08-05-buzz-backend-gcp-plan-review-r1.md`](../reviews/2026-08-05-buzz-backend-gcp-plan-review-r1.md)
+**Reviews this revision answers:** [r1](../reviews/2026-08-05-buzz-backend-gcp-plan-review-r1.md) · [r2](../reviews/2026-08-05-buzz-backend-gcp-plan-review-r2.md) · [r3](../reviews/2026-08-05-buzz-backend-gcp-plan-review-r3.md)
 
 ## Global Constraints
 
@@ -39,7 +39,9 @@ A future reader will be tempted to change each of these. Each was tested; changi
 
 ### One mechanism that was deliberately removed
 
-The revision before this one gave shared artifacts a `# content-hash:` marker line and had the observer recompute it with the header stripped, to detect out-of-band edits to root-owned units. **That mechanism is deleted, not disabled, and must not be reintroduced.** A digest a file declares about itself cannot detect an editor who can also edit the digest; the strip was a GNU-`sed` range that removed every matching block anywhere in the file, so hidden directives were excluded from the hash and executed by systemd anyway; and a `binding-version` bump hashed differently and read as "tampered", making a provider upgrade an unrecoverable lockout. Nothing in the approved design asks for it. Shared artifacts are **write-if-absent-or-content-differs**, compared by hashing the installed bytes and the rendered bytes independently, and the provider-level marker is a plain provenance comment. See Task 6's preamble. (Review r2, P1-6.)
+The revision before this one gave shared artifacts a `# content-hash:` marker line and had the observer recompute it with the header stripped, to detect out-of-band edits to root-owned units. **That mechanism is deleted, not disabled, and must not be reintroduced.** A digest a file declares about itself cannot detect an editor who can also edit the digest; the strip was a GNU-`sed` range that removed every matching block anywhere in the file, so hidden directives were excluded from the hash and executed by systemd anyway; and a `binding-version` bump hashed differently and read as "tampered", making a provider upgrade an unrecoverable lockout. Nothing in the approved design asks for it. Shared artifacts are **write-if-absent-or-content-differs**, compared by hashing both sides independently.
+
+**What deleting it did not fix.** Round 3 found that the *upgrade lockout* survived the deletion: it had a second home in the ownership predicate, which conjoined `managed-by` with an **exact** `binding-version`, so the first bump would have made every artifact already on the instance read as "present and not ours" — `deploy` refusing to upgrade it, `remove` refusing to delete it, and the refusal telling the operator their own agent was somebody else's. Ownership is therefore version-aware everywhere in this binding (`naming::Ownership`, Task 6): an **older** binding version is an authorised upgrade target at both file tiers and in Secret Manager, a **newer** one is a refusal that names the version, and the shell fences compare the version with `-le` rather than matching it as a literal line. Do not re-collapse that into a boolean — it reads like a simplification and it is the lockout.
 
 ---
 
@@ -339,10 +341,23 @@ Second, `inactivity_omitted_when_unset` at `crates/buzz-backend-core/src/env.rs:
 Then add one case beside it, proving the new degree of freedom actually works — without it, `max_env_bytes: None` is a parameter no test exercises:
 
 ```rust
-    /// A substrate with no cap must not inherit Kubernetes' 1 MiB rule: on a
-    /// systemd `EnvironmentFile` there is no such boundary to respect.
+    /// A substrate with no cap must not inherit Kubernetes' 1 MiB rule: a
+    /// systemd `EnvironmentFile` on a 38 GB boot disk has no such boundary to
+    /// respect, and `MAX_SECRET_BYTES` was an apiserver limit, not a law.
+    ///
+    /// What this does **not** say is that any environment this accepts is
+    /// deployable. `max_env_bytes: None` means "this core has no opinion", not
+    /// "no limit applies": each binding still owes its own substrate's rules.
+    /// The 2 MiB below is a case in point — `BIG` is not on the GCP binding's
+    /// non-secret allowlist, so that binding classifies it as secret, and the
+    /// secret half travels as one Secret Manager version, whose payload is
+    /// capped at 64 KiB. `buzz_backend_gcp::render::plan` therefore **refuses**
+    /// this exact environment, in its pure phase, before any mutation
+    /// (`a_secret_payload_over_secret_managers_cap_is_refused_before_any_mutation`).
+    /// That division is the point of the parameter: the core stops asserting a
+    /// limit it cannot know, and each binding asserts the one it can.
     #[test]
-    fn an_uncapped_substrate_accepts_an_environment_kubernetes_would_refuse() {
+    fn an_uncapped_substrate_leaves_the_size_rule_to_its_binding() {
         let big = "x".repeat(2 * 1024 * 1024);
         let agent = payload_json(serde_json::json!({
             "launch": { "owner_pubkey": "a".repeat(64), "env": { "BIG": big } }
@@ -355,7 +370,7 @@ Then add one case beside it, proving the new degree of freedom actually works �
                 max_env_bytes: None,
             },
         )
-        .expect("no cap means no refusal");
+        .expect("no cap here means no refusal here");
         assert_eq!(env["BIG"].len(), 2 * 1024 * 1024);
     }
 ```
@@ -1971,7 +1986,7 @@ git add -A && git commit -s -m "feat(backend-gcp): refuse relay-mesh from the ra
 
 ## Task 6: Naming and the two marker tiers
 
-Resolves review **P2-2**, and round 2's **P1-6** — by *deleting* the shared-artifact content-hash tamper check rather than repairing it.
+Resolves review **P2-2**, round 2's **P1-6** — by *deleting* the shared-artifact content-hash tamper check rather than repairing it — and round 3's **P1-1**, which found that deleting the tamper check removed only one half of the upgrade lockout: the other half was living inside `is_ours`.
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/naming.rs`
@@ -1985,7 +2000,10 @@ Resolves review **P2-2**, and round 2's **P1-6** — by *deleting* the shared-ar
   - `naming::Names::new(&AgentIdentity) -> Names` with `instance()`, `unit()`, `secret_unit()`, `env_path()`, `trail_path()`, `dropin_dir()`, `dropin_path()`, `secret_dropin_dir()`, `secret_dropin_path()`, `secret_name()`. There is deliberately **no** `runtime_dir()`: `/run/buzz-acp-%i` is spelled by systemd's `RuntimeDirectory=` and by the fetcher script, never by this provider, and a `pub` accessor nothing calls is `dead_code` in a binary crate — which `-D warnings` turns into a build failure.
   - `naming::Names::from_pubkey_hex(pubkey_hex: &str) -> Result<Names, String>` and `naming::normalize_pubkey(value: &str) -> Result<String, String>` — the operator route, used by `remove` and by the reconciler's tests
   - `naming::AgentMarker { pubkey_full: String, create_intent: String }` with `render() -> String`, `parse(&str) -> Option<AgentMarker>`
-  - `naming::shared_marker() -> String` and `naming::is_shared_marker(body: &str) -> bool`
+  - `naming::shared_marker() -> String`
+  - `naming::Ownership` — `Ours | OursButOlder(u32) | OursButNewer(u32) | NotOurs`, deriving `Debug, Clone, Copy, Default, PartialEq, Eq`, with `actionable(self) -> bool`
+  - `naming::ownership_of(managed_by: Option<&str>, binding_version: Option<&str>) -> Ownership`, and the two tier readers `naming::agent_ownership(body: &str) -> Ownership` and `naming::shared_ownership(body: &str) -> Ownership`
+  - `naming::BINDING_VERSION_NUM: u32` — the same value as `BINDING_VERSION`, as a number, because ownership is an ordering question
 - Consumes: `buzz_backend_core::identity::AgentIdentity`, `sha2`, `hex`.
 
 **Why two tiers.** A template unit is installed once and used by every instance. Stamping it with one agent's `agent-pubkey-full` and `create-intent` means the next deploy of a *different* agent rewrites the same file with a different identity, so the identity recorded on a shared file means nothing more than "whoever deployed most recently" — while the fence that reads it is asking "is this file *this* agent's?". Answering that from a shared file is wrong in both directions: it authorizes destroying a file three other agents depend on, and it refuses when the file is legitimately ours. The invariant the tests enforce is therefore *"every installed file carries the marker of its own tier"* — never *"every installed file carries the per-agent marker"*, which is enforceable only by making the shared marker a lie.
@@ -1994,9 +2012,24 @@ Resolves review **P2-2**, and round 2's **P1-6** — by *deleting* the shared-ar
 
 All three are symptoms of one thing: **a digest a file declares about itself cannot detect an editor who can also edit the digest.** The check was unsound as specified, not merely buggy. It was also the only mechanism in the plan solving a problem the approved spec does not pose — the spec asks for write-if-absent-or-different and for an unmarked shared file to be a refusal, and asks for nothing about detecting out-of-band edits to root-owned units.
 
-What replaces it is what the spec already asked for: a shared artifact is written when it is **absent, or when the bytes on the instance differ from the bytes this provider would render**, compared by independently hashing both sides — `sha256sum` over the whole file on one, `sha256_hex` over the rendered body on the other. Neither side trusts a claim stored in the file. An out-of-band edit is therefore still *detected*, because it makes the bytes differ; the response is to converge, which is the right answer for a shared, identity-free, byte-identical, idempotent artifact. A `binding-version` bump becomes an ordinary rewrite instead of a lockout, and the GNU-`sed` dependency is gone. The provider-level marker survives as a plain provenance comment feeding the one fence the spec *does* state: a shared file present with **no** marker is a refusal, not an overwrite.
+What replaces it is what the spec already asked for: a shared artifact is written when it is **absent, or when the bytes on the instance differ from the bytes this provider would render**, compared by independently hashing both sides — `sha256sum` over the whole file on one, `sha256_hex` over the rendered body on the other. Neither side trusts a claim stored in the file. An out-of-band edit is therefore still *detected*, because it makes the bytes differ; the response is to converge, which is the right answer for a shared, identity-free, byte-identical, idempotent artifact. The GNU-`sed` dependency is gone. The provider-level marker survives as a plain provenance comment feeding the one fence the spec *does* state: a shared file present with **no** marker is a refusal, not an overwrite. (What deleting the digest did *not* fix is the upgrade lockout — that half lived in the ownership predicate, and is the subject of the next section.)
 
-**Header shapes.** A per-agent header is four contiguous lines; a shared header is three. Neither reader depends on the position: they take the first `remote::MARKER_SCAN_LINES` of a file and count exact whole-line matches, which is why the fetcher script's shebang above its header costs nothing.
+**Why ownership is four states and not a boolean.** Round 2 deleted the content-hash check partly because a `binding-version` bump made every existing shared file read as "tampered" — an unrecoverable upgrade lockout — and this plan then asserted in three places that the lockout was gone. It was not. `is_ours` was the conjunction `managed-by == MANAGED_BY ∧ binding-version == BINDING_VERSION`, so the moment `BINDING_VERSION` became `"2"` every artifact written at version 1 read as *present and not ours*. `classify` refused on the first one, so `deploy` could not upgrade the agent; `verify_removable` refused identically, so `remove` could not tear it down; and the refusal text told the operator that their own prior-version agent was somebody else's file. The lockout had not died, it had moved — and `BINDING_VERSION` is documented as "bump when the unit/env shape changes", a *designed-for* event.
+
+So ownership is a verdict with four states rather than a flag:
+
+| State | Meaning | What acts on it |
+|---|---|---|
+| `Ours` | This provider, this binding version | Ordinary reconciliation |
+| `OursButOlder(v)` | This provider, a layout this build supersedes | **Authorised upgrade target**: per-agent artifacts classify `FencedReplace`, shared ones take the ordinary write-if-different path, the Secret Manager labels are rolled forward with `--update-labels` and then a version is added, and `remove` may still delete |
+| `OursButNewer(v)` | This provider, a layout this build does not understand | Refusal, naming the version — a downgrade destroys a newer provider's work |
+| `NotOurs` | Foreign `managed-by`, unparseable version, or no marker | Refusal — somebody else's file |
+
+A fourth state rather than the three a strict reading would give: collapsing "newer" into `NotOurs` costs the operator the one sentence that tells them what actually happened, and P1-1 exists precisely because a refusal described the operator's own agent as foreign. `actionable()` is the single predicate every caller uses to mean "this build may write or delete this", and it is true for `Ours` and `OursButOlder` only.
+
+`BINDING_VERSION_NUM` exists because the question is an *ordering* and a string comparison cannot answer it; `BINDING_VERSION` remains the decimal spelling written into headers and Secret Manager labels, and a test asserts the two agree. A version that is not a decimal number describes no layout to order against and is `NotOurs` — fail closed. The same `ownership_of` serves both file-header tiers and Secret Manager's two labels, so the four states mean one thing across this binding rather than one thing per storage medium. And the shell readers do the ordering too: `remote::marker_fn`, `reconcile::fenced_stop_script` and `operator::listing_script` all compare with `-le BINDING_VERSION_NUM` rather than matching an exact `# binding-version:` line, because a guard that required the exact current version would refuse the very install that upgrades the file.
+
+**Header shapes.** A per-agent header is four contiguous lines; a shared header is three. No reader depends on the position: each takes the first `remote::MARKER_SCAN_LINES` of a file and asserts every required line independently, anywhere in that window, which is why the fetcher script's shebang above its header costs nothing. "Independently" is load-bearing — round 3's P1-3 found the shell readers counting matching *lines* with `grep -c` and comparing the count to the number of needles, which a header with a duplicated line satisfies while omitting another entirely.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2065,13 +2098,21 @@ mod tests {
     #[test]
     fn the_provider_marker_says_only_what_is_true() {
         let header = shared_marker();
-        assert!(is_shared_marker(&header));
+        assert_eq!(shared_ownership(&header), Ownership::Ours);
         assert!(header.contains(&header_line("managed-by", MANAGED_BY)));
         assert!(header.contains(&header_line("binding-version", BINDING_VERSION)));
         assert!(header.contains(&header_line("scope", SHARED_SCOPE)));
         for absent in ["content-hash", "agent-pubkey", "create-intent"] {
             assert!(!header.contains(absent), "the shared marker claims {absent}");
         }
+    }
+
+    /// The two spellings of the binding version must agree, or the header a
+    /// file carries and the number every ordering compares against describe
+    /// different releases — and the one place that shows up is an upgrade.
+    #[test]
+    fn the_two_spellings_of_the_binding_version_agree() {
+        assert_eq!(BINDING_VERSION.parse::<u32>(), Ok(BINDING_VERSION_NUM));
     }
 
     /// The tiers must not be readable as each other. A shared file read as
@@ -2085,7 +2126,8 @@ mod tests {
         }
         .render();
         let shared = shared_marker();
-        assert!(!is_shared_marker(&agent));
+        assert_eq!(shared_ownership(&agent), Ownership::NotOurs);
+        assert_eq!(agent_ownership(&shared), Ownership::NotOurs);
         assert!(AgentMarker::parse(&shared).is_none());
     }
 
@@ -2093,24 +2135,84 @@ mod tests {
     fn an_unmarked_file_yields_no_marker_of_either_tier() {
         let body = "# just some file\nFOO=bar\n";
         assert!(AgentMarker::parse(body).is_none());
-        assert!(!is_shared_marker(body));
+        assert_eq!(agent_ownership(body), Ownership::NotOurs);
+        assert_eq!(shared_ownership(body), Ownership::NotOurs);
     }
 
-    /// A marker from a future binding version must not be read as ours: the
-    /// artifact layout it describes is one this build does not understand.
-    /// Note what this is *not*: with the content-hash check gone, a future
-    /// version is an unmarked-at-this-version file, which is a refusal for a
-    /// per-agent artifact and an ordinary rewrite for a shared one — never the
-    /// permanent "tampered" lockout the previous revision produced.
-    #[test]
-    fn a_foreign_binding_version_is_not_our_marker() {
-        let body = format!(
-            "# managed-by: {MANAGED_BY}\n# binding-version: 99\n\
+    /// A per-agent header at an arbitrary binding version. Version 0 never
+    /// shipped, but the ordering rule has to be exercised *now*: the bump that
+    /// creates a real prior version is exactly the moment nobody will go back
+    /// and re-derive what should happen to the artifacts already on the box.
+    fn agent_header_at(version: &str) -> String {
+        format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: {version}\n\
              # agent-pubkey-full: {}\n# create-intent: ci\n",
             "ab".repeat(32)
+        )
+    }
+
+    fn shared_header_at(version: &str) -> String {
+        format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: {version}\n\
+             # scope: {SHARED_SCOPE}\n"
+        )
+    }
+
+    /// P1-1. An **older** binding version is this provider's own work at a
+    /// layout this build supersedes — an authorised upgrade target at both
+    /// tiers, with its identity intact, because `remove` acts on that pubkey
+    /// and `FencedReplace` rewrites the file that carries it. Reading it as
+    /// "not ours" is what made a version bump lock the operator out of
+    /// `deploy` *and* `remove` for every agent already installed.
+    #[test]
+    fn an_older_binding_version_is_ours_and_an_upgrade_target() {
+        let body = agent_header_at("0");
+        assert_eq!(agent_ownership(&body), Ownership::OursButOlder(0));
+        assert!(agent_ownership(&body).actionable());
+        let marker = AgentMarker::parse(&body).expect("an upgrade target keeps its identity");
+        assert_eq!(marker.pubkey_full, "ab".repeat(32));
+
+        let shared = shared_header_at("0");
+        assert_eq!(shared_ownership(&shared), Ownership::OursButOlder(0));
+        assert!(shared_ownership(&shared).actionable());
+    }
+
+    /// …and a **future** one is the refusal the rule reserves, at both tiers.
+    /// The layout it describes is one this build cannot reason about, so
+    /// overwriting or deleting it would destroy a newer provider's work — and
+    /// it must be a *distinct* state from "somebody else's file", or the
+    /// refusal tells the operator their own newer agent is foreign.
+    #[test]
+    fn a_future_binding_version_is_refused_at_both_tiers() {
+        let body = agent_header_at("99");
+        assert_eq!(agent_ownership(&body), Ownership::OursButNewer(99));
+        assert!(!agent_ownership(&body).actionable());
+        assert!(
+            AgentMarker::parse(&body).is_none(),
+            "a layout this build cannot read must yield nothing to act on"
         );
-        assert!(AgentMarker::parse(&body).is_none());
-        assert!(!is_shared_marker(&body));
+        assert_eq!(
+            shared_ownership(&shared_header_at("99")),
+            Ownership::OursButNewer(99)
+        );
+    }
+
+    /// A version that is not a decimal number describes no layout to order
+    /// against. Fail closed rather than guessing.
+    #[test]
+    fn a_binding_version_that_is_not_a_number_is_not_ours() {
+        for version in ["", "1.0", "v1", "one", "-1", "0x1"] {
+            assert_eq!(
+                agent_ownership(&agent_header_at(version)),
+                Ownership::NotOurs,
+                "binding-version {version:?} was ordered against ours"
+            );
+            assert_eq!(
+                shared_ownership(&shared_header_at(version)),
+                Ownership::NotOurs,
+                "binding-version {version:?} was ordered against ours"
+            );
+        }
     }
 
     #[test]
@@ -2121,12 +2223,24 @@ mod tests {
             "ab".repeat(32)
         );
         assert!(AgentMarker::parse(&body).is_none());
+        assert_eq!(agent_ownership(&body), Ownership::NotOurs);
         // …and a foreign file that merely declares our scope is still not ours.
         let scoped = format!(
             "# managed-by: some-other-tool\n# binding-version: {BINDING_VERSION}\n\
              # scope: {SHARED_SCOPE}\n"
         );
-        assert!(!is_shared_marker(&scoped));
+        assert_eq!(shared_ownership(&scoped), Ownership::NotOurs);
+    }
+
+    /// A file plainly ours that names no agent is neither ownable nor
+    /// anonymous: `agent_ownership` says ours, `parse` says nothing to act on,
+    /// and the caller owes the operator a different sentence from "somebody
+    /// else's file".
+    #[test]
+    fn our_marker_without_an_identity_yields_ownership_but_no_marker() {
+        let body = format!("# managed-by: {MANAGED_BY}\n# binding-version: {BINDING_VERSION}\n");
+        assert_eq!(agent_ownership(&body), Ownership::Ours);
+        assert!(AgentMarker::parse(&body).is_none());
     }
 
     /// `remove` names its target by pubkey, because the operator holds no
@@ -2219,6 +2333,15 @@ Prepend to `crates/buzz-backend-gcp/src/naming.rs`:
 //! the job it should have been doing is done by comparing the installed bytes
 //! against the bytes this provider would render, hashed independently on each
 //! side (`observe.rs`, `reconcile::shared_writes`).
+//!
+//! Deleting that check removed the *tamper* half of the upgrade lockout. The
+//! other half lived here, in a boolean that conjoined `managed-by` with an
+//! **exact** `binding-version`: on the first bump, every artifact this provider
+//! had ever written read as "present and not ours", `deploy` refused to upgrade
+//! it and `remove` refused to delete it, and the operator was told their own
+//! agent was somebody else's file. Ownership is therefore [`Ownership`], a
+//! four-state verdict — and an *older* version is an authorised upgrade target
+//! everywhere in this binding, not a refusal.
 
 use buzz_backend_core::identity::AgentIdentity;
 use sha2::{Digest, Sha256};
@@ -2227,9 +2350,20 @@ use sha2::{Digest, Sha256};
 /// file lacking the marker of its own tier** — that is the auto-repair fence.
 pub const MANAGED_BY: &str = "buzz-backend-gcp";
 
-/// Schema version of the artifact layout. Bump when the unit/env shape changes
-/// in a way an older provider would mishandle.
+/// Schema version of the artifact layout, as it appears in a header line and
+/// in a Secret Manager label. Bump when the unit/env shape changes in a way an
+/// older provider would mishandle — and bump [`BINDING_VERSION_NUM`] with it.
 pub const BINDING_VERSION: &str = "1";
+
+/// The same value as [`BINDING_VERSION`], as a number.
+///
+/// Ownership is an *ordering* question — is this artifact older than us, ours,
+/// or newer — and a string comparison cannot answer it. This is also the value
+/// the shell readers compare against with `-le`
+/// (`remote::marker_fn`, `reconcile::fenced_stop_script`,
+/// `operator::listing_script`), so the two spellings must agree;
+/// `the_two_spellings_of_the_binding_version_agree` asserts it.
+pub const BINDING_VERSION_NUM: u32 = 1;
 
 /// The `scope:` value that distinguishes a provider-level marker from a
 /// per-agent one. Present on shared artifacts, absent from per-agent ones.
@@ -2358,10 +2492,99 @@ fn header_field(body: &str, name: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-/// Both tiers share these two lines; neither tier is ours without both.
-fn is_ours(body: &str) -> bool {
-    header_field(body, "managed-by").as_deref() == Some(MANAGED_BY)
-        && header_field(body, "binding-version").as_deref() == Some(BINDING_VERSION)
+/// How an artifact's own marker relates to **this** build.
+///
+/// Four states rather than a boolean, and the reason is the upgrade path.
+/// [`BINDING_VERSION`] is documented as "bump when the unit/env shape changes"
+/// — a designed-for event — so the version an artifact carries is routinely
+/// *older* than the one deciding what to do with it. Collapsing that into "not
+/// ours" made every artifact written before a bump read as a foreign file:
+/// `classify` refused, so `deploy` could not upgrade it, and
+/// `verify_removable` refused identically, so `remove` could not tear it down.
+/// The agent became unmanageable in both directions.
+///
+/// `OursButNewer` is a separate state from `NotOurs` even though both refuse,
+/// because the sentences differ and the difference matters: one says "upgrade
+/// this provider", the other says "somebody else's file is in the way".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Ownership {
+    /// This provider, at exactly this binding version.
+    Ours,
+    /// This provider, at an **older** binding version. An authorised upgrade
+    /// target: per-agent artifacts are replaced, shared ones are rewritten when
+    /// their bytes differ, Secret Manager labels are rolled forward, and
+    /// `remove` may still delete.
+    OursButOlder(u32),
+    /// This provider, at a **newer** binding version. A refusal: a build that
+    /// cannot reason about a layout must not overwrite or delete it.
+    OursButNewer(u32),
+    /// A foreign `managed-by`, a version that is not a decimal number, or no
+    /// marker at all.
+    #[default]
+    NotOurs,
+}
+
+impl Ownership {
+    /// May this build write, replace, or delete the artifact?
+    ///
+    /// The single predicate every caller uses, so "may we act" has one
+    /// definition. True for [`Ownership::Ours`] and [`Ownership::OursButOlder`]
+    /// only — an upgrade is an action, not a refusal.
+    pub fn actionable(self) -> bool {
+        matches!(self, Ownership::Ours | Ownership::OursButOlder(_))
+    }
+}
+
+/// The one rule that turns a `managed-by` / `binding-version` pair into a
+/// verdict.
+///
+/// Fed by both file-header tiers below **and** by Secret Manager's two labels
+/// (`secrets::verify_owned`), so the four states mean the same thing on every
+/// storage medium this binding uses rather than one thing per medium.
+///
+/// A version that does not parse as a `u32` is [`Ownership::NotOurs`]: it
+/// describes no layout to order against, and guessing is how a downgrade
+/// silently destroys a newer provider's work.
+pub fn ownership_of(managed_by: Option<&str>, binding_version: Option<&str>) -> Ownership {
+    if managed_by != Some(MANAGED_BY) {
+        return Ownership::NotOurs;
+    }
+    match binding_version.and_then(|value| value.parse::<u32>().ok()) {
+        Some(version) if version == BINDING_VERSION_NUM => Ownership::Ours,
+        Some(version) if version < BINDING_VERSION_NUM => Ownership::OursButOlder(version),
+        Some(version) => Ownership::OursButNewer(version),
+        None => Ownership::NotOurs,
+    }
+}
+
+/// Ownership of a **per-agent** artifact, read from its own header.
+///
+/// A header declaring a `scope` is a shared one at a per-agent path, which is
+/// not ours *at this tier* — the tiers must not be readable as each other.
+pub fn agent_ownership(body: &str) -> Ownership {
+    if header_field(body, "scope").is_some() {
+        return Ownership::NotOurs;
+    }
+    ownership_of(
+        header_field(body, "managed-by").as_deref(),
+        header_field(body, "binding-version").as_deref(),
+    )
+}
+
+/// Ownership of a **shared** artifact, read from its own header.
+///
+/// The whole question about a shared file: [`Ownership::actionable`] licenses a
+/// rewrite when the bytes differ, and the two refusing states each earn their
+/// own message. A per-agent header answers [`Ownership::NotOurs`] because it
+/// declares no scope.
+pub fn shared_ownership(body: &str) -> Ownership {
+    if header_field(body, "scope").as_deref() != Some(SHARED_SCOPE) {
+        return Ownership::NotOurs;
+    }
+    ownership_of(
+        header_field(body, "managed-by").as_deref(),
+        header_field(body, "binding-version").as_deref(),
+    )
 }
 
 /// The header written into every artifact that belongs to exactly one agent:
@@ -2393,11 +2616,21 @@ impl AgentMarker {
 
     /// Parse a per-agent marker from a file body.
     ///
-    /// `None` means "not ours, at this tier, at this binding version" — which
-    /// is a refusal to act, never a licence to overwrite. A shared artifact's
-    /// header parses to `None` here because it declares a scope.
+    /// `None` means "there is nothing here this build may act on, at this
+    /// tier" — a refusal to act, never a licence to overwrite. That covers a
+    /// foreign or future [`agent_ownership`], a shared artifact's header
+    /// (which declares a scope), and a header of ours that carries no identity
+    /// lines. An **older** binding version parses normally, and must: `remove`
+    /// acts on the pubkey a prior-version artifact carries, and
+    /// `FencedReplace` rewrites the file that carries it.
+    ///
+    /// That last point is the compatibility floor. A future bump may add or
+    /// reshape header lines freely, but it must keep `# agent-pubkey-full:`
+    /// and `# create-intent:` spelled exactly as they are, or this function
+    /// stops recognising the previous release's artifacts and the lockout
+    /// comes straight back.
     pub fn parse(body: &str) -> Option<Self> {
-        if !is_ours(body) || header_field(body, "scope").is_some() {
+        if !agent_ownership(body).actionable() {
             return None;
         }
         Some(Self {
@@ -2423,15 +2656,6 @@ pub fn shared_marker() -> String {
         header_line("scope", SHARED_SCOPE),
     )
 }
-
-/// Does `body` carry the provider-level marker at this binding version?
-///
-/// The whole question about a shared file, and the only one: presence licenses
-/// a rewrite when the bytes differ, absence is a refusal. A per-agent header
-/// answers `false` because it declares no scope.
-pub fn is_shared_marker(body: &str) -> bool {
-    is_ours(body) && header_field(body, "scope").as_deref() == Some(SHARED_SCOPE)
-}
 ```
 
 Add `mod naming;` to `main.rs`.
@@ -2439,7 +2663,7 @@ Add `mod naming;` to `main.rs`.
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp naming`
-Expected: PASS — 11 tests.
+Expected: PASS — 15 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2451,7 +2675,7 @@ git add -A && git commit -s -m "feat(backend-gcp): pubkey-derived naming and two
 
 ## Task 7: `render.rs` — six artifacts, the non-secret allowlist, and the hardened fetcher
 
-Resolves review **P1-7** and **P2-8**, and round 2's **P1-1** (`launch.command` reaches the VM verbatim), the render half of **P1-6** (the shared marker loses its content hash), **P1-7** (credential rotation), and **P2-4** (the fetcher unit does not carry the hardening the docs claim).
+Resolves review **P1-7** and **P2-8**, round 2's **P1-1** (`launch.command` reaches the VM verbatim), the render half of **P1-6** (the shared marker loses its content hash), **P1-7** (credential rotation) and **P2-4** (the fetcher unit does not carry the hardening the docs claim), and round 3's **P2-2** (Secret Manager's 64 KiB version-payload cap is enforced as a preflight) and **P2-4** (a value that changes side must diverge the intent).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/render.rs`
@@ -2466,9 +2690,11 @@ Resolves review **P1-7** and **P2-8**, and round 2's **P1-1** (`launch.command` 
   - `render::Plan { per_agent: Vec<RemoteFile>, shared: Vec<SharedArtifact>, secret_env: BTreeMap<String, String>, create_intent: String, trail: RemoteFile }` with `Plan::secret_body(&self) -> String` and `Plan::redacted_secret_body(&self) -> String`
   - `render::plan(agent: &AgentPayload, cfg: &ProviderConfig, names: &Names, identity: &AgentIdentity, generation: &str) -> Result<Plan, String>`
   - `render::dry_run_report(plan: &Plan, names: &Names, trail_record: &str) -> String`
-  - `render::NON_SECRET_KEYS: [&str; 9]`
+  - `render::NON_SECRET_KEYS: [&str; 9]` and `render::SECRET_MANAGER_MAX_PAYLOAD_BYTES: usize`
   - `render::DEFAULT_HARNESS: &str` and `render::harness_basename(agent: &AgentPayload) -> String`
-- Consumes: `buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY}`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::AgentPayload`, `crate::capacity` (tests only), `crate::config::ProviderConfig`, `crate::naming::{header_line, sha256_hex, shared_marker, AgentMarker, Names, BINDING_VERSION, MANAGED_BY, SHARED_SCOPE}`.
+- Consumes: `buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY}`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::AgentPayload`, `crate::capacity` (tests only), `crate::config::ProviderConfig`, `crate::naming::{header_line, sha256_hex, shared_marker, AgentMarker, Names, MANAGED_BY, SHARED_SCOPE}`. The test module additionally imports `crate::naming::{shared_ownership, Ownership, BINDING_VERSION}` — the parent stopped naming `BINDING_VERSION` when the owner-marker needle lists dropped it, and an import only the tests use is an unused import under `-D warnings`.
+
+**Where the size rule lives, and where it does not.** `build_env` takes `max_env_bytes: None` from this binding, and that is right: a systemd `EnvironmentFile` on a 38 GB boot disk has no cap worth inventing, and Kubernetes' 1 MiB is a `MaxSecretSize` this substrate does not have. But `None` means "the *core* has no opinion", not "no limit applies". This binding splits the environment, and the secret-classified half is uploaded as one Secret Manager **version**, whose payload is capped at 64 KiB. Enforcing that here — in the pure phase, before a transport even exists — is the difference between a refusal that changed nothing and a failure inside `secrets::store`, which is the *fourth* mutation of a deploy: the shared templates are already installed and the secret resource may already have been created by the time it fires.
 
 **Classification is an allowlist of non-secret keys, not a denylist of known-secret ones.** A denylist leaves `BUZZ_AUTH_TAG` — a bearer credential the relay treats as interchangeable with a resolved owner pubkey (`docs/remote-agents.md:1416-1419`) — plus every `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GITHUB_TOKEN` that tiers 1 and 2 routinely carry, on the **persistent boot disk**, where a disk snapshot or image capture picks them up. The desktop already refuses to draw that distinction: `env_secrets_from_request` treats *every* non-empty value in `env_vars`, `launch.env`, and `launch.policy_env` as redaction-worthy (`backend.rs:395-415`), and its doc comment says why. A provider whose classification is narrower than the redaction defending it has the policy backwards.
 
@@ -2486,7 +2712,7 @@ Resolves review **P1-7** and **P2-8**, and round 2's **P1-1** (`launch.command` 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::naming::is_shared_marker;
+    use crate::naming::{shared_ownership, Ownership, BINDING_VERSION};
     use buzz_backend_core::wire::DeployRequest;
 
     /// A second valid nsec, for the cross-agent shared-artifact test.
@@ -2808,13 +3034,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} carries no per-agent marker", f.path));
             assert_eq!(marker.pubkey_full, identity.pubkey_hex());
             assert_eq!(marker.create_intent, p.create_intent);
-            assert!(!is_shared_marker(&f.body));
+            assert_eq!(shared_ownership(&f.body), Ownership::NotOurs);
         }
 
         for a in &p.shared {
             assert!(
-                is_shared_marker(&a.file.body),
-                "{} carries no provider-level marker",
+                shared_ownership(&a.file.body) == Ownership::Ours,
+                "{} carries no provider-level marker at this binding version",
                 a.file.path
             );
             assert!(
@@ -2846,9 +3072,12 @@ mod tests {
         let identity = AgentIdentity::from_nsec(&req.agent.private_key_nsec).unwrap();
         let p = plan_for(&req);
 
+        // The tier's identity lines, and nothing else. `binding-version` is
+        // absent deliberately: `remote::marker_fn` compares it as an ordering,
+        // so an exact needle would make the install that upgrades a
+        // prior-version file be refused by that file's own fence.
         let agent_lines = [
             format!("# managed-by: {MANAGED_BY}"),
-            format!("# binding-version: {BINDING_VERSION}"),
             format!("# agent-pubkey-full: {}", identity.pubkey_hex()),
         ];
         for f in p.per_agent.iter().chain(std::iter::once(&p.trail)) {
@@ -2860,11 +3089,16 @@ mod tests {
                     f.path
                 );
             }
+            // …and the version is still *written*, because the reader that
+            // orders it has to have something to read.
+            assert!(f
+                .body
+                .lines()
+                .any(|l| l == format!("# binding-version: {BINDING_VERSION}")));
         }
 
         let shared_lines = [
             format!("# managed-by: {MANAGED_BY}"),
-            format!("# binding-version: {BINDING_VERSION}"),
             format!("# scope: {SHARED_SCOPE}"),
         ];
         for a in &p.shared {
@@ -2876,6 +3110,11 @@ mod tests {
                     a.file.path
                 );
             }
+            assert!(a
+                .file
+                .body
+                .lines()
+                .any(|l| l == format!("# binding-version: {BINDING_VERSION}")));
         }
     }
 
@@ -3021,6 +3260,88 @@ mod tests {
         assert_ne!(a.create_intent, plan_for(&renamed).create_intent);
     }
 
+    /// P2-4 (round 3): the case above covers a changed value and an added key.
+    /// The one it misses is a value that changes **side** — allowlisted on one
+    /// deploy, secret-classified on the next — with the key set and the value
+    /// multiset both unchanged. That is not hypothetical: it is what editing
+    /// `NON_SECRET_KEYS` does to every agent already deployed, and the two
+    /// deploys are genuinely different, because one writes the value into a
+    /// 0600 file on the persistent boot disk and the other into Secret
+    /// Manager. A fingerprint that hashed the whole environment *before* the
+    /// split would call them identical, classify `RestartSame`, and never
+    /// re-store the secret.
+    #[test]
+    fn a_value_that_changes_side_diverges_the_intent() {
+        // `BUZZ_ACP_AGENT_ARGS` is allowlisted and comes from `launch.args`;
+        // `TEAM_TOKEN` is not allowlisted, so it is secret-classified. Swap
+        // which value each carries and nothing else moves.
+        let side = |args: &str, token: &str| {
+            let mut req = request();
+            let launch = req.agent.launch.as_mut().unwrap();
+            launch.args = vec![args.to_string()];
+            launch.env.insert("TEAM_TOKEN".into(), token.to_string());
+            plan_for(&req)
+        };
+        let a = side("SIDEONE", "SIDETWO");
+        let b = side("SIDETWO", "SIDEONE");
+
+        // Same two values, opposite halves of the split.
+        assert!(a.secret_body().contains("SIDETWO") && !a.secret_body().contains("SIDEONE"));
+        assert!(b.secret_body().contains("SIDEONE") && !b.secret_body().contains("SIDETWO"));
+        assert_ne!(
+            a.create_intent, b.create_intent,
+            "the fingerprint must be side-aware, not merely content-aware"
+        );
+        for intent in [&a.create_intent, &b.create_intent] {
+            assert!(!intent.contains("SIDE"), "the intent leaks a value: {intent}");
+        }
+    }
+
+    /// P2-2 (round 3): `max_env_bytes: None` says the *core* imposes no cap,
+    /// not that none applies. The secret half travels as one Secret Manager
+    /// version, and a version payload is capped at 64 KiB, so an environment
+    /// the core accepts can still be undeployable — and it must be refused
+    /// here, in the pure phase, rather than in `secrets::store` after the
+    /// shared templates are already installed.
+    #[test]
+    fn a_secret_payload_over_secret_managers_cap_is_refused_before_any_mutation() {
+        let huge = "x".repeat(SECRET_MANAGER_MAX_PAYLOAD_BYTES);
+        let mut req = request();
+        req.agent
+            .launch
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("HUGE_API_KEY".into(), huge.clone());
+        let identity = AgentIdentity::from_nsec(&req.agent.private_key_nsec).unwrap();
+        let names = Names::new(&identity);
+        let err = plan(&req.agent, &gcp_config(), &names, &identity, "g")
+            .expect_err("64 KiB is Secret Manager's hard cap on a version payload");
+        assert!(err.contains("Secret Manager"), "{err}");
+        assert!(
+            err.contains(&SECRET_MANAGER_MAX_PAYLOAD_BYTES.to_string()),
+            "the refusal must state the cap: {err}"
+        );
+        // [L2] item 5: a refusal about a secret value must not echo it.
+        assert!(!err.contains(&huge), "the refusal echoes the value");
+        assert!(!err.contains(&"x".repeat(64)), "the refusal echoes the value");
+    }
+
+    /// …and the same size on the **allowlisted** half is fine, which is the
+    /// whole point of putting the cap on `secret_body()` rather than on the
+    /// environment: the boot disk has no such boundary.
+    #[test]
+    fn an_oversized_allowlisted_value_is_not_capped() {
+        let mut req = request();
+        req.agent.launch.as_mut().unwrap().args =
+            vec!["y".repeat(SECRET_MANAGER_MAX_PAYLOAD_BYTES)];
+        let p = plan_for(&req);
+        assert!(p.secret_body().len() <= SECRET_MANAGER_MAX_PAYLOAD_BYTES);
+        assert!(
+            per_agent(&p, &names_for(&req).env_path()).len() > SECRET_MANAGER_MAX_PAYLOAD_BYTES
+        );
+    }
+
     /// v1 ships bounded lifetimes only, and the refusal must name the
     /// prerequisite rather than silently downgrading the request.
     #[test]
@@ -3111,14 +3432,27 @@ Prepend to `crates/buzz-backend-gcp/src/render.rs`:
 
 use crate::config::ProviderConfig;
 use crate::naming::{
-    header_line, sha256_hex, shared_marker, AgentMarker, Names, BINDING_VERSION, MANAGED_BY,
-    SHARED_SCOPE,
+    header_line, sha256_hex, shared_marker, AgentMarker, Names, MANAGED_BY, SHARED_SCOPE,
 };
 use buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY};
 use buzz_backend_core::identity::AgentIdentity;
 use buzz_backend_core::wire::AgentPayload;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+/// Secret Manager's hard cap on a single version's payload, 64 KiB
+/// (<https://cloud.google.com/secret-manager/quotas>).
+///
+/// Enforced in [`plan`], on `secret_body()` only. The on-disk half is
+/// deliberately uncapped — a systemd `EnvironmentFile` on a 38 GB boot disk
+/// has no such boundary, which is why this binding passes
+/// `max_env_bytes: None` to `build_env` — but the secret-classified half is
+/// uploaded as one version, and a payload over this is rejected by the API.
+/// The check lives in the pure phase because `secrets::store` is the *fourth*
+/// mutation of a deploy: failing there leaves the shared templates installed
+/// and possibly an empty secret resource created, for a condition that was
+/// knowable offline.
+pub const SECRET_MANAGER_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// The **only** environment keys that may live on the persistent boot disk.
 ///
@@ -3174,9 +3508,16 @@ pub struct RemoteFile {
     /// Attached at render time rather than passed to `Remote::install`, because
     /// the renderer is the only place that knows each file's tier and this
     /// agent's pubkey — and because a fence that travels with the file cannot
-    /// be forgotten at one of several call sites. `create-intent` is
-    /// deliberately excluded: it changes on every legitimate reconfiguration,
-    /// so requiring it would refuse a file this agent wrote yesterday.
+    /// be forgotten at one of several call sites.
+    ///
+    /// These are the tier's **identity** lines and nothing else. `create-intent`
+    /// is excluded because it changes on every legitimate reconfiguration, so
+    /// requiring it would refuse a file this agent wrote yesterday.
+    /// `binding-version` is excluded because `remote::marker_fn` compares it as
+    /// an *ordering* rather than matching it as a literal line: an artifact
+    /// written by an older build of this provider is an authorised upgrade
+    /// target, and an exact needle would have the install that upgrades a file
+    /// be refused by that file's own fence.
     pub owner_marker: Vec<String>,
 }
 
@@ -3258,19 +3599,23 @@ fn env_file_body(env: &BTreeMap<String, String>, header: &str) -> String {
 }
 
 /// The header lines a per-agent target must already carry, if it exists at all.
+///
+/// Identity only. The binding version is checked by `remote::marker_fn` as an
+/// ordering rather than matched as a literal line, so that an artifact written
+/// by an older build of this provider is an upgrade target instead of a file
+/// its own fence refuses.
 fn agent_owner_marker(pubkey_full: &str) -> Vec<String> {
     vec![
         header_line("managed-by", MANAGED_BY),
-        header_line("binding-version", BINDING_VERSION),
         header_line("agent-pubkey-full", pubkey_full),
     ]
 }
 
 /// The header lines a shared target must already carry, if it exists at all.
+/// Same rule as [`agent_owner_marker`] for the binding version.
 fn shared_owner_marker() -> Vec<String> {
     vec![
         header_line("managed-by", MANAGED_BY),
-        header_line("binding-version", BINDING_VERSION),
         header_line("scope", SHARED_SCOPE),
     ]
 }
@@ -3414,6 +3759,27 @@ pub fn plan(
         }
     }
     let secret_body = env_file_body(&secret_env, "");
+
+    // The on-disk half has no cap — a systemd `EnvironmentFile` on a 38 GB
+    // boot disk is bounded by the disk, which is why `max_env_bytes` above is
+    // `None`. The secret half does: it is uploaded as one Secret Manager
+    // version, and a version payload is capped at 64 KiB. Refusing here, in
+    // the pure phase, is what keeps that from surfacing inside
+    // `secrets::store` — the fourth mutation of a deploy, by which point the
+    // shared templates are installed and the secret resource may already
+    // exist. The refusal names sizes only: [L2] item 5 forbids echoing a
+    // secret-classified value, and the oversized one is by definition secret.
+    if secret_body.len() > SECRET_MANAGER_MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "deploy refused: this agent's secret-classified environment renders \
+             to {} bytes, and Secret Manager caps one version's payload at \
+             {SECRET_MANAGER_MAX_PAYLOAD_BYTES} bytes. Nothing was changed. \
+             Move the oversized value off the agent payload — a file on the \
+             instance, or a secret the harness fetches itself. No value is \
+             echoed here.",
+            secret_body.len()
+        ));
+    }
 
     let shared = vec![
         shared_artifact(
@@ -3769,7 +4135,7 @@ Remove the two `#[ignore]` attributes added in Task 5 Step 7.
 - [ ] **Step 5: Run the full crate suite**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 24 `render` tests, plus `deploy_responses_match_their_fixtures` now matching all four goldens (`deploy-no-owner` from `build_env`, `deploy-ordinary-provider` from the indefinite-lifetime refusal) and `an_ordinary_provider_is_not_refused_as_shared_compute` no longer ignored.
+Expected: PASS — 27 `render` tests, plus `deploy_responses_match_their_fixtures` now matching all four goldens (`deploy-no-owner` from `build_env`, `deploy-ordinary-provider` from the indefinite-lifetime refusal) and `an_ordinary_provider_is_not_refused_as_shared_compute` no longer ignored.
 
 - [ ] **Step 6: Commit**
 
@@ -4017,7 +4383,7 @@ git add -A && git commit -s -m "feat(backend-gcp): capacity warning and durable 
 
 ## Task 9: `remote.rs` — the IAP SSH transport
 
-Resolves review **P1-2**, and round 2's **P1-9** (atomic installs), the write half of **P1-4** (each install is fenced on its own target's marker), and the transport half of **P1-8** (the exit codes the deploy lease and the narrowed fence speak).
+Resolves review **P1-2**, round 2's **P1-9** (atomic installs), the write half of **P1-4** (each install is fenced on its own target's marker) and the transport half of **P1-8** (the exit codes the deploy lease and the narrowed fence speak), and round 3's **P1-3**: the guard compared `grep -c` against a count, which counts matching input *lines* rather than distinct matched patterns.
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/remote.rs`
@@ -4028,6 +4394,7 @@ Resolves review **P1-2**, and round 2's **P1-9** (atomic installs), the write ha
   - `remote::Output { stdout: String, stderr: String, code: i32 }` with `ok(&self) -> bool`
   - `remote::Gcloud` — one method, `gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>`, implemented by `Remote`
   - `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED}: i32` and `remote::MARKER_SCAN_LINES: usize`
+  - `remote::marker_fn(required: &[String]) -> String` — `pub(crate)`; emits the `marker_ok` shell function Task 13's `removal_script` also calls
   - `remote::Remote::new(project: &str, zone: &str, instance: &str) -> Result<Remote, String>` with `token(&self) -> &str`
   - `Remote::run(&self, script: &str) -> Result<Output, String>`
   - `Remote::install(&self, file: &RemoteFile) -> Result<(), String>`
@@ -4051,16 +4418,19 @@ Resolves review **P1-2**, and round 2's **P1-9** (atomic installs), the write ha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::naming::{header_line, MANAGED_BY};
+    use crate::naming::{header_line, SHARED_SCOPE};
     use std::ffi::OsString;
 
-    /// The three header lines a per-agent target must already carry.
-    /// `create-intent` is deliberately absent: it changes on every legitimate
+    /// The two identity lines a per-agent target must already carry.
+    ///
+    /// `create-intent` is absent because it changes on every legitimate
     /// reconfiguration, so requiring it would refuse a file this agent wrote.
+    /// `binding-version` is absent for a different reason: `marker_ok`
+    /// compares it as an *ordering*, so a file written by an older build of
+    /// this provider can be upgraded rather than refused by its own fence.
     fn marker_lines() -> Vec<String> {
         vec![
             header_line("managed-by", MANAGED_BY),
-            header_line("binding-version", BINDING_VERSION),
             header_line("agent-pubkey-full", &"ab".repeat(32)),
         ]
     }
@@ -4132,12 +4502,78 @@ mod tests {
             "requiring the intent would refuse a file this agent wrote: {script}"
         );
         let drained = script.find("/dev/stdin").expect("the staged write");
-        let guard = script.find("grep -c").expect("the ownership guard");
+        let guard = script.find("marker_ok ||").expect("the ownership guard");
         let rename = script.find("mv -f").expect("the rename");
         assert!(
             drained < guard && guard < rename,
             "drain, then check, then rename: {script}"
         );
+    }
+
+    /// P1-3. The guard used to be `grep -c -F -x -e a -e b -e c` compared
+    /// against `3`, and `grep -c` counts matching input **lines**, not
+    /// distinct matched patterns. A header whose first lines repeat
+    /// `# managed-by:` and `# binding-version:` therefore reached the expected
+    /// count while carrying no `# agent-pubkey-full:` at all — so the guard
+    /// authorized overwriting a file that never named this agent, which is the
+    /// "a marker-looking file authorises the wrong file" hole the deleted
+    /// tamper check was supposed to have closed. Each needle is asserted on
+    /// its own now, and the first miss returns.
+    #[test]
+    fn a_header_that_repeats_one_marker_line_does_not_satisfy_the_guard() {
+        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        assert!(
+            !script.contains("grep -c"),
+            "counting lines instead of patterns is the defect: {script}"
+        );
+        assert_eq!(
+            script.matches("grep -Fqx").count(),
+            marker_lines().len(),
+            "one independent check per needle: {script}"
+        );
+        for line in marker_lines() {
+            assert!(
+                script.contains(&format!("grep -Fqx -- {}", sq(&line))),
+                "{line:?} is not asserted on its own: {script}"
+            );
+        }
+
+        // The shared tier is the same function with a different needle set, so
+        // a header that repeats `# managed-by:` and omits `# scope:` fails for
+        // the same reason.
+        let shared = marker_guard(
+            "/usr/local/sbin/buzz-acp-fetch-key",
+            &[
+                header_line("managed-by", MANAGED_BY),
+                header_line("scope", SHARED_SCOPE),
+            ],
+        );
+        assert_eq!(shared.matches("grep -Fqx").count(), 2, "{shared}");
+        assert!(
+            shared.contains(&format!(
+                "grep -Fqx -- {}",
+                sq(&header_line("scope", SHARED_SCOPE))
+            )),
+            "{shared}"
+        );
+    }
+
+    /// P1-1's install half: the binding version is compared as an ordering, so
+    /// the very install that upgrades a prior-version file is not refused by
+    /// that file's own fence — and a *newer* one still is.
+    #[test]
+    fn the_guard_admits_an_older_binding_version_and_refuses_a_newer_one() {
+        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        assert!(
+            script.contains(&format!("-le {BINDING_VERSION_NUM}")),
+            "{script}"
+        );
+        assert!(
+            !script.contains(&sq(&header_line("binding-version", BINDING_VERSION))),
+            "an exact binding-version needle is the upgrade lockout: {script}"
+        );
+        // A version that is not a number describes no layout to order against.
+        assert!(script.contains("[!0-9]"), "{script}");
     }
 
     #[test]
@@ -4264,7 +4700,7 @@ Prepend to `crates/buzz-backend-gcp/src/remote.rs`:
 //! bytes in and a matching md5 out. That is what makes the stdin install path
 //! sound with no `scp` staging and no remote temp file.
 
-use crate::naming::BINDING_VERSION;
+use crate::naming::{BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY};
 use crate::render::RemoteFile;
 use buzz_backend_core::identity::new_generation;
 use std::ffi::{OsStr, OsString};
@@ -4386,13 +4822,52 @@ fn gcloud_not_found() -> String {
     )
 }
 
+/// The `marker_ok` shell function: does the header captured in `$h` carry
+/// every line of `required`, at a binding version this build may act on?
+/// Exit 0 for yes, 1 for no.
+///
+/// One definition, `pub(crate)`, called by this module's install guard and by
+/// Task 13's per-file delete veto — because both used to ask the question the
+/// same wrong way. `grep -c -F -x -e a -e b -e c` compared against `3` counts
+/// matching input **lines**, not distinct matched patterns, so a header whose
+/// first three lines are `# managed-by: …` twice and `# binding-version: …`
+/// once reaches the count while carrying no `# agent-pubkey-full:` at all, and
+/// the guard then authorizes overwriting or deleting a file that does not
+/// carry the tuple. Each needle is asserted on its own here, and the first
+/// miss returns.
+///
+/// The binding version is deliberately **not** one of the needles. It is
+/// compared as an ordering, `-le BINDING_VERSION_NUM`: a file written by an
+/// older build of this provider is an authorised upgrade target, so requiring
+/// an exact `# binding-version: N` line would make the very install that
+/// upgrades a file be refused by that file's own fence. A non-numeric or newer
+/// version is a refusal — a layout this build cannot reason about must not be
+/// rewritten.
+pub(crate) fn marker_fn(required: &[String]) -> String {
+    let checks: String = required
+        .iter()
+        .map(|line| format!("printf '%s\\n' \"$h\" | grep -Fqx -- {} || return 1\n", sq(line)))
+        .collect();
+    format!(
+        "marker_ok() {{\n\
+         {checks}\
+         v=$(printf '%s\\n' \"$h\" | sed -n 's/^# binding-version: //p' | head -n 1)\n\
+         case \"$v\" in ''|*[!0-9]*) return 1 ;; esac\n\
+         [ \"$v\" -le {version} ] || return 1\n\
+         return 0\n\
+         }}\n",
+        checks = checks,
+        version = BINDING_VERSION_NUM,
+    )
+}
+
 /// The shell fragment that refuses to touch an existing file whose own header
 /// is not ours.
 ///
 /// `head -n MARKER_SCAN_LINES` rather than an exact slice: a shared artifact
 /// carries a shebang on line 1, so its three header lines sit at 2-4, while a
-/// per-agent artifact's four start at line 1. Counting exact whole-line matches
-/// makes the check independent of which.
+/// per-agent artifact's four start at line 1. Matching exact whole lines
+/// anywhere in that window makes the check independent of which.
 ///
 /// The refusal carries no message. The caller knows the path, the reason and
 /// which of several operations is speaking; the script knows none of that, and
@@ -4405,19 +4880,15 @@ fn marker_guard(path: &str, required: &[String]) -> String {
     if required.is_empty() {
         return String::new();
     }
-    let needles: String = required
-        .iter()
-        .map(|line| format!(" -e {}", sq(line)))
-        .collect();
     format!(
-        "if sudo -n test -e {path}; then \
-           n=$(sudo -n head -n {scan} {path} | grep -c -F -x{needles} || true); \
-           [ \"$n\" -eq {count} ] || exit {refused}; \
+        "{marker_ok}\
+         if sudo -n test -e {path}; then\n\
+         h=$(sudo -n head -n {scan} {path} || true)\n\
+         marker_ok || exit {refused}\n\
          fi\n",
+        marker_ok = marker_fn(required),
         path = sq(path),
         scan = MARKER_SCAN_LINES,
-        needles = needles,
-        count = required.len(),
         refused = OWNERSHIP_REFUSED,
     )
 }
@@ -4598,13 +5069,20 @@ impl Remote {
     }
 
     /// The refusal for a target that exists and is not this agent's.
+    ///
+    /// "at a binding version this build may act on" rather than "at binding
+    /// version N": the guard admits an *older* version — that is the upgrade
+    /// path — and refuses a newer or foreign one, so naming this build's exact
+    /// version would describe a check the script does not perform.
     fn not_ours(&self, path: &str, verb: &str) -> String {
         format!(
             "{path} is present on the instance but does not carry this agent's \
-             marker at binding version {BINDING_VERSION}. Refusing to {verb} a \
-             file this provider did not write for this agent — it was left \
-             exactly as it was. Move it aside, or run `buzz-backend-gcp list` \
-             to see which agent owns it."
+             {MANAGED_BY} marker at a binding version this build may act on \
+             (this build writes {BINDING_VERSION}; a newer one is refused \
+             rather than downgraded). Refusing to {verb} a file this provider \
+             did not write for this agent — it was left exactly as it was. \
+             Move it aside, or run `buzz-backend-gcp list` to see which agent \
+             owns it."
         )
     }
 
@@ -4650,7 +5128,7 @@ Add `mod remote;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing**
 
 Run: `cargo test -p buzz-backend-gcp remote`
-Expected: PASS — 10 tests.
+Expected: PASS — 12 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -4662,7 +5140,7 @@ git add -A && git commit -s -m "feat(backend-gcp): IAP ssh transport with stdin-
 
 ## Task 10: `secrets.rs` — Secret Manager storage behind an ownership gate
 
-Resolves review **P2-1**, and round 2's **P1-5** (ownership is verified once and then mutated twice).
+Resolves review **P2-1**, round 2's **P1-5** (ownership is verified once and then mutated twice), and the Secret Manager half of round 3's **P1-1**: a secret this provider created at an older binding version is an upgrade target, not a stranger.
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/secrets.rs`
@@ -4672,18 +5150,20 @@ Resolves review **P2-1**, and round 2's **P1-5** (ownership is verified once and
 - Produces:
   - `secrets::labels_for(pubkey_full: &str) -> String` — the `--labels` argument value
   - `secrets::annotations_for(pubkey_full: &str) -> String` — the `--set-annotations` value
-  - `secrets::verify_owned(described: &serde_json::Value, pubkey_full: &str, name: &str) -> Result<(), String>` — pure, unit-tested
+  - `secrets::verify_owned(described: &serde_json::Value, pubkey_full: &str, name: &str) -> Result<Ownership, String>` — pure, unit-tested; `Ok` carries `Ours` or `OursButOlder(v)` so `store` can tell a steady state from an upgrade
   - `secrets::describe(remote: &dyn Gcloud, project: &str, name: &str) -> Result<Option<serde_json::Value>, String>`
   - `secrets::store(remote: &dyn Gcloud, project: &str, name: &str, pubkey_full: &str, body: &str, service_account: &str) -> Result<(), String>`
   - `secrets::destroy(remote: &dyn Gcloud, project: &str, name: &str, pubkey_full: &str) -> Result<(), String>`
   - `secrets::instance_service_account(remote: &dyn Gcloud, project: &str, zone: &str, instance: &str) -> Result<String, String>`
-- Consumes: `crate::remote::{Gcloud, Output}`, `crate::naming::{BINDING_VERSION, MANAGED_BY}`.
+- Consumes: `crate::remote::{Gcloud, Output}`, `crate::naming::{ownership_of, Ownership, BINDING_VERSION, MANAGED_BY}`.
 
 **Why the transport is a trait here and nowhere else.** Every function above takes `&dyn Gcloud` rather than `&Remote`, and `Remote` is the only production implementation. The reason is narrow and specific: the property this module has to guarantee is a property of the **command sequence** — describe, verify, mutate, describe, verify, mutate — and a sequence can only be tested by recording it. `verify_owned` can be unit-tested to exhaustion while `store` still verifies once and mutates twice, which is exactly the defect round 2 found. `&dyn` rather than a generic because the call is once per deploy and the vtable costs nothing next to an IAP round trip.
 
 **Why the operand is a `&str` and not an `AgentIdentity`.** `deploy` holds a decoded identity, but `remove` never does — the operator has the pubkey `list` printed, not the agent's key. Taking the validated 64-hex string keeps one gate for both callers instead of inventing a second, weaker one for the operator path. `naming::normalize_pubkey` (Task 13) is where an operator-supplied value is validated before it can reach this module.
 
-**The marker is verified immediately before every add-version, IAM binding, and delete — not once per call.** The precedent is `secret_is_ours`, which requires *both* marker halves *and* a full-pubkey match (`crates/buzz-backend-kubernetes/src/observe.rs:64-67`, over `has_marker` at `:42-46` and `annotation_matches` at `:52-60`), and whose comment states the principle: *"Identity labels prove identity; the marker asserts protocol ownership. Without it an object that merely matches our schema fails closed"* (`observe.rs:38-41`). Without that gate, a name-matching secret created by anything else — an operator, another tool, an older binding version — receives this agent's whole secret environment as a new version *and* a grant of read access to the VM service account. **Name collision is not ownership.**
+**The marker is verified immediately before every add-version, IAM binding, and delete — not once per call.** The precedent is `secret_is_ours`, which requires *both* marker halves *and* a full-pubkey match (`crates/buzz-backend-kubernetes/src/observe.rs:64-67`, over `has_marker` at `:42-46` and `annotation_matches` at `:52-60`), and whose comment states the principle: *"Identity labels prove identity; the marker asserts protocol ownership. Without it an object that merely matches our schema fails closed"* (`observe.rs:38-41`). Without that gate, a name-matching secret created by anything else — an operator, another tool, a *foreign* binding — receives this agent's whole secret environment as a new version *and* a grant of read access to the VM service account. Name collision is not ownership.
+
+**But "an older binding version" is not somebody else — it is us, last release.** The label pair goes through the same `naming::ownership_of` the file headers use, so the four states mean the same thing on both sides of the binding. `OursButOlder` is an authorised upgrade: `store` issues `secrets update --update-labels` to roll the marker forward and then adds the new version, which is what keeps a `BINDING_VERSION` bump from stranding every agent's secret. The refusals that remain are the ones worth having — a foreign or absent `managed_by`, a *newer* binding version whose layout this build cannot reason about, and an `agent-pubkey-full` that names a different agent.
 
 **Once is not enough, and the distance is the point.** The previous revision verified at the top of `store` and then ran `versions add` and `add-iam-policy-binding` with no re-read between them. Each of those is a full API round trip, and a secret that changes hands inside that window is granted this agent's payload or hands the VM `secretAccessor` on a resource we no longer own. Every mutation now sits immediately after its own `describe_owned`, with **nothing** between the two, and a test asserts the resulting command sequence rather than trusting the reading of it.
 
@@ -4746,7 +5226,10 @@ mod tests {
     #[test]
     fn a_fully_marked_secret_is_ours() {
         let pubkey = pubkey();
-        assert!(verify_owned(&described(&pubkey), &pubkey, "s").is_ok());
+        assert_eq!(
+            verify_owned(&described(&pubkey), &pubkey, "s").expect("ours"),
+            Ownership::Ours
+        );
     }
 
     /// An object that merely matches our schema fails closed: the marker is
@@ -4763,11 +5246,41 @@ mod tests {
         assert!(err.contains("not managed by"), "{err}");
     }
 
+    /// P1-1, the Secret Manager half: an older binding version is this
+    /// provider's own secret at a layout this build supersedes. Refusing it
+    /// stranded every existing agent's secret behind a version bump — the
+    /// deploy could not add a version and `remove` could not delete it.
     #[test]
-    fn a_foreign_binding_version_is_a_refusal() {
+    fn a_secret_from_an_older_binding_version_is_an_upgrade_target() {
+        let pubkey = pubkey();
+        let mut secret = described(&pubkey);
+        secret["labels"]["binding_version"] = json!("0");
+        assert_eq!(
+            verify_owned(&secret, &pubkey, "s").expect("ours, one release back"),
+            Ownership::OursButOlder(0)
+        );
+    }
+
+    /// …and a *newer* one is the refusal that reserves, naming the version so
+    /// the operator is not told their own secret is foreign.
+    #[test]
+    fn a_secret_from_a_future_binding_version_is_a_refusal() {
         let pubkey = pubkey();
         let mut secret = described(&pubkey);
         secret["labels"]["binding_version"] = json!("99");
+        let err = verify_owned(&secret, &pubkey, "s").expect_err("must refuse");
+        assert!(err.contains("99"), "{err}");
+        assert!(err.contains("newer"), "{err}");
+        assert!(!err.contains("not managed by"), "{err}");
+    }
+
+    /// A `binding_version` label that is not a number describes no layout at
+    /// all, so it cannot be ordered against ours. Fail closed.
+    #[test]
+    fn a_non_numeric_binding_version_label_is_a_refusal() {
+        let pubkey = pubkey();
+        let mut secret = described(&pubkey);
+        secret["labels"]["binding_version"] = json!("1.0");
         assert!(verify_owned(&secret, &pubkey, "s").is_err());
     }
 
@@ -4842,6 +5355,7 @@ mod tests {
             let verb = match args {
                 ["secrets", "describe", ..] => "describe",
                 ["secrets", "create", ..] => "create",
+                ["secrets", "update", ..] => "update",
                 ["secrets", "versions", "add", ..] => "versions add",
                 ["secrets", "add-iam-policy-binding", ..] => "add-iam-policy-binding",
                 ["secrets", "delete", ..] => "delete",
@@ -4899,6 +5413,41 @@ mod tests {
         assert_eq!(
             fake.sequence(),
             ["describe", "versions add", "describe", "add-iam-policy-binding"]
+        );
+    }
+
+    /// P1-1's sequence half. A secret at an older binding version is rolled
+    /// forward *before* the new version is added, so a deploy interrupted
+    /// after the label update leaves a secret the next run reads as `Ours`
+    /// rather than repeating the upgrade. The re-read between the update and
+    /// the add is not optional: a full API round trip now separates the
+    /// verification from the mutation it authorizes.
+    #[test]
+    fn a_secret_from_an_older_binding_version_is_rolled_forward() {
+        let pubkey = pubkey();
+        let mut older = described(&pubkey);
+        older["labels"]["binding_version"] = json!("0");
+        // Older on the first look, current on every look after the update.
+        let fake = Recorder::new(vec![Some(older), Some(described(&pubkey))]);
+        store(
+            &fake,
+            "p",
+            "s",
+            &pubkey,
+            "BODY\n",
+            "vm@p.iam.gserviceaccount.com",
+        )
+        .expect("this provider's own prior-version secret is an upgrade target");
+        assert_eq!(
+            fake.sequence(),
+            [
+                "describe",
+                "update",
+                "describe",
+                "versions add",
+                "describe",
+                "add-iam-policy-binding"
+            ]
         );
     }
 
@@ -5019,7 +5568,7 @@ Prepend to `crates/buzz-backend-gcp/src/secrets.rs`:
 //! at create time and **verified before every add-version, IAM binding, and
 //! delete**. Name collision is not ownership.
 
-use crate::naming::{BINDING_VERSION, MANAGED_BY};
+use crate::naming::{ownership_of, Ownership, BINDING_VERSION, MANAGED_BY};
 use crate::remote::{Gcloud, Output};
 
 /// Label key carrying the marker's identity half.
@@ -5059,33 +5608,50 @@ pub fn annotations_for(pubkey_full: &str) -> String {
 /// Requires **both** marker halves *and* a full-pubkey match, mirroring
 /// `secret_is_ours` in the Kubernetes binding (`observe.rs:64-67`). Pure, so
 /// every branch is tested without a project.
+///
+/// The two labels go through [`ownership_of`], the same rule the file-header
+/// tiers use, so "ours / ours-but-older / ours-but-newer / not ours" has one
+/// definition in this binding rather than one per storage medium. `Ok` carries
+/// the verdict because the caller has to act on it: `OursButOlder` means the
+/// labels need rolling forward before anything else happens.
 pub fn verify_owned(
     described: &serde_json::Value,
     pubkey_full: &str,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Ownership, String> {
     let label = |key: &str| {
         described
             .get("labels")
             .and_then(|labels| labels.get(key))
             .and_then(serde_json::Value::as_str)
     };
-    if label(LABEL_MANAGED_BY) != Some(MANAGED_BY)
-        || label(LABEL_BINDING_VERSION) != Some(BINDING_VERSION)
-    {
-        return Err(format!(
-            "secret {name} already exists but is not managed by {MANAGED_BY} at \
-             binding version {BINDING_VERSION}. Refusing to modify a secret this \
-             provider did not create — rename or delete it, or point this agent \
-             at a different instance."
-        ));
+    let ownership = ownership_of(label(LABEL_MANAGED_BY), label(LABEL_BINDING_VERSION));
+    match ownership {
+        Ownership::Ours | Ownership::OursButOlder(_) => {}
+        Ownership::OursButNewer(found) => {
+            return Err(format!(
+                "secret {name} was created by a newer {MANAGED_BY} (binding \
+                 version {found}; this build writes {BINDING_VERSION}). \
+                 Refusing to write a version into, or delete, a secret whose \
+                 layout this build does not understand. Upgrade this provider."
+            ))
+        }
+        Ownership::NotOurs => {
+            return Err(format!(
+                "secret {name} already exists but is not managed by \
+                 {MANAGED_BY} at a binding version this build recognises. \
+                 Refusing to modify a secret this provider did not create — \
+                 rename or delete it, or point this agent at a different \
+                 instance."
+            ))
+        }
     }
     let annotated = described
         .get("annotations")
         .and_then(|annotations| annotations.get(ANNOTATION_PUBKEY_FULL))
         .and_then(serde_json::Value::as_str);
     match annotated {
-        Some(pubkey) if pubkey == pubkey_full => Ok(()),
+        Some(pubkey) if pubkey == pubkey_full => Ok(ownership),
         Some(pubkey) => Err(format!(
             "secret {name} belongs to pubkey {pubkey}, not {pubkey_full}. The \
              12-hex name is collision-resistant, not collision-free; refusing \
@@ -5147,7 +5713,7 @@ fn describe_owned(
     project: &str,
     name: &str,
     pubkey_full: &str,
-) -> Result<(), String> {
+) -> Result<Ownership, String> {
     let Some(described) = describe(remote, project, name)? else {
         return Err(format!(
             "secret {name} disappeared between two checks in this deploy. \
@@ -5181,9 +5747,42 @@ pub fn store(
     service_account: &str,
 ) -> Result<(), String> {
     match describe(remote, project, name)? {
-        // Verified here and deliberately *not* re-read before the add below:
-        // no round trip separates the two.
-        Some(existing) => verify_owned(&existing, pubkey_full, name)?,
+        Some(existing) => {
+            // Verified here. On the steady-state path nothing at all separates
+            // this check from the `versions add` below — that is the invariant
+            // round 2's P1-5 established and the sequence test asserts.
+            if let Ownership::OursButOlder(from) = verify_owned(&existing, pubkey_full, name)? {
+                // Ours, one layout back. Roll the marker forward *first*, so a
+                // deploy interrupted after this point leaves a secret the next
+                // run reads as `Ours` rather than repeating the upgrade.
+                // Nothing separates this mutation from the check above either.
+                let labels = labels_for(pubkey_full);
+                let out = remote.gcloud(
+                    &[
+                        "secrets",
+                        "update",
+                        name,
+                        "--project",
+                        project,
+                        "--update-labels",
+                        &labels,
+                    ],
+                    None,
+                )?;
+                if !out.ok() {
+                    return Err(format!(
+                        "rolling secret {name} forward from binding version \
+                         {from} to {BINDING_VERSION} failed (exit {}): {}",
+                        out.code,
+                        out.stderr.trim()
+                    ));
+                }
+                // A full API round trip now separates the verification above
+                // from the add below, so the add gets its own re-read. On the
+                // steady-state path this costs nothing, because it does not run.
+                describe_owned(remote, project, name, pubkey_full)?;
+            }
+        }
         None => {
             let labels = labels_for(pubkey_full);
             let annotations = annotations_for(pubkey_full);
@@ -5345,7 +5944,7 @@ Add `mod secrets;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing and clippy-clean**
 
 Run: `cargo test -p buzz-backend-gcp secrets && cargo clippy -p buzz-backend-gcp --all-targets -- -D warnings`
-Expected: PASS — 13 tests — and no clippy warnings.
+Expected: PASS — 16 tests — and no clippy warnings.
 
 - [ ] **Step 5: Commit**
 
@@ -5357,7 +5956,7 @@ git add -A && git commit -s -m "feat(backend-gcp): label-fenced Secret Manager s
 
 ## Task 11: `observe.rs` — systemd state and marker state, separately
 
-Resolves the observation half of review **P1-5**, and round 2's **P1-4** (each artifact is observed against its own marker) and the observation half of **P1-6** (the content-hash tamper check is deleted).
+Resolves the observation half of review **P1-5**, round 2's **P1-4** (each artifact is observed against its own marker) and the observation half of **P1-6** (the content-hash tamper check is deleted), and the observation half of round 3's **P1-1**: an artifact's binding version is now reported as a three-way verdict rather than folded into a boolean, so `classify` can tell "ours, one layout behind" from "not ours".
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/observe.rs`
@@ -5366,21 +5965,24 @@ Resolves the observation half of review **P1-5**, and round 2's **P1-4** (each a
 **Interfaces:**
 - Produces:
   - `observe::SystemdState { load_state, active_state, sub_state, unit_file_state, main_pid }` with `instance_known(&self) -> bool` and `running(&self) -> bool`
-  - `observe::AgentFileState { path: String, present: bool, marker: Option<AgentMarker> }`
-  - `observe::SharedFileState { path: String, present: bool, marked: bool, sha256: String }`
+  - `observe::AgentFileState { path: String, present: bool, ownership: Ownership, marker: Option<AgentMarker> }`
+  - `observe::SharedFileState { path: String, present: bool, ownership: Ownership, sha256: String }`
   - `observe::MarkerState { env: AgentFileState, siblings: Vec<AgentFileState>, shared: Vec<SharedFileState> }` with `agent_files(&self) -> impl Iterator<Item = &AgentFileState>`
   - `observe::Observation { systemd, markers, harness_installed: bool, reserved_bytes: u64, available_bytes: u64 }`
   - `observe::SHARED_PATHS: [&str; 3]` and `observe::agent_paths(names: &Names) -> [String; 4]`
   - `observe::look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation, String>`
   - `observe::parse_observation(stdout: &str, own_dropin: &str) -> Observation`
   - `observe::section(body: &str, name: &str) -> &str` and `observe::property(block: &str, key: &str) -> &str` — `pub(crate)`, reused by `reconcile`'s startup poll and its start round trip, which drive scripts of the same sectioned shape
-- Consumes: `crate::capacity::parse_reported_bytes`, `crate::config::parse_memory_max`, `crate::naming::{header_line, is_shared_marker, AgentMarker, Names}`, `crate::remote::{sq, Remote, MARKER_SCAN_LINES}`.
+  - `observe::FIELD_HELPER: &str`, `observe::agent_file_rows(names: &Names) -> String` and `observe::parse_agent_file_row(line: &str) -> AgentFileState` — `pub(crate)`, the emitter/parser pair Task 13's pre-stop ownership scan reuses
+- Consumes: `crate::capacity::parse_reported_bytes`, `crate::config::parse_memory_max`, `crate::naming::{agent_ownership, header_line, shared_ownership, AgentMarker, Names, Ownership}`, `crate::remote::{sq, Remote, MARKER_SCAN_LINES}`.
 
 **Why the two states are separate types.** The previous revision derived `unit_present` solely from the env file, so a real unit with no env file classified as `Create` and got provider files installed around it. They are independent facts and must be observed independently: systemd knows about install symlinks and running jobs; markers know about ownership. Note the trap the split makes visible — once the *template* `buzz-acp@.service` exists, `systemctl show buzz-acp@<anything>.service` reports `LoadState=loaded` for **every** instance name, so `LoadState` is not evidence that *this* instance exists. `UnitFileState=enabled` (an install symlink) or a non-`inactive` `ActiveState` is.
 
 **Four per-agent rows, not one.** A replace rewrites four files and a remove deletes four files, so an observation that records only the env file's marker cannot authorize either without authorizing them from a *sibling's* header. That is not the auto-repair fence, which says no destructive action may touch a file lacking the marker of its own tier (`docs/remote-agents.md:1460-1476`). The observer therefore reports one `AgentFileState` per artifact, and `classify` refuses on the first present-but-not-ours among them, naming that path. The env file keeps its own field rather than an index into a vector, because it is genuinely special: it is the only artifact that records what the deploy *was*, and so the only one anything classifies on.
 
-**Bytes, not claims.** A shared file is compared by hashing the whole file on the instance and comparing that to the digest of the exact bytes this provider would render. Nothing is stripped, nothing stored in the file is trusted, and there is no `sed` range to get wrong. Whether the file carries the provider marker is a separate, boolean question, and it is answered the same way the per-agent rows are: the script extracts the three header values with one `field` helper and ships them, and Rust reassembles the header and hands it to `naming::is_shared_marker`. That keeps "is this ours" in **one** function per tier for both the bytes this provider writes and the bytes it reads back — the alternative, a `grep -F -x` needle list built in the script, is a second implementation of the same predicate in a second language. The instance-side `grep -F -x` form survives only where the check must be atomic with the action it guards (`Remote::install`, `removal_script`), which an observation is not.
+**Bytes, not claims.** A shared file is compared by hashing the whole file on the instance and comparing that to the digest of the exact bytes this provider would render. Nothing is stripped, nothing stored in the file is trusted, and there is no `sed` range to get wrong. Whether the file carries the provider marker is a separate question, and it is answered the same way the per-agent rows are: the script extracts the three header values with one `field` helper and ships them, and Rust reassembles the header and hands it to `naming::shared_ownership`. That keeps "is this ours" in **one** function per tier for both the bytes this provider writes and the bytes it reads back — the alternative, a `grep -F -x` needle list built in the script, is a second spelling of the same rule.
+
+**Ownership is a verdict, not a flag.** Each row carries an `Ownership` beside its marker, and the two are not redundant: `ownership` answers the *provenance* question — this provider at this binding version, at an older one, at a newer one, or not us — while `marker` answers the *identity* one, which pubkey and which intent. A file can be plainly ours and still carry no `agent-pubkey-full`, and that deserves a different refusal from "somebody else's file". `marker` is `Some` only when `ownership` is actionable, so the implication runs one way and the observer is the single place both are derived, from the same header, in one function per tier.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5441,6 +6043,14 @@ mod tests {
             .collect()
     }
 
+    /// A row body for a present file carrying our per-agent marker at an
+    /// arbitrary binding version, so the ordering rule can be exercised now —
+    /// the bump that creates a real prior version is exactly the moment nobody
+    /// will re-derive it.
+    fn marked_at(version: &str) -> String {
+        format!("present|{MANAGED_BY}|{version}|{}|ci", pubkey())
+    }
+
     #[test]
     fn a_running_instance_parses_as_live_and_owned() {
         let out = sample(
@@ -5460,7 +6070,11 @@ mod tests {
         // Our own drop-in is excluded, or a redeploy would double-count itself.
         assert_eq!(o.reserved_bytes, 1024 * 1024 * 1024);
         assert_eq!(o.available_bytes, 2_831_156 * 1024);
-        assert!(o.markers.shared.iter().all(|s| s.present && s.marked));
+        assert!(o
+            .markers
+            .shared
+            .iter()
+            .all(|s| s.present && s.ownership == Ownership::Ours));
     }
 
     /// A template unit makes `systemctl show` report `LoadState=loaded` for
@@ -5526,7 +6140,11 @@ mod tests {
         let o = parse_observation(&out, OWN_DROPIN);
         assert!(!o.systemd.instance_known());
         assert!(o.markers.agent_files().all(|f| !f.present && f.marker.is_none()));
-        assert!(o.markers.shared.iter().all(|s| !s.present && !s.marked));
+        assert!(o
+            .markers
+            .shared
+            .iter()
+            .all(|s| !s.present && s.ownership == Ownership::NotOurs));
         assert_eq!(o.reserved_bytes, 0);
     }
 
@@ -5542,6 +6160,46 @@ mod tests {
         let o = parse_observation(&out, OWN_DROPIN);
         assert!(o.markers.env.present);
         assert!(o.markers.env.marker.is_none());
+    }
+
+    /// P1-1's observation half. A version this build supersedes must read as
+    /// *ours, one layout behind* — with its identity intact, because `remove`
+    /// needs that pubkey — and a version it does not understand must read as
+    /// neither ours nor anonymous.
+    #[test]
+    fn a_row_reports_an_older_version_as_ours_and_a_newer_one_as_not() {
+        let unit = "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
+                    UnitFileState=enabled\nMainPID=0\n";
+        let older = parse_observation(
+            &sample(
+                unit,
+                &agent_rows(&marked_at("0"), ABSENT, ABSENT, ABSENT),
+                &all_shared_marked(),
+                "",
+            ),
+            OWN_DROPIN,
+        );
+        assert_eq!(older.markers.env.ownership, Ownership::OursButOlder(0));
+        assert_eq!(
+            older.markers.env.marker.as_ref().map(|m| m.pubkey_full.clone()),
+            Some(pubkey()),
+            "an upgrade target must keep the identity remove acts on"
+        );
+
+        let newer = parse_observation(
+            &sample(
+                unit,
+                &agent_rows(&marked_at("99"), ABSENT, ABSENT, ABSENT),
+                &all_shared_marked(),
+                "",
+            ),
+            OWN_DROPIN,
+        );
+        assert_eq!(newer.markers.env.ownership, Ownership::OursButNewer(99));
+        assert!(
+            newer.markers.env.marker.is_none(),
+            "a layout this build cannot read yields no marker to act on"
+        );
     }
 
     /// P1-4's observation half: four artifacts, four independent verdicts. A
@@ -5573,27 +6231,6 @@ mod tests {
         assert!(!o.markers.siblings[2].present);
     }
 
-    /// A binding version this build does not understand is not our marker, and
-    /// a present file that is not ours is never safe to overwrite.
-    #[test]
-    fn a_future_binding_version_reads_as_present_and_unowned() {
-        let out = sample(
-            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
-             UnitFileState=enabled\nMainPID=0\n",
-            &agent_rows(
-                &format!("present|{MANAGED_BY}|99|{}|ci", pubkey()),
-                ABSENT,
-                ABSENT,
-                ABSENT,
-            ),
-            &all_shared_marked(),
-            "",
-        );
-        let o = parse_observation(&out, OWN_DROPIN);
-        assert!(o.markers.env.present);
-        assert!(o.markers.env.marker.is_none());
-    }
-
     /// A shared file with our name and no provider marker is somebody else's.
     /// There is deliberately no third state: nothing in the file claims what
     /// its own content should be, so "edited underneath us" is not a verdict
@@ -5617,9 +6254,9 @@ mod tests {
             OWN_DROPIN,
         );
         assert!(o.markers.shared[0].present);
-        assert!(!o.markers.shared[0].marked);
+        assert_eq!(o.markers.shared[0].ownership, Ownership::NotOurs);
         assert_eq!(o.markers.shared[0].sha256, "deadbeef");
-        assert!(o.markers.shared[1].marked);
+        assert_eq!(o.markers.shared[1].ownership, Ownership::Ours);
     }
 
     #[test]
@@ -5719,7 +6356,9 @@ Prepend to `crates/buzz-backend-gcp/src/observe.rs`:
 
 use crate::capacity::parse_reported_bytes;
 use crate::config::parse_memory_max;
-use crate::naming::{header_line, is_shared_marker, AgentMarker, Names};
+use crate::naming::{
+    agent_ownership, header_line, shared_ownership, AgentMarker, Names, Ownership,
+};
 use crate::remote::{sq, Remote, MARKER_SCAN_LINES};
 
 /// The three artifacts every instance shares. Order is fixed so the observer's
@@ -5781,9 +6420,19 @@ impl SystemdState {
 pub struct AgentFileState {
     pub path: String,
     pub present: bool,
-    /// The marker **this file's own** header carries, at this binding version.
-    /// `None` on a present file means "not ours" — which is a refusal to act,
-    /// never a licence to overwrite.
+    /// What **this file's own** header says about who wrote it, and at which
+    /// binding version. [`Ownership::OursButOlder`] is an authorised upgrade
+    /// target; [`Ownership::OursButNewer`] and [`Ownership::NotOurs`] are
+    /// refusals, and they are separate states because a newer build of this
+    /// provider is not a stranger and must not be described as one.
+    pub ownership: Ownership,
+    /// The identity half of the same header: which agent, and what intent.
+    ///
+    /// Independent of `ownership`, not a restatement of it — a file can carry
+    /// our marker at our version and still have no `agent-pubkey-full` line,
+    /// which is its own refusal with its own message. The implication runs one
+    /// way: `Some` is only ever produced for an actionable `ownership`,
+    /// because [`AgentMarker::parse`] checks that first.
     pub marker: Option<AgentMarker>,
 }
 
@@ -5792,8 +6441,10 @@ pub struct AgentFileState {
 pub struct SharedFileState {
     pub path: String,
     pub present: bool,
-    /// Does the file carry this provider's three-line provider-level marker?
-    pub marked: bool,
+    /// What the file's provider-level header says. Ours at this version or an
+    /// older one takes the ordinary write-if-different path; a newer one and
+    /// an absent marker are both refusals, for different reasons.
+    pub ownership: Ownership,
     /// SHA-256 of the file's **whole** contents, header included.
     ///
     /// Compared against the digest of the exact bytes this provider would
@@ -5862,24 +6513,29 @@ pub fn look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation
     Ok(observation)
 }
 
-/// The observer script. Sectioned so the parser is a pure function of text.
+/// The `field` helper both row emitters need: read one `# <name>: ` value out
+/// of `$h`, the first few lines of whatever file the loop is currently on.
 ///
-/// `field` is defined once and reads from `$h`, the first few lines of whatever
-/// file the loop is currently on — the same helper serves both tiers. Emitting
-/// the header *values* as one `|`-separated row keeps each section
-/// line-oriented, and a value that itself contains a `|` is truncated at it,
-/// which makes the reassembled header fail to match — the fail-closed
-/// direction. Nothing here decides ownership; that is `AgentMarker::parse` and
-/// `is_shared_marker`, in Rust, for both tiers.
-fn observe_script(names: &Names, harness: &str) -> String {
+/// `pub(crate)` and a `const` rather than an inline fragment because Task 13's
+/// pre-stop ownership scan reuses [`agent_file_rows`], and a helper defined in
+/// one script and called from another is the kind of coupling that breaks
+/// silently.
+pub(crate) const FIELD_HELPER: &str =
+    "field() { printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }\n";
+
+/// The shell that emits one
+/// `path|present|managed-by|binding-version|agent-pubkey-full|create-intent`
+/// row per per-agent artifact.
+///
+/// Factored out of [`observe_script`] and `pub(crate)` because `remove`
+/// (Task 13) needs exactly these rows and nothing else: a second emitter of
+/// the same shape would be a second thing to keep in step with
+/// [`parse_agent_file_row`], and `deploy` and `remove` disagreeing about what
+/// a header says is precisely the failure the marker exists to prevent.
+/// Assumes [`FIELD_HELPER`] is already defined in the surrounding script.
+pub(crate) fn agent_file_rows(names: &Names) -> String {
     format!(
-        "set -uo pipefail\n\
-         field() {{ printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }}\n\
-         echo '---UNIT---'\n\
-         systemctl show {unit} -p LoadState -p ActiveState -p SubState \
-             -p UnitFileState -p MainPID 2>/dev/null || true\n\
-         echo '---AGENTFILES---'\n\
-         for p in {agent_files}; do \
+        "for p in {agent_files}; do \
            if sudo -n test -e \"$p\"; then \
              h=$(sudo -n head -n {scan} \"$p\"); \
              printf '%s|present|%s|%s|%s|%s\\n' \"$p\" \"$(field managed-by)\" \
@@ -5888,7 +6544,33 @@ fn observe_script(names: &Names, harness: &str) -> String {
            else \
              printf '%s|absent||||\\n' \"$p\"; \
            fi; \
-         done\n\
+         done\n",
+        agent_files = agent_paths(names)
+            .iter()
+            .map(|p| sq(p))
+            .collect::<Vec<_>>()
+            .join(" "),
+        scan = MARKER_SCAN_LINES,
+    )
+}
+
+/// The observer script. Sectioned so the parser is a pure function of text.
+///
+/// Emitting the header *values* as one `|`-separated row keeps each section
+/// line-oriented, and a value that itself contains a `|` is truncated at it,
+/// which makes the reassembled header fail to match — the fail-closed
+/// direction. Nothing here decides ownership; that is `naming::agent_ownership`
+/// / `AgentMarker::parse` and `naming::shared_ownership`, in Rust, for both
+/// tiers.
+fn observe_script(names: &Names, harness: &str) -> String {
+    format!(
+        "set -uo pipefail\n\
+         {field}\
+         echo '---UNIT---'\n\
+         systemctl show {unit} -p LoadState -p ActiveState -p SubState \
+             -p UnitFileState -p MainPID 2>/dev/null || true\n\
+         echo '---AGENTFILES---'\n\
+         {agent_rows}\
          echo '---SHARED---'\n\
          for p in {shared}; do \
            if sudo -n test -e \"$p\"; then \
@@ -5913,12 +6595,9 @@ fn observe_script(names: &Names, harness: &str) -> String {
          echo '---HARNESS---'\n\
          test -x {harness_path} && echo yes || echo no\n\
          echo '---END---'\n",
+        field = FIELD_HELPER,
         unit = sq(&names.unit()),
-        agent_files = agent_paths(names)
-            .iter()
-            .map(|p| sq(p))
-            .collect::<Vec<_>>()
-            .join(" "),
+        agent_rows = agent_file_rows(names),
         shared = SHARED_PATHS
             .iter()
             .map(|p| sq(p))
@@ -5955,9 +6634,11 @@ pub(crate) fn property<'a>(block: &'a str, key: &str) -> &'a str {
 /// Decode one `path|present|managed-by|binding-version|pubkey|intent` row.
 ///
 /// The four header values are reassembled into the lines they came from and
-/// handed to [`AgentMarker::parse`], so "is this ours" is decided by exactly one
-/// function for the bytes this provider renders and the bytes it reads back.
-fn parse_agent_file_row(line: &str) -> AgentFileState {
+/// handed to [`agent_ownership`] and [`AgentMarker::parse`], so "is this ours"
+/// is decided by exactly one pair of functions for the bytes this provider
+/// renders and the bytes it reads back. `pub(crate)` because Task 13's
+/// pre-stop scan parses the same rows.
+pub(crate) fn parse_agent_file_row(line: &str) -> AgentFileState {
     let mut parts = line.split('|');
     let path = parts.next().unwrap_or("").to_string();
     let present = parts.next().unwrap_or("") == "present";
@@ -5971,7 +6652,14 @@ fn parse_agent_file_row(line: &str) -> AgentFileState {
     AgentFileState {
         path,
         present,
-        // An absent file carries no marker, whatever the rest of the row says.
+        // An absent file carries no marker of any kind, whatever the rest of
+        // the row says — the row for an absent file is all-empty fields, but
+        // being explicit here keeps the invariant local rather than implied.
+        ownership: if present {
+            agent_ownership(&header)
+        } else {
+            Ownership::NotOurs
+        },
         marker: present.then(|| AgentMarker::parse(&header)).flatten(),
     }
 }
@@ -5979,7 +6667,7 @@ fn parse_agent_file_row(line: &str) -> AgentFileState {
 /// Decode one `path|present|managed-by|binding-version|scope|sha256` row.
 ///
 /// Same shape as [`parse_agent_file_row`] and the same discipline: the header
-/// values are reassembled and handed to the one predicate that also judges the
+/// values are reassembled and handed to the one function that also judges the
 /// bytes this provider renders, so "is this ours" has a single definition per
 /// tier rather than one in Rust and one in shell.
 fn parse_shared_file_row(line: &str) -> SharedFileState {
@@ -5995,8 +6683,11 @@ fn parse_shared_file_row(line: &str) -> SharedFileState {
     SharedFileState {
         path,
         present,
-        // An absent file carries no marker, whatever the rest of the row says.
-        marked: present && is_shared_marker(&header),
+        ownership: if present {
+            shared_ownership(&header)
+        } else {
+            Ownership::NotOurs
+        },
         sha256: parts.next().unwrap_or("").trim().to_string(),
     }
 }
@@ -6077,7 +6768,7 @@ git add -A && git commit -s -m "feat(backend-gcp): observe systemd state and mar
 
 ## Task 12: `reconcile.rs` — the I4 state machine, the fence, and the startup poll
 
-Resolves the classification half of review **P1-5**, and round 2's **P1-2** (startup confirmation), **P1-4** (the per-artifact fence), the classification half of **P1-6** (the tamper verdict is gone), **P1-7** (credential rotation), **P1-8** (serialization and the narrowed fence), and **P2-3** (shared repair on `RestartSame`).
+Resolves the classification half of review **P1-5**, round 2's **P1-2** (startup confirmation), **P1-4** (the per-artifact fence), the classification half of **P1-6** (the tamper verdict is gone), **P1-7** (credential rotation), **P1-8** (serialization and the narrowed fence) and **P2-3** (shared repair on `RestartSame`), and round 3's **P1-4** (the lease was acquired after the decision it protects), the `classify` half of **P1-1** (a prior-version artifact read as foreign), and **P2-1** (the lease TTL was shorter than the deploy budget) and **P2-3** (the lease record was a trust boundary without controls).
 
 **Files:**
 - Modify: `crates/buzz-backend-gcp/src/reconcile.rs` (replaces the Task 5 skeleton wholesale)
@@ -6090,15 +6781,19 @@ Resolves the classification half of review **P1-5**, and round 2's **P1-2** (sta
   - `reconcile::Startup` — `Confirmed | Failed(String) | Pending`
   - `reconcile::parse_startup(stdout: &str) -> Startup`
   - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, String>` (signature unchanged from Task 5, so `main.rs` needs no edit)
-- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, BINDING_VERSION, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::observe::{AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` and `crate::naming::AgentMarker` — the parent module never names those types, so importing them there would be an unused import under `-D warnings`.
+- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, Ownership, BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::observe::{AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` and `crate::naming::AgentMarker` — the parent module never names those, so importing them there would be an unused import under `-D warnings`. `Ownership` needs no test import: the parent names it, so `use super::*` carries it.
 
-**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes roughly a dozen `gcloud` round trips (observe, the lease, three secret calls, up to seven installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 40-90 s of the budget is gone before the first poll. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is roughly 8× that and still leaves ≥ 250 s of slack, so a stuck agent produces this provider's actionable error rather than the desktop's opaque one.
+**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes fifteen or so `gcloud` round trips (a pre-lease look, the lease, the authoritative look under it, four lease renewals, three secret calls, up to seven installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 50-110 s of the budget is gone before the first poll. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is about 8× an observed warm start and still leaves ≥ 250 s of slack, so a stuck agent produces this provider's actionable error rather than the desktop's opaque one.
 
 **Why the startup poll is scoped to one attempt.** The harness's startup line carries no generation and no start nonce (`crates/buzz-acp/src/config.rs:1119-1146`), and `enable --now` on a `Type=simple` unit returns before the new process logs anything. A poll that counts any `buzz-acp starting:` line in a fixed lookback window is therefore *confirmed by the previous run* whenever an agent is restarted soon after a success — the deploy reports a healthy start it never observed. Two independent bounds close it: `_SYSTEMD_INVOCATION_ID`, which systemd re-mints on every start, and `--since @<epoch>` taken **on the instance** immediately before `enable --now`. The first pins the query to this invocation; the second covers the case the first cannot see, where the unit was already running and `enable --now` was a no-op, so the "current" invocation id is the *old* run's.
 
 **Why the fence and the stop share one shell.** [L2] item 4 requires a destructive write fenced to the exact observation that authorized it. The previous shape read the observation in one `gcloud` round trip and performed the stop in the next, with the installs four to six round trips after that; a competing `enable --now` anywhere in that window starts a unit over a half-rewritten file set. A fence that wide is a TOCTOU with more steps. The re-read and the stop now execute in a single remote shell, and every write after it carries its **own** marker guard inside its own install script — so no later step leans on a check that ran earlier.
 
-**Why the mutating window takes a lease.** `flock` cannot span the window on its own: every round trip is a separate SSH session, so the descriptor holding the lock closes when the session ends. What `flock` *can* do is make the read-modify-write of a lease record atomic, which is exactly what a lease needs. The lock file under `/run/lock` is the mutex; a sibling owner file holds `<token> <epoch>` and expires after `DEPLOY_LEASE_SECONDS`, so a provider killed mid-window blocks the next deploy for minutes rather than forever. The lease is taken after classification (a read-only refusal must not block anyone) and released before the startup poll (which mutates nothing and may run for four minutes).
+**Why the mutating window takes a lease, and why it is taken first.** `flock` cannot span the window on its own: every round trip is a separate SSH session, so the descriptor holding the lock closes when the session ends. What `flock` *can* do is make the read-modify-write of a lease record atomic, which is exactly what a lease needs. The lock file is the mutex; a sibling owner file holds `<token> <epoch>` and expires after `DEPLOY_LEASE_SECONDS`, so a provider killed mid-window blocks the next deploy for minutes rather than forever. Both live in a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp` rather than directly under `/run/lock`: `/run` is a tmpfs systemd recreates on every boot, so a lease can never outlive the reboot that made its holder irrelevant, but `/run/lock` is world-readable and a predictable record path there is one an unprivileged local user can watch or pre-create.
+
+The lease is now acquired **before the observation the deploy acts on**, not after it. The previous ordering ran `observe::look` and `classify` first and then took the lease and acted on that pre-lease verdict — a deploy could observe "absent/stopped", lose the race, and mutate on stale state. What survives of the old reasoning is the cheap part: a *pre-lease* look still runs, because refusing an unowned file or no-opping a live agent should cost nobody a lease. Everything the deploy then acts on comes from `DeployLease::observe`, a method on the guard, so there is no way to reach the authoritative observation without holding the lease and the ordering is a property of the type rather than of the order somebody wrote two statements in. The lease is released before the startup poll, which mutates nothing and may run for four minutes.
+
+**Why the lease is renewed rather than merely long.** `DEPLOY_LEASE_SECONDS` was 300 s against a desktop provider timeout of 600 s (`backend.rs:528`) and against direct CLI runs with no bound at all, so a slow-but-live holder aged out and a second deploy began mutating the same agent. Both halves are fixed, because each covers a case the other cannot: the TTL is raised to **900 s**, above every enforced lifetime, which handles the desktop; and `DeployLease::renew` — a verify-then-refresh of the owner record under the same `flock` — runs at each phase boundary of the window, which handles the unbounded case by making the longest un-renewed gap one phase instead of the whole window. Renewal *verifies before it refreshes*: if the record no longer names this holder, the deploy stops with `LOCK_UNAVAILABLE` rather than continuing to mutate under a lease it has lost.
 
 **Why `RestartSame` is safe to skip the secret with.** Secret *values* are excluded from the create-intent's readable content, but a **digest** of the secret payload is folded into it (`render::plan`). A rotated `auth_tag` or API key therefore diverges the intent, `classify` returns `FencedReplace`, and the secret is re-stored before the unit starts. Without that digest `RestartSame` would restart an agent against the previous secret version while reporting success — the operator sees a healthy restart and the relay sees the old identity.
 
@@ -6140,7 +6835,7 @@ mod tests {
             .map(|path| SharedFileState {
                 path: (*path).to_string(),
                 present: true,
-                marked: true,
+                ownership: Ownership::Ours,
                 sha256: format!("hash-{path}"),
             })
             .collect()
@@ -6177,6 +6872,16 @@ mod tests {
                 env: AgentFileState {
                     path: ENV_PATH.to_string(),
                     present: env_present,
+                    // The pair is not redundant: `ownership` is the version
+                    // half and `marker` the identity half, and a file can
+                    // carry ours at this version while its identity lines are
+                    // missing. A `Some` marker does imply an actionable
+                    // ownership, though, so the helper keeps them consistent.
+                    ownership: if marker.is_some() {
+                        Ownership::Ours
+                    } else {
+                        Ownership::NotOurs
+                    },
                     marker,
                 },
                 siblings: SIBLING_PATHS
@@ -6184,6 +6889,7 @@ mod tests {
                     .map(|path| AgentFileState {
                         path: (*path).to_string(),
                         present: false,
+                        ownership: Ownership::NotOurs,
                         marker: None,
                     })
                     .collect(),
@@ -6293,6 +6999,7 @@ mod tests {
     fn a_sibling_belonging_to_another_agent_is_refused_by_name() {
         let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
         o.markers.siblings[2].present = true;
+        o.markers.siblings[2].ownership = Ownership::Ours;
         o.markers.siblings[2].marker = Some(AgentMarker {
             pubkey_full: "ff".repeat(32),
             create_intent: "stale".to_string(),
@@ -6311,6 +7018,7 @@ mod tests {
         let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
         for sibling in &mut o.markers.siblings {
             sibling.present = true;
+            sibling.ownership = Ownership::Ours;
             sibling.marker = ours("stale");
         }
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
@@ -6320,7 +7028,7 @@ mod tests {
     #[test]
     fn an_unmarked_shared_file_is_refused() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
-        o.markers.shared[0].marked = false;
+        o.markers.shared[0].ownership = Ownership::NotOurs;
         let action = classify(&o, &pubkey(), INTENT);
         assert!(matches!(action, Action::Refuse(_)), "got {action:?}");
     }
@@ -6336,13 +7044,103 @@ mod tests {
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::Create);
     }
 
+    /// P1-1, the shared half: a template unit this provider wrote at an older
+    /// binding version takes the ordinary write-if-different path. It is not a
+    /// refusal — refusing it would stop every deploy on the box the moment the
+    /// version bumped, on files this provider itself installed.
+    #[test]
+    fn a_shared_file_from_an_older_binding_version_is_rewritten_not_refused() {
+        let mut o = obs(systemd("disabled", "inactive", 0), false, None);
+        o.markers.shared[1].ownership = Ownership::OursButOlder(0);
+        o.markers.shared[1].sha256 = "the-version-0-rendering".to_string();
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::Create);
+
+        let plan = plan_with_shared([
+            "hash-/etc/systemd/system/buzz-acp@.service",
+            "hash-/etc/systemd/system/buzz-acp-secret@.service",
+            "hash-/usr/local/sbin/buzz-acp-fetch-key",
+        ]);
+        let writes = shared_writes(&plan, &o);
+        assert_eq!(writes.len(), 1, "the older rendering must be rewritten");
+        assert_eq!(writes[0].path, SHARED_PATHS[1]);
+    }
+
+    /// …and a shared file from a *newer* one is the refusal the version rule
+    /// reserves, with that version named. Overwriting it would downgrade a
+    /// template every other instance on the box is running against.
+    #[test]
+    fn a_shared_file_from_a_future_binding_version_is_refused_by_version() {
+        let mut o = obs(systemd("disabled", "inactive", 0), false, None);
+        o.markers.shared[0].ownership = Ownership::OursButNewer(99);
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("a newer provider's template must not be downgraded")
+        };
+        assert!(why.contains(SHARED_PATHS[0]), "{why}");
+        assert!(why.contains("99"), "the refusal must name the version: {why}");
+        assert!(
+            !why.contains("somebody else's file"),
+            "a newer build of this provider is not a stranger: {why}"
+        );
+    }
+
+    /// P1-1, the per-agent half. `BINDING_VERSION` is documented as
+    /// "bump when the unit/env shape changes" — a designed-for event — and the
+    /// conjunction it used to sit in made every artifact written before the
+    /// bump read as *present and not ours*: `classify` refused, so `deploy`
+    /// could not upgrade the agent, and `verify_removable` refused
+    /// identically, so `remove` could not tear it down. An older version is an
+    /// authorised upgrade target, and it forces a replace even when the
+    /// recorded intent still matches, because the intent says the inputs did
+    /// not change — not that the artifact layout is current.
+    #[test]
+    fn a_prior_version_agent_is_upgraded_not_refused() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours(INTENT));
+        o.markers.env.ownership = Ownership::OursButOlder(0);
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
+
+        // A live one is still a strict no-op: I4 puts at-most-one-live-instance
+        // above convergence, and an upgrade is convergence.
+        let mut live = obs(systemd("enabled", "active", 4242), true, ours(INTENT));
+        live.markers.env.ownership = Ownership::OursButOlder(0);
+        assert_eq!(classify(&live, &pubkey(), INTENT), Action::NoOp);
+    }
+
+    /// …and a per-agent artifact from a *future* binding version is refused,
+    /// naming the version rather than calling the operator's own agent
+    /// foreign.
+    #[test]
+    fn a_future_version_artifact_is_refused_with_its_version_named() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, None);
+        o.markers.env.ownership = Ownership::OursButNewer(99);
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("a layout this build cannot read must not be overwritten")
+        };
+        assert!(why.contains(ENV_PATH), "{why}");
+        assert!(why.contains("99"), "{why}");
+        assert!(why.contains(BINDING_VERSION), "{why}");
+    }
+
+    /// A file carrying our provider marker but no identity line is its own
+    /// refusal, and it must not read as "somebody else's file": the operator
+    /// needs to know the marker is ours and the identity is missing.
+    #[test]
+    fn our_marker_without_an_identity_line_is_refused_by_name() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, None);
+        o.markers.env.ownership = Ownership::Ours;
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("an unidentifiable per-agent file must stop the deploy")
+        };
+        assert!(why.contains(ENV_PATH), "{why}");
+        assert!(why.contains("agent-pubkey-full"), "{why}");
+    }
+
     /// A missing shared file is normal on a first deploy, not a refusal.
     #[test]
     fn absent_shared_files_are_not_a_refusal() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
         for shared in &mut o.markers.shared {
             shared.present = false;
-            shared.marked = false;
+            shared.ownership = Ownership::NotOurs;
             shared.sha256 = String::new();
         }
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::Create);
@@ -6403,7 +7201,7 @@ Append to the same test module:
     fn an_absent_shared_file_is_written() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
         o.markers.shared[2].present = false;
-        o.markers.shared[2].marked = false;
+        o.markers.shared[2].ownership = Ownership::NotOurs;
         o.markers.shared[2].sha256 = String::new();
         let plan = plan_with_shared([
             "hash-/etc/systemd/system/buzz-acp@.service",
@@ -6495,7 +7293,8 @@ Append to the same test module:
 
     /// P1-8: the mutating window is serialized per agent, the holder is
     /// identifiable, and an abandoned lease expires rather than wedging the
-    /// instance.
+    /// instance. P2-3 adds the record's own controls: a private directory, a
+    /// root-owned regular file, and a future timestamp read as corrupt.
     #[test]
     fn the_deploy_lease_is_per_agent_identifiable_and_bounded() {
         let script = acquire_lease_script("a1b2c3d4e5f6", "tok3n");
@@ -6510,10 +7309,67 @@ Append to the same test module:
             script.contains(&DEPLOY_LEASE_SECONDS.to_string()),
             "an abandoned lease must expire: {script}"
         );
+        // The record lives in a private directory of our own, not loose under
+        // the world-readable /run/lock.
+        assert!(script.contains(LEASE_DIR), "{script}");
+        assert!(!script.contains("/run/lock"), "{script}");
+        assert!(
+            script.contains("install -d -m 0700 -o root -g root"),
+            "the directory must be created private, and repaired if it is not: \
+             {script}"
+        );
+        // A record that is not a root-owned regular file is not a lease
+        // record, and a clock that moved backwards must not grant one either.
+        assert!(script.contains("stat -c %u"), "{script}");
+        assert!(script.contains("-L"), "a symlink is not a lease record: {script}");
+        assert!(
+            script.contains("-ge 0"),
+            "a future-dated record must read as corrupt, not fresh: {script}"
+        );
         // Release must never steal: it clears the record only if we hold it.
         let release = release_lease_script("a1b2c3d4e5f6", "tok3n");
         assert!(release.contains("tok3n"), "{release}");
         assert!(release.contains("rm -f"), "{release}");
+    }
+
+    /// P2-1: the TTL must exceed every enforced lifetime, or a slow-but-live
+    /// holder ages out and a second deploy starts mutating the same agent
+    /// while the first is still writing.
+    #[test]
+    fn the_lease_outlives_the_desktops_deploy_budget() {
+        // The desktop kills the provider at 600 s (`backend.rs:528`), and the
+        // startup poll — which runs *after* the lease is released — is 240 s.
+        assert!(
+            DEPLOY_LEASE_SECONDS > 600,
+            "a lease that expires under a live deploy is worse than none"
+        );
+        assert!(DEPLOY_LEASE_SECONDS > STARTUP_TIMEOUT.as_secs());
+    }
+
+    /// P1-4: nothing this deploy acts on is observed before the lease exists.
+    /// The authoritative observation hangs off the guard
+    /// (`DeployLease::observe`), so it is unreachable without one — the
+    /// compiler enforces the ordering, not a convention about statement order
+    /// — and its first act is this verify-then-refresh of the owner record, so
+    /// a lease silently lost between acquire and observe stops the deploy
+    /// instead of feeding it stale state.
+    #[test]
+    fn the_authoritative_observation_cannot_run_without_a_held_lease() {
+        let script = renew_lease_script("a1b2c3d4e5f6", "tok3n");
+        assert!(script.contains("tok3n"), "the record must name us: {script}");
+        assert!(
+            script.contains(&LOCK_UNAVAILABLE.to_string()),
+            "losing the lease must stop the deploy, not warn: {script}"
+        );
+        // The whole critical section is `sq`-wrapped for `sudo -n sh -c`, so
+        // match on fragments that carry no single quotes of their own.
+        let verify = script.find("cut -d").expect("the holder check");
+        let refresh = script.rfind("printf").expect("the refreshed record");
+        assert!(
+            verify < refresh,
+            "the renewal must prove the holder before it extends the lease: \
+             {script}"
+        );
     }
 
     /// P1-8's other half: the re-read that authorizes the stop runs in the same
@@ -6525,6 +7381,18 @@ Append to the same test module:
         let script = fenced_stop_script(&names, &pubkey(), INTENT);
         assert!(script.contains(&sq(&names.env_path())), "{script}");
         assert!(script.contains(INTENT), "the intent is re-compared: {script}");
+        // The version is an ordering here too: `FencedReplace` is exactly what
+        // a prior-version artifact classifies as, so an exact match would make
+        // the fence refuse every upgrade it exists to authorize.
+        assert!(
+            script.contains(&format!("-le {BINDING_VERSION_NUM}")),
+            "{script}"
+        );
+        assert!(
+            !script.contains(&format!("!= {}", sq(BINDING_VERSION))),
+            "an exact binding-version compare re-creates the upgrade lockout: \
+             {script}"
+        );
         assert!(
             script.contains("is-active"),
             "the running state is re-checked: {script}"
@@ -6558,7 +7426,7 @@ Replace `crates/buzz-backend-gcp/src/reconcile.rs`'s non-test content in full:
 
 use crate::capacity;
 use crate::config::ProviderConfig;
-use crate::naming::{Names, BINDING_VERSION, MANAGED_BY};
+use crate::naming::{Names, Ownership, BINDING_VERSION, BINDING_VERSION_NUM, MANAGED_BY};
 use crate::observe::{self, property, section, Observation};
 use crate::remote::{
     sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES,
@@ -6586,12 +7454,18 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a deploy lease on the instance stays valid.
 ///
-/// It covers the mutating window only — the installs, the trail append and
-/// `enable --now`, roughly seven to eleven `gcloud` round trips at 3-5 s each —
-/// not the startup poll that follows. Generous enough that a slow link cannot
-/// lose the lease mid-write; short enough that a provider killed between
-/// acquire and release blocks the next deploy for minutes rather than forever.
-const DEPLOY_LEASE_SECONDS: u64 = 300;
+/// It covers the mutating window only — the authoritative observation, the
+/// installs, the trail append and `enable --now` — not the startup poll that
+/// follows. 900 s is chosen to sit **above every enforced lifetime**: the
+/// desktop kills the provider at 600 s (`backend.rs:528`), so a
+/// desktop-driven deploy can never age out its own lease, which is what 300 s
+/// allowed. A direct CLI run has no enforced lifetime at all, and no TTL can
+/// cover that — [`DeployLease::renew`] does, by refreshing the record at each
+/// phase boundary so the longest un-renewed gap is one phase rather than the
+/// whole window. The TTL still bounds the other direction: a provider killed
+/// between acquire and release blocks the next deploy for minutes, not
+/// forever.
+const DEPLOY_LEASE_SECONDS: u64 = 900;
 
 /// How long to wait for the lease's `flock` itself. The critical section under
 /// it is three file operations, so anything longer means a wedged holder.
@@ -6627,16 +7501,34 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
     // Shared artifacts first: they are installed once and depended on by every
     // instance, so one unowned file poisons every deploy on the box. A marked
     // shared file whose bytes differ is an older rendering of ours, not a
-    // finding — nothing in the file claims what its own content should be.
+    // finding — nothing in the file claims what its own content should be, and
+    // that is true whether it was rendered by this build or by an older one.
     for shared in &obs.markers.shared {
-        if shared.present && !shared.marked {
-            return Action::Refuse(format!(
-                "{} exists but carries no {MANAGED_BY} provider marker. It is \
-                 somebody else's file that happens to share our name; refusing \
-                 to overwrite it. Move it aside to let this provider install \
-                 its own.",
-                shared.path
-            ));
+        if !shared.present {
+            continue;
+        }
+        match shared.ownership {
+            // Ours, at this version or an earlier one. `shared_writes` decides
+            // whether the bytes need rewriting; ownership has no further say.
+            Ownership::Ours | Ownership::OursButOlder(_) => {}
+            Ownership::OursButNewer(found) => {
+                return Action::Refuse(format!(
+                    "{} was written by a newer {MANAGED_BY} (binding version \
+                     {found}; this build writes {BINDING_VERSION}). Refusing to \
+                     downgrade a template every instance on this box runs \
+                     against. Upgrade this provider.",
+                    shared.path
+                ))
+            }
+            Ownership::NotOurs => {
+                return Action::Refuse(format!(
+                    "{} exists but carries no {MANAGED_BY} provider marker. It \
+                     is somebody else's file that happens to share our name; \
+                     refusing to overwrite it. Move it aside to let this \
+                     provider install its own.",
+                    shared.path
+                ))
+            }
         }
     }
 
@@ -6646,16 +7538,50 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
     // of them is marked" — the opposite of the auto-repair fence
     // (`docs/remote-agents.md:1460-1476`). A file that fails is reported and
     // left exactly where it is.
+    //
+    // Ownership is version-aware, and the asymmetry is the whole point of
+    // round 3's P1-1. An *older* binding version is this provider's own work
+    // at a layout this build supersedes — an authorised upgrade target, not a
+    // stranger — because `BINDING_VERSION` is documented as
+    // "bump when the unit/env shape changes", so treating it as foreign locked
+    // the operator out of `deploy` *and* `remove` for every agent already
+    // installed. A *newer* one is the refusal that reserves: a build that
+    // cannot reason about a layout must not overwrite or delete it.
     for file in obs.markers.agent_files() {
         if !file.present {
             continue;
         }
+        match file.ownership {
+            Ownership::Ours | Ownership::OursButOlder(_) => {}
+            Ownership::OursButNewer(found) => {
+                return Action::Refuse(format!(
+                    "{} was written by a newer {MANAGED_BY} (binding version \
+                     {found}; this build writes {BINDING_VERSION}). Refusing to \
+                     overwrite or delete an artifact whose layout this build \
+                     does not understand; it is untouched. Upgrade this \
+                     provider, or move the file aside.",
+                    file.path
+                ))
+            }
+            Ownership::NotOurs => {
+                return Action::Refuse(format!(
+                    "{} exists but carries no {MANAGED_BY} marker. Refusing to \
+                     overwrite or delete a file this provider did not write; \
+                     it is untouched. Move it aside to let this deploy \
+                     proceed.",
+                    file.path
+                ))
+            }
+        }
+        // Ours by provenance, but the identity half has to be there too: a
+        // header carrying our marker and no `agent-pubkey-full` names no
+        // agent, and "which agent is this?" is the question every destructive
+        // step downstream asks.
         let Some(marker) = file.marker.as_ref() else {
             return Action::Refuse(format!(
-                "{} exists but carries no {MANAGED_BY} marker at binding \
-                 version {BINDING_VERSION}. Refusing to overwrite or delete a \
-                 file this provider did not write; it is untouched. Move it \
-                 aside to let this deploy proceed.",
+                "{} carries the {MANAGED_BY} marker but no agent-pubkey-full \
+                 line, so which agent it belongs to cannot be established. \
+                 Refusing to overwrite or delete it; it is untouched.",
                 file.path
             ));
         };
@@ -6678,9 +7604,9 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
         if obs.systemd.instance_known() {
             return Action::Refuse(format!(
                 "a unit for this agent exists on the instance (LoadState={}, \
-                 SubState={}), but no {MANAGED_BY} marker at binding version \
-                 {BINDING_VERSION} records it. Refusing to adopt, restart, or \
-                 replace a unit this provider did not create.",
+                 SubState={}), but no {MANAGED_BY} marker records it. Refusing \
+                 to adopt, restart, or replace a unit this provider did not \
+                 create.",
                 obs.systemd.load_state, obs.systemd.sub_state
             ));
         }
@@ -6692,6 +7618,20 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
     // convergence. The operator stops it, then redeploys.
     if obs.systemd.running() {
         return Action::NoOp;
+    }
+
+    // An artifact still at an older binding version makes this a replace even
+    // when the recorded intent matches: the intent says the *inputs* did not
+    // change, not that the artifact layout is current, and rewriting the four
+    // files is what rolls their markers forward. Checked after `running()`,
+    // because an upgrade is convergence and I4 puts at-most-one-live-instance
+    // above convergence.
+    if obs
+        .markers
+        .agent_files()
+        .any(|file| file.present && matches!(file.ownership, Ownership::OursButOlder(_)))
+    {
+        return Action::FencedReplace;
     }
 
     if marker.create_intent == intent {
@@ -6802,16 +7742,64 @@ pub fn parse_startup(stdout: &str) -> Startup {
     Startup::Pending
 }
 
-/// Where a deploy lease lives.
+/// The private directory both lease files live in.
 ///
-/// `/run/lock` is a tmpfs systemd creates on every boot, so a lease can never
-/// outlive the reboot that made its holder irrelevant. `instance` is the
-/// 12-lowercase-hex name derived from the pubkey (`naming.rs`), which is what
-/// makes it safe to interpolate into a path.
+/// Not `/run/lock` directly. `/run` is the right filesystem — a tmpfs systemd
+/// recreates on every boot, so a lease can never outlive the reboot that made
+/// its holder irrelevant — but `/run/lock` is world-readable and, on several
+/// distributions, group-writable, so a predictable `<agent>.owner` path there
+/// is a record an unprivileged local user can watch and, in the worst case,
+/// pre-create with contents of their choosing. `0700 root:root` puts the
+/// record where exactly the identity that enforces it can read or write it.
+const LEASE_DIR: &str = "/run/buzz-backend-gcp";
+
+/// Where a deploy lease lives. `instance` is the 12-lowercase-hex name derived
+/// from the pubkey (`naming.rs`), which is what makes it safe to interpolate
+/// into a path.
 fn lease_paths(instance: &str) -> (String, String) {
     (
-        format!("/run/lock/buzz-backend-gcp-{instance}.lock"),
-        format!("/run/lock/buzz-backend-gcp-{instance}.owner"),
+        format!("{LEASE_DIR}/{instance}.lock"),
+        format!("{LEASE_DIR}/{instance}.owner"),
+    )
+}
+
+/// The shell that reads a lease record and decides whether it is *held by
+/// somebody else, right now*.
+///
+/// Only [`acquire_lease_script`] needs it — [`renew_lease_script`] asks a
+/// narrower question, "is this record still ours", which needs no freshness
+/// arithmetic at all. It is a function rather than an inline block so the
+/// three controls below sit next to the reasoning for them.
+///
+/// Three controls, each closing a way a record could lie:
+///
+/// * **`install -d -m 0700 -o root -g root`** creates the directory private and
+///   *repairs* it if something loosened it, on every acquire.
+/// * **A record that is not a root-owned regular file is not a record.** `-f`
+///   follows symlinks, so `-L` is tested separately; a symlink is removed
+///   (which removes the link, not its target) and treated as absent. `stat -c`
+///   is GNU coreutils, which every Debian and Ubuntu GCE image ships — and
+///   unlike the deleted `sed` range it is a plain field read with no
+///   address-range semantics to get wrong.
+/// * **A future-dated timestamp is corrupt, not fresh.** A clock step or a
+///   hand-edited record must not grant an unbounded lease, so the age has to
+///   be non-negative *and* under the TTL to count as held.
+///
+/// The stored epoch is filtered to digits before the arithmetic: a corrupted
+/// record must not make `$(( ))` fail in a direction that hands out the lease.
+fn lease_preamble(owner: &str, ttl_check: &str) -> String {
+    format!(
+        "if [ -e {owner} ]; then\n\
+           if [ ! -f {owner} ] || [ -L {owner} ] || \
+              [ \"$(stat -c %u {owner} 2>/dev/null || echo -1)\" != 0 ]; then\n\
+             rm -f {owner}\n\
+           else\n\
+             held=$(cut -d' ' -f1 {owner})\n\
+             at=$(cut -d' ' -f2 {owner} | tr -cd '0-9')\n\
+             age=$(( now - ${{at:-0}} ))\n\
+             {ttl_check}\
+           fi\n\
+         fi\n"
     )
 }
 
@@ -6825,29 +7813,64 @@ fn lease_paths(instance: &str) -> (String, String) {
 /// abandoned one expires instead of wedging the instance.
 ///
 /// The whole critical section runs under one `sudo -n sh -c` because
-/// `/run/lock` is root-owned and `exec 9>` cannot be elevated on its own. The
-/// stored epoch is filtered to digits before the arithmetic: a corrupted record
-/// must not make `$(( ))` fail in a direction that hands out the lease.
+/// [`LEASE_DIR`] is root-owned and `exec 9>` cannot be elevated on its own.
 fn acquire_lease_script(instance: &str, token: &str) -> String {
+    let (lock, owner) = lease_paths(instance);
+    let inner = format!(
+        "set -u\n\
+         install -d -m 0700 -o root -g root {dir}\n\
+         exec 9>{lock}\n\
+         flock -w {wait} 9 || exit {busy}\n\
+         now=$(date +%s)\n\
+         {preamble}\
+         printf '%s %s\\n' {token} \"$now\" > {owner}\n",
+        dir = sq(LEASE_DIR),
+        lock = sq(&lock),
+        owner = sq(&owner),
+        token = sq(token),
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+        busy = LOCK_UNAVAILABLE,
+        preamble = lease_preamble(
+            &sq(&owner),
+            &format!(
+                "if [ \"$held\" != {token} ] && [ \"$age\" -ge 0 ] && \
+                 [ \"$age\" -lt {ttl} ]; then\n\
+                   exit {busy}\n\
+                 fi\n",
+                token = sq(token),
+                ttl = DEPLOY_LEASE_SECONDS,
+                busy = LOCK_UNAVAILABLE,
+            ),
+        ),
+    );
+    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+}
+
+/// Refresh the lease's timestamp — but only after proving we still hold it.
+///
+/// This is the half of P2-1 that a longer TTL cannot cover. `DEPLOY_LEASE_SECONDS`
+/// is above every *enforced* lifetime, but a direct CLI run has none, so the
+/// window can in principle outlive any fixed number. Renewing at each phase
+/// boundary makes the longest un-renewed gap one phase.
+///
+/// It **verifies before it refreshes**: a record that no longer names this
+/// token means the lease was stolen or expired and somebody else is mutating
+/// this agent, and the only safe answer is [`LOCK_UNAVAILABLE`] — extending a
+/// lease we do not hold would be worse than having none.
+fn renew_lease_script(instance: &str, token: &str) -> String {
     let (lock, owner) = lease_paths(instance);
     let inner = format!(
         "set -u\n\
          exec 9>{lock}\n\
          flock -w {wait} 9 || exit {busy}\n\
          now=$(date +%s)\n\
-         if [ -s {owner} ]; then\n\
-           held=$(cut -d' ' -f1 {owner})\n\
-           at=$(cut -d' ' -f2 {owner} | tr -cd '0-9')\n\
-           if [ \"$held\" != {token} ] && [ $(( now - ${{at:-0}} )) -lt {ttl} ]; then\n\
-             exit {busy}\n\
-           fi\n\
-         fi\n\
+         [ -f {owner} ] || exit {busy}\n\
+         [ \"$(cut -d' ' -f1 {owner})\" = {token} ] || exit {busy}\n\
          printf '%s %s\\n' {token} \"$now\" > {owner}\n",
         lock = sq(&lock),
         owner = sq(&owner),
         token = sq(token),
         wait = LEASE_FLOCK_WAIT_SECONDS,
-        ttl = DEPLOY_LEASE_SECONDS,
         busy = LOCK_UNAVAILABLE,
     );
     format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
@@ -6875,10 +7898,60 @@ fn release_lease_script(instance: &str, token: &str) -> String {
 /// The lease, released when it leaves scope.
 ///
 /// The guard exists so that every `?` in the mutating window releases on the
-/// way out — including the ones added after it was written.
-struct DeployLease<'a> {
+/// way out — including the ones added after it was written. `pub(crate)`
+/// because `operator::remove` takes the same lease around its own destructive
+/// window.
+pub(crate) struct DeployLease<'a> {
     remote: &'a Remote,
     instance: String,
+}
+
+impl DeployLease<'_> {
+    /// Prove we still hold the lease and push its expiry out.
+    ///
+    /// Called at each phase boundary of the mutating window. Cheap — one round
+    /// trip against three file operations — and the only way a deploy learns
+    /// it lost a lease it thought it had.
+    pub(crate) fn renew(&self) -> Result<(), String> {
+        let out = self
+            .remote
+            .run(&renew_lease_script(&self.instance, self.remote.token()))?;
+        if out.code == LOCK_UNAVAILABLE {
+            return Err(format!(
+                "the deploy lease for buzz-acp@{}.service was lost while this \
+                 operation was running — another provider holds it now. \
+                 Stopping here rather than continuing to write under a lease \
+                 we do not hold; re-run once the other operation finishes.",
+                self.instance
+            ));
+        }
+        if !out.ok() {
+            return Err(format!(
+                "could not renew the deploy lease for buzz-acp@{}.service \
+                 (exit {}): {}",
+                self.instance,
+                out.code,
+                out.stderr.trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The **authoritative** observation: the one this deploy acts on.
+    ///
+    /// It hangs off the guard rather than being a free call, and that is the
+    /// whole fix for P1-4. `deploy` used to `observe::look` and `classify`
+    /// *before* taking the lease and then act on that pre-lease verdict, so a
+    /// deploy could see "absent/stopped", lose the race, and mutate on state
+    /// that had already moved. Written this way the ordering is a property of
+    /// the type: there is no way to reach this observation without a
+    /// `DeployLease`, and no way to hold one without having written the owner
+    /// record first. The `renew` is not decoration either — it is what turns
+    /// "we took a lease a moment ago" into "we hold it now".
+    fn observe(&self, names: &Names, harness: &str) -> Result<Observation, String> {
+        self.renew()?;
+        observe::look(self.remote, names, harness)
+    }
 }
 
 impl Drop for DeployLease<'_> {
@@ -6897,12 +7970,17 @@ impl Drop for DeployLease<'_> {
 ///
 /// Losing is not an error to work around — it is the correct outcome: the loser
 /// mutates nothing and says so, which is what makes "deploys are unserialised"
-/// acceptable in the first place.
-fn acquire_lease<'a>(remote: &'a Remote, names: &Names) -> Result<DeployLease<'a>, String> {
+/// acceptable in the first place. `pub(crate)` so `operator::remove` can take
+/// the same lease: it destroys a secret and four files, and taking none made
+/// it freely interleavable with a deploy.
+pub(crate) fn acquire_lease<'a>(
+    remote: &'a Remote,
+    names: &Names,
+) -> Result<DeployLease<'a>, String> {
     let out = remote.run(&acquire_lease_script(names.instance(), remote.token()))?;
     if out.code == LOCK_UNAVAILABLE {
         return Err(format!(
-            "another deploy of {} is already in progress on this instance. \
+            "another operation on {} is already in progress on this instance. \
              Nothing was modified; wait for it to finish and start again. A \
              lease left behind by a provider that died is reclaimed after \
              {DEPLOY_LEASE_SECONDS}s.",
@@ -6933,6 +8011,14 @@ fn acquire_lease<'a>(remote: &'a Remote, names: &Names) -> Result<DeployLease<'a
 /// Everything written afterwards carries its own marker guard inside its own
 /// install script, so nothing downstream leans on this check.
 ///
+/// `intent` is the intent the **observation** carried, not the one this deploy
+/// is about to write: a divergent intent is precisely what makes a replacement
+/// a replacement, so comparing against the new one would refuse every
+/// legitimate `FencedReplace`. The binding version is compared as an ordering
+/// for the same reason a step further on — an upgrade classifies as
+/// `FencedReplace`, and an exact compare here would refuse the upgrade the
+/// classification just authorized.
+///
 /// [`MARKER_CHANGED`] means the marker moved, [`AGENT_STARTED`] means the agent
 /// started. Both are clean refusals that changed nothing, and each earns its
 /// own message.
@@ -6942,11 +8028,13 @@ fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String 
          h=$(sudo -n sed -n '1,{scan}p' {env} 2>/dev/null || true)\n\
          field() {{ printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }}\n\
          if [ \"$(field managed-by)\" != {managed_by} ] \
-            || [ \"$(field binding-version)\" != {version} ] \
             || [ \"$(field agent-pubkey-full)\" != {pubkey} ] \
             || [ \"$(field create-intent)\" != {intent} ]; then\n\
            exit {changed}\n\
          fi\n\
+         v=$(field binding-version)\n\
+         case \"$v\" in ''|*[!0-9]*) exit {changed} ;; esac\n\
+         [ \"$v\" -le {version} ] || exit {changed}\n\
          if [ \"$(systemctl is-active {unit} 2>/dev/null || true)\" = active ]; then\n\
            exit {started}\n\
          fi\n\
@@ -6955,7 +8043,7 @@ fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String 
         scan = MARKER_SCAN_LINES,
         env = sq(&names.env_path()),
         managed_by = sq(MANAGED_BY),
-        version = sq(BINDING_VERSION),
+        version = BINDING_VERSION_NUM,
         pubkey = sq(pubkey_full),
         intent = sq(intent),
         unit = sq(&names.unit()),
@@ -7048,6 +8136,24 @@ fn confirm_started(
     }
 }
 
+/// Refuse a deploy whose harness binary is not on the instance.
+///
+/// `launch.command` was resolved against the desktop's PATH, which means
+/// nothing here. Refusing beats deploying a unit that fails at exec. Factored
+/// out because both observations ask it — the cheap pre-lease look, so the
+/// refusal costs no lease, and the authoritative one, because the binary can
+/// be removed between them.
+fn require_harness(obs: &Observation, harness: &str, instance: &str) -> Result<(), String> {
+    if obs.harness_installed {
+        return Ok(());
+    }
+    Err(format!(
+        "deploy refused: {harness} is not installed in /usr/local/bin on \
+         {instance}. launch.command is resolved against the desktop's PATH, \
+         which does not exist on the instance; install the harness there first."
+    ))
+}
+
 /// Run one deploy to a terminal outcome.
 pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, String> {
     // ---- Pure phase: no gcloud, no VM. -----------------------------------
@@ -7063,53 +8169,73 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     // is this same string.
     let harness = render::harness_basename(agent);
 
-    // ---- Transport phase. -------------------------------------------------
+    // ---- Transport phase: the lease-free look. ----------------------------
+    // Refusing an unowned file, or no-opping a live agent, should cost nobody
+    // a lease — so a first, cheap observation answers those. Nothing this
+    // deploy *acts* on comes from it: it is a fast exit, not a decision.
     let remote = Remote::new(&cfg.project, &cfg.zone, &cfg.instance)?;
-    let obs = observe::look(&remote, &names, &harness)?;
-
-    // `launch.command` was resolved against the desktop's PATH, which means
-    // nothing here. Refusing now beats deploying a unit that fails at exec.
-    if !obs.harness_installed {
-        return Err(format!(
-            "deploy refused: {harness} is not installed in /usr/local/bin on \
-             {}. launch.command is resolved against the desktop's PATH, which \
-             does not exist on the instance; install the harness there first.",
-            cfg.instance
-        ));
-    }
-
-    // Matched by reference so `action` survives for the two comparisons below.
-    // Taking it by value here would move it.
-    let action = classify(&obs, identity.pubkey_hex(), &plan.create_intent);
-    match &action {
-        Action::Refuse(why) => return Err(why.clone()),
+    let preview = observe::look(&remote, &names, &harness)?;
+    require_harness(&preview, &harness, &cfg.instance)?;
+    match classify(&preview, identity.pubkey_hex(), &plan.create_intent) {
+        Action::Refuse(why) => return Err(why),
         Action::NoOp => return Ok(names.unit()),
         Action::Create | Action::RestartSame | Action::FencedReplace => {}
     }
 
-    // Overcommit is reported, never vetoed — but stderr is dropped by the
-    // desktop on the success path, so the durable copy below is the one an
-    // operator can actually find (§Capacity).
-    let warnings = capacity::warning_lines(
-        obs.available_bytes,
-        obs.reserved_bytes,
-        &names.unit(),
-        cfg.memory_max_bytes,
-    );
-    for warning in &warnings {
-        eprintln!("{warning}");
-    }
-
     // ---- Mutating window, serialized per agent. ---------------------------
-    // The lease is taken here rather than before `observe`, so a read-only
-    // refusal never blocks a concurrent deploy; and it is released at the end
-    // of this block rather than after `confirm_started`, because the poll
-    // mutates nothing and may run for four minutes.
+    // The lease comes **before** the observation this deploy acts on. The
+    // previous ordering observed and classified first and then took the lease
+    // and acted on that pre-lease verdict, so a deploy could see
+    // "absent/stopped", lose the race, and mutate on state that had already
+    // moved. `lease.observe` is the only way to reach the authoritative
+    // observation, so the ordering is enforced by the type rather than by the
+    // order two statements happen to be written in. The lease is released at
+    // the end of this block rather than after `confirm_started`, because the
+    // poll mutates nothing and may run for four minutes.
     let started_at = {
-        let _lease = acquire_lease(&remote, &names)?;
+        let lease = acquire_lease(&remote, &names)?;
+        let obs = lease.observe(&names, &harness)?;
+        require_harness(&obs, &harness, &cfg.instance)?;
+
+        // Matched by reference so `action` survives for the two comparisons
+        // below. Taking it by value here would move it.
+        let action = classify(&obs, identity.pubkey_hex(), &plan.create_intent);
+        match &action {
+            Action::Refuse(why) => return Err(why.clone()),
+            Action::NoOp => return Ok(names.unit()),
+            Action::Create | Action::RestartSame | Action::FencedReplace => {}
+        }
+
+        // Overcommit is reported, never vetoed — but stderr is dropped by the
+        // desktop on the success path, so the durable copy below is the one an
+        // operator can actually find (§Capacity). Computed from the
+        // authoritative observation, which is also the freshest one.
+        let warnings = capacity::warning_lines(
+            obs.available_bytes,
+            obs.reserved_bytes,
+            &names.unit(),
+            cfg.memory_max_bytes,
+        );
+        for warning in &warnings {
+            eprintln!("{warning}");
+        }
 
         if action == Action::FencedReplace {
-            fenced_stop(&remote, &names, identity.pubkey_hex(), &plan.create_intent)?;
+            // The fence re-reads the marker that *authorized* this
+            // replacement — the one the observation above carries — not the
+            // one this deploy is about to write. A divergent intent is what
+            // makes a replacement a replacement, so comparing against
+            // `plan.create_intent` would refuse every legitimate one. An
+            // unreadable marker here yields `""`, which the fence treats as a
+            // mismatch and refuses cleanly; `FencedReplace` cannot be reached
+            // without one, so the fallback is unreachable rather than lossy.
+            let authorizing_intent = obs
+                .markers
+                .env
+                .marker
+                .as_ref()
+                .map_or("", |marker| marker.create_intent.as_str());
+            fenced_stop(&remote, &names, identity.pubkey_hex(), authorizing_intent)?;
         }
 
         // Shared artifacts are repaired on every acting path, `RestartSame`
@@ -7118,11 +8244,13 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         // unit, so a shared template deleted out of band is a start failure
         // that re-entry would otherwise never converge on. Written before the
         // per-agent files because the agent unit depends on them.
+        lease.renew()?;
         for file in shared_writes(&plan, &obs) {
             remote.install(file)?;
         }
 
         if action != Action::RestartSame {
+            lease.renew()?;
             let service_account = secrets::instance_service_account(
                 &remote,
                 &cfg.project,
@@ -7148,6 +8276,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
 
         // The durable record, written before the start attempt so a deploy that
         // then fails to start still leaves its capacity warning behind.
+        lease.renew()?;
         remote.append(
             &plan.trail,
             &capacity::trail_record(
@@ -7161,6 +8290,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         // The instance's own clock, printed after the reload and before the
         // start, is what bounds the startup query. It cannot be read on this
         // machine: the two clocks are unrelated.
+        lease.renew()?;
         let out = remote.run(&format!(
             "set -euo pipefail\n\
              sudo -n systemctl daemon-reload\n\
@@ -7199,7 +8329,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 23 new `reconcile` tests plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
+Expected: PASS — 30 new `reconcile` tests plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
 
 - [ ] **Step 6: Commit**
 
@@ -7211,23 +8341,27 @@ git add -A && git commit -s -m "feat(backend-gcp): I4 reconciler with a full-tup
 
 ## Task 13: Operator subcommands — `list`, `remove`, `dry-run`
 
-Resolves review **P2-4**, **P2-6**, P3's "`dry-run` is exercised by no acceptance criterion", and round 2's **P1-4** (`remove`'s fence must read each file it deletes) and **P2-2** (an agent whose env file is gone must still be visible and still be removable).
+Resolves review **P2-4**, **P2-6**, P3's "`dry-run` is exercised by no acceptance criterion", round 2's **P1-4** (`remove`'s fence must read each file it deletes) and **P2-2** (an agent whose env file is gone must still be visible and still be removable), and round 3's **P1-2** (`remove` stops a unit it has not proven it owns), the `remove` halves of **P1-1** (a prior-version agent must stay removable), **P1-3** (the delete veto counted lines, not patterns) and **P1-4** (`remove` took no lease at all).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/operator.rs`
 - Modify: `crates/buzz-backend-gcp/src/main.rs` (add `mod operator;` and the argv branch)
 
 **Interfaces:**
-- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`, and the private `instance_of`, `resolve_target`, `listing_script`, `verify_removable`, `removal_script`
-- Consumes: `crate::capacity`, `crate::config::{self, ProviderConfig}`, `crate::naming::{self, AgentMarker, Names, MANAGED_BY}`, `crate::observe::SHARED_PATHS` (tests only), `crate::remote::{sq, Remote, MARKER_SCAN_LINES}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`.
+- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`, and the private `instance_of`, `resolve_target`, `listing_script`, `ownership_scan_script`, `verify_removable`, `removal_script`
+- Consumes: `crate::capacity`, `crate::config::{self, ProviderConfig}`, `crate::naming::{self, Names, MANAGED_BY}`, `crate::observe::{self, AgentFileState}`, `crate::reconcile::acquire_lease`, `crate::remote::{marker_fn, sq, Remote, MARKER_SCAN_LINES}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`. The test module additionally imports `crate::naming::{agent_ownership, AgentMarker, Ownership}` and reaches `crate::observe::{agent_paths, SHARED_PATHS}` by path — the parent names none of them, and an import only the tests use is an unused import under `-D warnings`.
 
 The desktop passes no argv, so argv presence unambiguously selects operator mode. With empty argv the binary behaves exactly as the protocol requires.
 
 **`remove` requires `--pubkey`, and that is the point.** `managed-by` proves only that this provider wrote a file; it says nothing about *which* agent. Since the 12-hex name is collision-resistant rather than collision-free, a `managed-by`-only fence would let `remove buzz-acp@a1b2c3d4e5f6` destroy a different agent that truncated to the same 12 hex. The full pubkey has to come from somewhere, and the operator is the only party who can supply it — which is exactly why `list` prints it.
 
-**`remove` deletes enumerated paths, never a directory — and fences each path on its own header.** `rm -rf /etc/systemd/system/buzz-acp@<short12>.service.d/` is not a fence, it is a fence-shaped hole: a drop-in directory is precisely where an operator puts `override.conf` or `team.conf`, and the live host already has such an out-of-band drop-in. Nor is "verify the env file, then delete four paths" a fence: that authorizes destroying a hand-written drop-in from a *sibling's* header, which is exactly what [L2]'s auto-repair rule forbids (`docs/remote-agents.md:1460-1476`). Each of the four paths carries its own veto, evaluated in the same remote shell as its own `rm`; a file that fails it is reported and left exactly where it is. `remove` then `rmdir`s each drop-in directory **only if empty**. Shared artifacts are never touched: they carry the provider-level marker and other agents depend on them.
+**`remove` deletes enumerated paths, never a directory — and fences each path on its own header.** `rm -rf /etc/systemd/system/buzz-acp@<short12>.service.d/` is not a fence, it is a fence-shaped hole: a drop-in directory is precisely where an operator puts `override.conf` or `team.conf`, and the live host already has such an out-of-band drop-in. Nor is "verify the env file, then delete four paths" a fence: that authorizes destroying a hand-written drop-in from a *sibling's* header, which is exactly what [L2]'s auto-repair rule forbids (`docs/remote-agents.md:1460-1476`). Each of the four paths carries its own veto, evaluated in the same remote shell as its own `rm`; a file that fails it is reported and left exactly where it is. `remove` then `rmdir`s each drop-in directory only if it is empty, so an operator's own file both survives and keeps its directory. The veto is `remote::marker_fn`'s `marker_ok`, the same shell function the install guard uses — round 3 found that both had spelled it `grep -c -F -x -e … | [ "$n" -eq 3 ]`, which counts matching input *lines* rather than distinct matched patterns, so a header repeating `# managed-by:` satisfied the count while carrying no `# agent-pubkey-full:` at all.
 
 **A missing env file is not "nothing to remove".** Both `list` and `remove` used to key off `/etc/buzz/acp-*.env`. Delete that one file — by hand, by a half-finished cleanup, by an interrupted `remove` — and a running, secret-bearing agent becomes invisible to `list` while `remove` answers "there is nothing here to remove". That is the operator's only reclamation path lying to them in a reachable state. `list` now unions three enumerations (the env glob, `systemctl list-units`/`list-unit-files`, and the drop-in directories) and recovers the pubkey from whichever per-agent artifact still carries a marker; `remove` proceeds without the env file, because authorization comes from `--pubkey` plus each file's own header, neither of which lives there exclusively.
+
+**Nothing is stopped before ownership is proven.** Deleting a file was fenced; *stopping a unit* was not. With the env file absent, `remove` used to run `systemctl disable --now buzz-acp@<id>.service` before reading a single marker, on the strength of `--pubkey` sharing its first twelve hex with the unit id — which is exactly the collision the full pubkey exists to close, and [L2] item 4 requires full-identity evidence before *any* action, not only before a delete. `remove` therefore opens with a read-only scan of all four per-agent artifacts in one shell and requires at least one present marker carrying this pubkey. Only then does it destroy the secret and run the removal script. A refusal names the four paths it looked at and the manual commands that reclaim the agent, because "refusing without a way forward" is how an operator ends up doing it with `rm -rf`.
+
+**`remove` holds the same lease `deploy` takes.** It destroys a Secret Manager secret and four files while a concurrent deploy may be installing them; taking no lease made the two freely interleavable. The lease is acquired *before* the ownership scan, so the state that authorizes the removal cannot move between the read and the act, and it is held across `secrets::destroy` and the removal script.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7237,6 +8371,7 @@ The desktop passes no argv, so argv presence unambiguously selects operator mode
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naming::{agent_ownership, AgentMarker, Ownership};
 
     #[test]
     fn an_agent_id_yields_its_instance() {
@@ -7368,6 +8503,13 @@ mod tests {
         assert!(script.contains("systemctl list-units"), "{script}");
         assert!(script.contains("systemctl list-unit-files"), "{script}");
         assert!(script.contains("buzz-acp@*.service.d"), "{script}");
+        // P1-1: a prior-version agent must remain listable. An exact
+        // `# binding-version: N` match made a version bump hide every agent
+        // already on the box behind `<pubkey unknown>`.
+        assert!(
+            script.contains(&format!("-le {}", naming::BINDING_VERSION_NUM)),
+            "{script}"
+        );
     }
 
     /// Enumerated paths only. A drop-in directory is where an operator keeps
@@ -7403,7 +8545,6 @@ mod tests {
         let script = removal_script(&names, &pubkey);
         for required in [
             naming::header_line("managed-by", MANAGED_BY),
-            naming::header_line("binding-version", naming::BINDING_VERSION),
             naming::header_line("agent-pubkey-full", &pubkey),
         ] {
             assert!(script.contains(&sq(&required)), "the fence omits {required:?}");
@@ -7422,27 +8563,177 @@ mod tests {
         assert!(!script.contains("create-intent"), "{script}");
     }
 
-    /// The marker check runs against the file's own header, and must require
-    /// the whole per-agent tuple rather than `managed-by` alone.
+    /// P1-3, the delete half. `grep -c -F -x -e a -e b -e c` compared against
+    /// `3` counts matching input *lines*, not distinct matched patterns, so a
+    /// header whose first lines repeat `# managed-by:` reaches the count while
+    /// carrying no `# agent-pubkey-full:` at all — and the veto then
+    /// authorizes deleting a file that does not carry this agent's identity.
+    /// Each needle gets its own test, and the first miss returns.
     #[test]
-    fn the_fence_requires_the_whole_marker_tuple() {
+    fn a_repeated_marker_line_does_not_authorize_a_delete() {
         let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
         let names = Names::from_pubkey_hex(&pubkey).unwrap();
-        let good = crate::naming::AgentMarker {
-            pubkey_full: pubkey.clone(),
-            create_intent: "ci".to_string(),
-        }
-        .render();
-        assert!(verify_removable(&good, &pubkey, &names.env_path()).is_ok());
+        let script = removal_script(&names, &pubkey);
+        assert!(
+            !script.contains("grep -c"),
+            "counting lines instead of patterns is the defect: {script}"
+        );
+        assert_eq!(
+            script.matches("grep -Fqx").count(),
+            2,
+            "one independent check per needle: {script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "grep -Fqx -- {}",
+                sq(&naming::header_line("agent-pubkey-full", &pubkey))
+            )),
+            "the identity line must be asserted on its own: {script}"
+        );
+        // The binding version is an ordering, not a needle: a prior-version
+        // file is this provider's own work, and `remove` must still delete it.
+        assert!(
+            script.contains(&format!("-le {}", naming::BINDING_VERSION_NUM)),
+            "{script}"
+        );
+        assert!(
+            !script.contains(&sq(&naming::header_line(
+                "binding-version",
+                naming::BINDING_VERSION
+            ))),
+            "an exact binding-version needle locks the operator out of a \
+             prior-version agent: {script}"
+        );
+    }
 
-        let foreign = crate::naming::AgentMarker {
-            pubkey_full: "ff".repeat(32),
-            create_intent: "ci".to_string(),
+    /// One row as the pre-stop scan reports it.
+    fn scanned(path: &str, marker: Option<AgentMarker>) -> AgentFileState {
+        AgentFileState {
+            path: path.to_string(),
+            present: marker.is_some(),
+            ownership: if marker.is_some() {
+                Ownership::Ours
+            } else {
+                Ownership::NotOurs
+            },
+            marker,
         }
-        .render();
-        assert!(verify_removable(&foreign, &pubkey, &names.env_path()).is_err());
+    }
 
-        assert!(verify_removable("# hand-written\n", &pubkey, &names.env_path()).is_err());
+    fn our_marker(pubkey: &str) -> Option<AgentMarker> {
+        Some(AgentMarker {
+            pubkey_full: pubkey.to_string(),
+            create_intent: "ci".to_string(),
+        })
+    }
+
+    /// P1-2: `remove` may stop a unit only once it has proven the unit is this
+    /// agent's. The env file is the artifact most likely to be missing, so the
+    /// gate reads all four and any one of them is enough.
+    #[test]
+    fn an_env_absent_agent_with_a_marked_sibling_is_removable() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let files = [
+            scanned(&names.env_path(), None),
+            scanned(&names.dropin_path(), None),
+            scanned(&names.secret_dropin_path(), None),
+            scanned(&names.trail_path(), our_marker(&pubkey)),
+        ];
+        verify_removable(&files, &pubkey, &names)
+            .expect("one marked sibling is full-identity evidence");
+    }
+
+    /// …and with nothing carrying this pubkey, the refusal arrives before
+    /// anything is stopped. `--pubkey` sharing its first 12 hex with the unit
+    /// id is not evidence — that is the collision the full pubkey closes — and
+    /// this gate is a pure function precisely so it can refuse without a
+    /// transport, which is what makes "nothing was stopped" structural rather
+    /// than a promise.
+    #[test]
+    fn an_agent_with_no_matching_marker_is_refused_before_anything_stops() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let sibling = Some(AgentMarker {
+            pubkey_full: format!("a1b2c3d4e5f6{}", "f".repeat(52)),
+            create_intent: "ci".to_string(),
+        });
+        let files = [
+            scanned(&names.env_path(), None),
+            scanned(&names.dropin_path(), sibling),
+            scanned(&names.secret_dropin_path(), None),
+            scanned(&names.trail_path(), None),
+        ];
+        let err = verify_removable(&files, &pubkey, &names)
+            .expect_err("a 12-hex prefix match must not authorize a stop");
+        assert!(err.contains(&names.env_path()), "{err}");
+        assert!(err.contains("Nothing was stopped"), "{err}");
+        assert!(
+            err.contains("systemctl") && err.contains(&names.secret_name()),
+            "a refusal with no way forward is how an operator reaches for \
+             rm -rf: {err}"
+        );
+    }
+
+    /// P1-1: a prior-version agent must still be removable. Treating an older
+    /// `binding-version` as foreign closed the operator's only reclamation
+    /// path for every agent this provider itself deployed before the bump.
+    #[test]
+    fn a_prior_version_agent_is_still_removable() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let older = format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: 0\n\
+             # agent-pubkey-full: {pubkey}\n# create-intent: ci\n"
+        );
+        assert_eq!(agent_ownership(&older), Ownership::OursButOlder(0));
+        let file = AgentFileState {
+            path: names.env_path(),
+            present: true,
+            ownership: agent_ownership(&older),
+            marker: AgentMarker::parse(&older),
+        };
+        verify_removable(&[file], &pubkey, &names)
+            .expect("this provider's own prior-version agent is removable");
+    }
+
+    /// A *newer* binding version is the refusal the version rule reserves:
+    /// deleting an artifact whose layout this build does not understand is
+    /// destroying a newer provider's work, not reclaiming our own.
+    #[test]
+    fn a_future_version_agent_is_not_removable_by_this_build() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let newer = format!(
+            "# managed-by: {MANAGED_BY}\n# binding-version: 99\n\
+             # agent-pubkey-full: {pubkey}\n# create-intent: ci\n"
+        );
+        assert_eq!(agent_ownership(&newer), Ownership::OursButNewer(99));
+        assert!(AgentMarker::parse(&newer).is_none(), "{newer}");
+        let file = AgentFileState {
+            path: names.env_path(),
+            present: true,
+            ownership: agent_ownership(&newer),
+            marker: AgentMarker::parse(&newer),
+        };
+        assert!(verify_removable(&[file], &pubkey, &names).is_err());
+    }
+
+    /// The pre-stop scan reads every per-agent artifact in one shell, and it
+    /// reads them with the *observer's* emitter — a second emitter of the same
+    /// row shape is a second thing to keep in step with the parser. It must
+    /// also touch no `systemctl` verb: it is the thing that decides whether
+    /// stopping is allowed.
+    #[test]
+    fn the_ownership_scan_reads_all_four_artifacts_and_stops_nothing() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let script = ownership_scan_script(&names);
+        for path in crate::observe::agent_paths(&names) {
+            assert!(script.contains(&sq(&path)), "{path} is not scanned");
+        }
+        assert!(!script.contains("systemctl"), "{script}");
+        assert!(!script.contains("rm -f"), "{script}");
     }
 }
 ```
@@ -7465,8 +8756,10 @@ Prepend to `crates/buzz-backend-gcp/src/operator.rs`:
 //! relay — and because a success-path capacity warning has nowhere else to go.
 
 use crate::config::{self, ProviderConfig};
-use crate::naming::{self, AgentMarker, Names, MANAGED_BY};
-use crate::remote::{sq, Remote, MARKER_SCAN_LINES};
+use crate::naming::{self, Names, MANAGED_BY};
+use crate::observe::{self, AgentFileState};
+use crate::reconcile::acquire_lease;
+use crate::remote::{marker_fn, sq, Remote, MARKER_SCAN_LINES};
 use crate::secrets;
 use clap::{Parser, Subcommand};
 
@@ -7579,10 +8872,14 @@ fn resolve_target(agent_id: &str, pubkey: &str) -> Result<(Names, String), Strin
 /// — a running, secret-bearing agent that `list` could not see and `remove`
 /// declared absent.
 ///
-/// The pubkey is read from whichever per-agent artifact still carries a marker.
+/// The pubkey is read from whichever per-agent artifact still carries a marker
+/// **at a binding version this build may act on** — its own, or an older one.
 /// All four carry the same tuple, so losing one costs nothing; losing all four
 /// flags the row and sends the operator to Secret Manager, which holds the same
-/// value as an annotation (Task 10).
+/// value as an annotation (Task 10). Requiring an *exact* `binding-version`
+/// match here was the third face of round 3's P1-1: a version bump would have
+/// hidden every agent already on the box behind `<pubkey unknown>`, and the
+/// pubkey `remove` needs is the one `list` prints.
 ///
 /// The instance-name `case` is not decoration: these ids come from a filesystem
 /// glob and from `systemctl` output, and every one of them is about to be
@@ -7621,7 +8918,9 @@ fn listing_script() -> String {
              sudo -n test -e \"$c\" || continue\n\
              h=$(sudo -n head -n {scan} \"$c\")\n\
              printf '%s\\n' \"$h\" | grep -Fxq {managed_by} || continue\n\
-             printf '%s\\n' \"$h\" | grep -Fxq {binding_version} || continue\n\
+             v=$(printf '%s\\n' \"$h\" | sed -n 's/^# binding-version: //p' | head -n 1)\n\
+             case \"$v\" in ''|*[!0-9]*) continue ;; esac\n\
+             [ \"$v\" -le {version} ] || continue\n\
              pk=$(printf '%s\\n' \"$h\" | sed -n 's/^# agent-pubkey-full: //p' | head -n 1)\n\
              if [ -n \"$pk\" ]; then break; fi\n\
            done\n\
@@ -7638,10 +8937,7 @@ fn listing_script() -> String {
          done\n",
         scan = MARKER_SCAN_LINES,
         managed_by = sq(&naming::header_line("managed-by", MANAGED_BY)),
-        binding_version = sq(&naming::header_line(
-            "binding-version",
-            naming::BINDING_VERSION
-        )),
+        version = naming::BINDING_VERSION_NUM,
     )
 }
 
@@ -7676,8 +8972,9 @@ pub fn render_listing(stdout: &str) -> String {
                          works.\n",
                     ),
                     "unmarked" => out.push_str(&format!(
-                        "    no {MANAGED_BY} marker on any of this agent's files. Recover the \
-                         pubkey with `gcloud secrets list \
+                        "    no {MANAGED_BY} marker this build recognises on any of this \
+                         agent's files — either nothing here is ours, or a newer provider \
+                         deployed it. Recover the pubkey with `gcloud secrets list \
                          --filter=\"labels.managed_by={MANAGED_BY}\" \
                          --format=\"value(name,annotations)\"`.\n"
                     )),
@@ -7711,23 +9008,73 @@ fn list(remote: &Remote) -> Result<(), String> {
     Ok(())
 }
 
-/// The fence every deletion passes: the whole per-agent marker tuple, read
-/// from the file's own header immediately before it is destroyed.
-fn verify_removable(body: &str, pubkey_full: &str, path: &str) -> Result<(), String> {
-    let Some(marker) = AgentMarker::parse(body) else {
-        return Err(format!(
-            "{path} carries no {MANAGED_BY} marker at this binding version. \
-             Refusing to delete a file this provider did not create."
-        ));
-    };
-    if marker.pubkey_full != pubkey_full {
-        return Err(format!(
-            "{path} belongs to pubkey {}, not {pubkey_full}. Refusing: the \
-             12-hex name is collision-resistant, not collision-free.",
-            marker.pubkey_full
-        ));
+/// The pre-stop gate: **before** anything is stopped, disabled or destroyed,
+/// at least one of this agent's four artifacts must carry a marker naming this
+/// pubkey.
+///
+/// Deleting a file was already fenced on that file's own header. Stopping a
+/// unit was not: with the env file absent, `remove` ran
+/// `systemctl disable --now buzz-acp@<id>.service` before reading a single
+/// marker, authorized only by `--pubkey` sharing its first twelve hex with the
+/// unit id — the exact collision the full pubkey exists to close. [L2] item 4
+/// requires full-identity evidence before *any* action.
+///
+/// Any one artifact is enough, and that is the point: the env file is the one
+/// most likely to be missing, and a marked drop-in or trail proves the same
+/// thing it would have. A `marker` is `Some` only for a header this build owns
+/// at its own binding version or an older one (`naming::agent_ownership`), so a
+/// prior-version agent stays removable while a *newer* one — a layout this
+/// build cannot reason about — does not authorize a stop either.
+///
+/// Pure, so it can refuse without a transport. That is what makes "nothing was
+/// stopped" structural rather than a promise in a comment.
+fn verify_removable(
+    files: &[AgentFileState],
+    pubkey_full: &str,
+    names: &Names,
+) -> Result<(), String> {
+    if files.iter().any(|file| {
+        file.present
+            && file
+                .marker
+                .as_ref()
+                .is_some_and(|marker| marker.pubkey_full == pubkey_full)
+    }) {
+        return Ok(());
     }
-    Ok(())
+    let looked_at = observe::agent_paths(names)
+        .iter()
+        .map(|path| format!("  {path}\n"))
+        .collect::<String>();
+    Err(format!(
+        "refusing to touch {unit}: none of its per-agent artifacts carries a \
+         {MANAGED_BY} marker for pubkey {pubkey_full} at a binding version this \
+         build recognises. Nothing was stopped, disabled or destroyed. Looked \
+         at:\n{looked_at}\
+         The 12-hex instance name is collision-resistant, not collision-free, \
+         so a unit whose name matches is not evidence that this agent is \
+         yours. If you are certain it is, reclaim it by hand: `sudo systemctl \
+         disable --now {unit}`, delete those paths, then `gcloud secrets \
+         delete {secret}`.",
+        unit = names.unit(),
+        secret = names.secret_name(),
+    ))
+}
+
+/// The pre-stop ownership scan: every per-agent artifact's marker header, in
+/// one remote shell, and nothing else.
+///
+/// It reads. It runs no `systemctl` verb and deletes nothing, because its whole
+/// job is to decide whether `remove` is allowed to. The rows come from
+/// [`observe::agent_file_rows`] — the same emitter the reconciler's observation
+/// uses, parsed by the same [`observe::parse_agent_file_row`] — so `remove` and
+/// `deploy` cannot come to different conclusions about the same header.
+fn ownership_scan_script(names: &Names) -> String {
+    format!(
+        "set -uo pipefail\n{field}echo '---AGENTFILES---'\n{rows}echo '---END---'\n",
+        field = observe::FIELD_HELPER,
+        rows = observe::agent_file_rows(names),
+    )
 }
 
 /// The remote script that deletes this agent's own files — by name, never a
@@ -7742,29 +9089,34 @@ fn verify_removable(body: &str, pubkey_full: &str, path: &str) -> Result<(), Str
 ///
 /// `create-intent` is deliberately **not** among the required lines: it changes
 /// on every legitimate reconfiguration, so requiring it would refuse a file
-/// this very agent wrote yesterday.
+/// this very agent wrote yesterday. Neither is `binding-version` — `marker_ok`
+/// compares it as an ordering, so a prior-version agent this provider itself
+/// deployed can still be torn down.
+///
+/// The veto is `remote::marker_fn`'s `marker_ok`, shared with the install
+/// guard. Both used to spell it `grep -c -F -x -e … | [ "$n" -eq 3 ]`, and
+/// `grep -c` counts matching input **lines** rather than distinct matched
+/// patterns: a header repeating `# managed-by:` reached the count while
+/// carrying no `# agent-pubkey-full:` at all, so the veto authorized deleting a
+/// file that never named this agent.
 fn removal_script(names: &Names, pubkey_full: &str) -> String {
     let required = [
         naming::header_line("managed-by", MANAGED_BY),
-        naming::header_line("binding-version", naming::BINDING_VERSION),
         naming::header_line("agent-pubkey-full", pubkey_full),
     ];
-    let needles: String = required
-        .iter()
-        .map(|line| format!(" -e {}", sq(line)))
-        .collect();
     format!(
         "set -uo pipefail\n\
+         {marker_ok}\
          sudo -n systemctl disable --now {unit} 2>/dev/null || true\n\
          sudo -n systemctl stop {secret_unit} 2>/dev/null || true\n\
          for p in {env} {trail} {dropin} {secret_dropin}; do\n\
-           sudo -n test -e \"$p\" || continue\n\
-           n=$(sudo -n head -n {scan} \"$p\" | grep -c -F -x{needles} || true)\n\
-           if [ \"$n\" -eq {count} ]; then\n\
+           sudo -n test -f \"$p\" || continue\n\
+           h=$(sudo -n head -n {scan} \"$p\" || true)\n\
+           if marker_ok; then\n\
              sudo -n rm -f \"$p\"\n\
            else\n\
              echo \"kept $p: it carries no {managed_by} marker for this agent at \
-binding version {version}\"\n\
+a binding version this build may act on\"\n\
            fi\n\
          done\n\
          for d in {dropin_dir} {secret_dropin_dir}; do\n\
@@ -7775,6 +9127,7 @@ binding version {version}\"\n\
            fi\n\
          done\n\
          sudo -n systemctl daemon-reload\n",
+        marker_ok = marker_fn(&required),
         unit = sq(&names.unit()),
         secret_unit = sq(&names.secret_unit()),
         env = sq(&names.env_path()),
@@ -7782,10 +9135,7 @@ binding version {version}\"\n\
         dropin = sq(&names.dropin_path()),
         secret_dropin = sq(&names.secret_dropin_path()),
         scan = MARKER_SCAN_LINES,
-        needles = needles,
-        count = required.len(),
         managed_by = MANAGED_BY,
-        version = naming::BINDING_VERSION,
         dropin_dir = sq(&names.dropin_dir()),
         secret_dropin_dir = sq(&names.secret_dropin_dir()),
     )
@@ -7794,37 +9144,47 @@ binding version {version}\"\n\
 fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Result<(), String> {
     let (names, pubkey) = resolve_target(agent_id, pubkey)?;
 
-    // Read the env file's header immediately before acting on it — but a
-    // *missing* env file is not "nothing to remove". The unit, both drop-ins,
-    // the trail and the Secret Manager secret all outlive it, and an operator
-    // whose only reclamation path answers "nothing here" for a running,
-    // secret-bearing agent has no reclamation path at all. Authorization comes
-    // from `--pubkey` and from each file's own header, checked inside
-    // `removal_script` in the same shell as that file's own `rm`, so a missing
-    // env file withholds nothing this operation needs.
-    let out = remote.run(&format!(
-        "sudo -n sed -n '1,{scan}p' {env} 2>/dev/null || true",
-        scan = MARKER_SCAN_LINES,
-        env = sq(&names.env_path()),
-    ))?;
+    // The same per-agent lease `deploy` takes, and for the same reason: this
+    // destroys a Secret Manager secret and four files while a concurrent deploy
+    // may be installing them, and taking none left the two freely
+    // interleavable. It is acquired *before* the scan whose verdict authorizes
+    // everything below, so the state that authorizes cannot move between the
+    // read and the act, and it is held to the end of this function.
+    let lease = acquire_lease(remote, &names)?;
+
+    // ---- Pre-stop gate ([L2] item 4). -------------------------------------
+    // Stopping a unit is itself destructive, so it waits behind full-identity
+    // evidence like every other destructive step. All four artifacts are read
+    // in one shell; a *missing env file* is still not "nothing to remove",
+    // because the unit, both drop-ins, the trail and the secret all outlive it
+    // and any one surviving marker proves the same thing the env file would.
+    let out = remote.run(&ownership_scan_script(&names))?;
     if !out.ok() {
         return Err(format!(
-            "could not read {} (exit {}): {}",
-            names.env_path(),
+            "could not read {}'s marker headers (exit {}): {}. Nothing was \
+             stopped or destroyed.",
+            names.unit(),
             out.code,
             out.stderr.trim()
         ));
     }
-    if out.stdout.trim().is_empty() {
+    let files: Vec<AgentFileState> = observe::section(&out.stdout, "AGENTFILES")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(observe::parse_agent_file_row)
+        .collect();
+    verify_removable(&files, &pubkey, &names)?;
+    if !files
+        .iter()
+        .any(|file| file.path == names.env_path() && file.present)
+    {
         eprintln!(
-            "note: {} is absent. Removing {} by pubkey anyway — the unit, its \
-             drop-ins, the trail and the secret can all outlive the env file, \
-             and each deletion is still fenced on that file's own marker.",
+            "note: {} is absent. Removing {} anyway — a sibling artifact \
+             carries this agent's marker, and each deletion below is still \
+             fenced on that file's own header.",
             names.env_path(),
             names.unit()
         );
-    } else {
-        verify_removable(&out.stdout, &pubkey, &names.env_path())?;
     }
 
     // Secret first. The reverse order leaves markers gone, the secret still
@@ -7832,8 +9192,10 @@ fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Resul
     // Ordered this way an interrupted remove is idempotent: a re-run finds the
     // marked files present, the secret already absent, and treats
     // delete-of-absent as success ([L2] item 4).
+    lease.renew()?;
     secrets::destroy(remote, project, &names.secret_name(), &pubkey)?;
 
+    lease.renew()?;
     let out = remote.run(&removal_script(&names, &pubkey))?;
     if !out.ok() {
         return Err(format!(
@@ -7907,7 +9269,7 @@ fn main() {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 12 `operator` tests, and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
+Expected: PASS — 17 `operator` tests, and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
 
 - [ ] **Step 6: Exercise `dry-run` as the acceptance criterion the design asks for**
 
@@ -8033,7 +9395,7 @@ The desktop passes no argv, so argv selects operator mode.
 | Command | Effect |
 |---|---|
 | `buzz-backend-gcp list` | Every marked unit with its state, full pubkey, and every `warning` line from its deploy trail. |
-| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Stop, disable, destroy the secret, then delete this agent's enumerated files — each one only if its **own** header carries this pubkey; anything else is reported and left in place. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. |
+| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Prove ownership, then stop, disable, destroy the secret, and delete this agent's enumerated files — each one only if its **own** header carries this pubkey; anything else is reported and left in place. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. Nothing is stopped until at least one of the four per-agent artifacts is found carrying a marker for that exact pubkey — stopping a unit is destructive, and a 12-hex prefix match is not evidence that it is yours. |
 | `buzz-backend-gcp dry-run < request.json` | Print every rendered artifact with all secret-classified values redacted. Touches nothing. |
 
 `list` is the only place a capacity warning is readable. **Buzz Desktop will not
@@ -8077,6 +9439,18 @@ carries — goes to Secret Manager and is materialized to
 `/run/buzz-acp-<id>/secret.env` on tmpfs, 0400 `buzzacp`. It never touches the
 persistent boot disk.
 
+## Provider upgrades
+
+Every artifact this provider writes carries a `binding-version`, bumped when the
+unit or environment shape changes in a way an older build would mishandle. An
+artifact written by an **older** build is this provider's own work at a layout
+this one supersedes: `deploy` replaces it, rolls the Secret Manager labels
+forward, and the marker comes out at the current version — no operator action,
+no `--force`. An artifact written by a **newer** build is refused, by `deploy`
+and by `remove` alike, and the refusal names the version it found: a build that
+cannot reason about a layout must not overwrite or delete it. If you have rolled
+the binary back, run the newer one to remove those agents.
+
 ## Not isolated from each other
 
 Every instance runs as the same Unix user, `buzzacp`. Per-secret IAM shrinks
@@ -8111,10 +9485,15 @@ The second binding's realization of the two lists above, in its own vocabulary:
    staged to `<path>.<token>.tmp` and `mv`d into place, so no target path is
    ever observed half-written and the fence never has a truncated fragment to
    refuse forever. The mutating window is serialized by a per-agent lease on
-   the instance (`flock` over a lease record under `/run/lock`), and a deploy
-   that loses it mutates nothing and says so. The auto-repair fence is the
-   marker itself — no destructive action touches a file lacking the marker of
-   its own tier.
+   the instance (`flock` over a lease record in a private `0700 root:root`
+   `/run/buzz-backend-gcp`, renewed at each phase boundary), acquired
+   **before** the observation the deploy acts on and held by `remove` across
+   the secret destroy and the file deletions; a deploy that loses it mutates
+   nothing and says so. `remove` additionally proves ownership before it stops
+   anything: at least one of the four per-agent artifacts must carry a marker
+   naming this pubkey, or nothing is stopped, disabled or destroyed. The
+   auto-repair fence is the marker itself — no destructive action touches a
+   file lacking the marker of its own tier.
 2. **Two marker tiers.** Per-agent artifacts carry `managed-by`,
    `binding-version`, `agent-pubkey-full`, and `create-intent`. Shared
    artifacts — the two template units and the fetcher script — carry
@@ -8128,7 +9507,16 @@ The second binding's realization of the two lists above, in its own vocabulary:
    not by trusting a digest stored in the file — which is what makes the
    live-instance no-op zero-mutation rather than "no-op except three files
    rewritten identically". A shared file present with no provider marker is a
-   refusal, not an overwrite.
+   refusal, not an overwrite. **Ownership is version-aware at both tiers**: an
+   artifact carrying an *older* `binding-version` is this provider's own work
+   at a layout this build supersedes, so it is an authorised upgrade target —
+   a per-agent one is replaced, a shared one is rewritten if its bytes differ,
+   and the Secret Manager labels are rolled forward — while a *newer* one is a
+   refusal, because a build that cannot reason about a layout must not
+   overwrite or delete it. `binding-version` is documented as a
+   bump-when-the-shape-changes value, so treating an older one as foreign
+   would make every such bump lock the operator out of both `deploy` and
+   `remove` for every agent already on the box.
 3. **Lifetime policy.** Bounded (`inactivity_seconds > 0`) is `Restart=no`.
    Indefinite (`inactivity_seconds: 0`) parses — it is the blessed opt-in and
    must not be rejected as invalid — and is then **refused by deploy** with a
@@ -8356,13 +9744,22 @@ Add the agent to a channel from the desktop and mention it.
 Expected: it replies — proving identity assembly, owner resolution, the
 respond-to gate, and the tmpfs secret path all survived the remote route.
 
-- [ ] **Step 12: Verify the marker fence actually refuses**
+- [ ] **Step 12: Verify the marker fence refuses, and refuses before it stops**
+
+A mismatched `--pubkey` shares no marker with anything on the box, so the
+pre-stop gate must refuse **before** `systemctl disable --now` runs. Run this
+while the agent is *live* — that is the only way to see whether it survived:
 
 ```bash
 ~/.local/bin/buzz-backend-gcp remove buzz-acp@<id> --pubkey $(printf 'f%.0s' {1..64})
+gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
+  --project zoop-innovation --command 'systemctl is-active buzz-acp@<id>.service'
 ```
-Expected: a refusal naming the mismatch, and **no** change on the instance.
-Confirm with `~/.local/bin/buzz-backend-gcp list` that the unit is still there.
+Expected: a refusal that names the four paths it looked at and says
+`Nothing was stopped, disabled or destroyed`, then `active` from the second
+command. A refusal is not enough on its own — if `is-active` prints `inactive`,
+the gate ran *after* the stop and P1-2 has regressed. Confirm with
+`~/.local/bin/buzz-backend-gcp list` that the unit and its secret are intact.
 
 - [ ] **Step 13: Verify a per-agent file this provider did not write is left alone**
 
@@ -8476,12 +9873,24 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | P1-3 `project` reaches a root drop-in unvalidated | Task 4 `parse_resource_name` — a closed `^[a-z][a-z0-9-]{0,61}[a-z0-9]$` grammar applied to `project`, `zone` and `instance`, before the CR/LF/NUL scan's own pass. Tests cover `zoop BUZZ_GCP_SECRET=evil`, embedded quotes, `%` specifiers, both length bounds, and CR/LF/NUL before trimming. Task 7 additionally asserts the rendered `Environment=` values contain nothing systemd's parser treats specially, so the grammar and its consumer cannot drift apart. |
 | P1-4 per-agent destruction authorized by one sibling | Task 11 reports an `AgentFileState` per artifact; Task 12's `classify` refuses on the first present-but-not-ours among all four, naming that path; Task 9's `install_script` carries the target's own marker guard in the same shell as the write; Task 13's `removal_script` vetoes each `rm` with the header of the file it deletes and reports the ones it kept. Tests: marked env + unmarked drop-in, and a sibling belonging to another agent. |
 | P1-5 Secret Manager verified once, mutated twice | Task 10 `describe_owned` immediately precedes each mutation with nothing between; `ALREADY_EXISTS` on create is a re-read-and-verify rather than a failure; a `Recorder` implementing the new `remote::Gcloud` trait asserts the exact command sequences, including that a secret swapped before the IAM grant never receives it. |
-| P1-6 the shared-artifact tamper check | **Deleted.** No `content-hash` line, no `SharedMarker` type, no `sed` strip, no `tampered()`, no tamper classification arm, no tamper tests. Shared artifacts are write-if-absent-or-content-differs, comparing `sha256sum` of the installed file against `sha256_hex` of the rendered body — both hashes of real bytes. The rationale is recorded in Global Constraints, in Task 6's preamble, in `naming.rs`'s module doc, and in the spec §Two marker tiers. |
-| P1-7 credential rotation silently fails on `RestartSame` | Task 7 folds `sha256` of the rendered secret body — hash, never value — into the create-intent, so a rotated `auth_tag` or API key diverges the intent and classifies as `FencedReplace`, which does re-store the secret. `a_rotated_credential_diverges_the_intent_without_exposing_it` asserts both halves. |
-| P1-8 concurrent deploys interleave | Task 12 takes a per-agent lease on the instance for the mutating window (`flock` making a `/run/lock` lease record's read-modify-write atomic, TTL 300 s, released by a `Drop` guard), and a loser fails cleanly with `another deploy … is already in progress`. The destructive fence is narrowed from "re-read, then stop four to six round trips before the writes" to a single remote shell that re-reads the marker tuple and the running state and performs the stop; every later write carries its own guard. Task 15 Step 10 races two real deploys. |
+| P1-6 the shared-artifact tamper check | **Deleted.** No `content-hash` line, no `SharedMarker` type, no `sed` strip, no `tampered()`, no tamper classification arm, no tamper tests. Shared artifacts are write-if-absent-or-content-differs, comparing `sha256sum` of the installed file against `sha256_hex` of the rendered body — both hashes of real bytes. The rationale is recorded in Global Constraints, in Task 6's preamble, in `naming.rs`'s module doc, and in the spec §Two marker tiers. Deleting it removed the tamper verdict; round 3's P1-1 removed the *other* half of the upgrade lockout, which had survived inside `is_ours`. |
+| P1-7 credential rotation silently fails on `RestartSame` | Task 7 folds `sha256` of the rendered secret body — hash, never value — into the create-intent, so a rotated `auth_tag` or API key diverges the intent and classifies as `FencedReplace`, which does re-store the secret. `a_rotated_credential_diverges_the_intent_without_exposing_it` asserts both halves, and round 3 adds `a_value_that_changes_side_diverges_the_intent` for the case where nothing changes except which half of the split a value lands in. |
+| P1-8 concurrent deploys interleave | Task 12 takes a per-agent lease on the instance for the mutating window (`flock` making a lease record's read-modify-write atomic under a private `0700 root:root /run/buzz-backend-gcp`, TTL 900 s, renewed at each phase boundary, released by a `Drop` guard), and a loser fails cleanly with `another deploy … is already in progress`. Round 3's P1-4 moved the acquire **before** the observation the deploy acts on, and gave `operator::remove` the same lease. The destructive fence is narrowed from "re-read, then stop four to six round trips before the writes" to a single remote shell that re-reads the marker tuple and the running state and performs the stop; every later write carries its own guard. Task 15 Step 10 races two real deploys. |
 | P1-9 partial writes are unmarked and unrecoverable | Task 9's `install_script` stages to `<path>.<token>.tmp` with the final mode and `mv`s into place, so no target path is ever observed half-written; `an_install_stages_and_renames_rather_than_writing_in_place` asserts the ordering, and the `trap` removes the staging file on every exit path including the ownership refusal. |
 
 **Round 2's P2s.** Folded in: P2-1 (writer→reader loop closed in Task 13 Step 1 against `capacity`'s real output, prefix contract asserted at the source in Task 8, over-capacity smoke at Task 15 Step 9, README says the desktop will not show it), P2-2 (`list` unions three enumerations and `remove` proceeds without the env file), P2-3 (`shared_writes` runs on `RestartSame`), P2-4 (`FETCHER_UNIT` carries the full set, with three documented deviations, asserted offline in Task 7 and against the loaded unit in Task 15 Step 7), P2-7 (the relay-mesh golden asserts the exact sentence). Not folded in, and recorded as residual risk below: P2-5 (capacity computed once, acted on later) and P2-6 (the standing `buzz-acp.service` is counted but not fenced).
+
+### Round 3's four P1s, and where each is answered
+
+| Finding | Answer |
+|---|---|
+| P1-1 the upgrade lockout moved rather than died | Ownership is version-aware, not version-blind. Task 6 replaces the `is_ours` boolean with `naming::Ownership` — `Ours`, `OursButOlder(v)`, `OursButNewer(v)`, `NotOurs` — computed by one rule, `ownership_of`, for file headers and Secret Manager labels alike. `OursButOlder` is an **authorised upgrade target** everywhere: Task 12's `classify` forces `FencedReplace` on a per-agent artifact carrying it, Task 12's `shared_writes` takes the ordinary write-if-different path for a shared one, Task 10's `store` rolls the labels forward with `secrets update --update-labels` and then adds a version, Task 13's `verify_removable` accepts it, and Task 9's `marker_fn` compares the version with `-le` rather than `=` so the install that rewrites the file is not refused by its own fence. Refusal is reserved for `OursButNewer` — a downgrade this build cannot reason about — and for a foreign or absent `managed-by`, and the two get different sentences. The two tests that enshrined the old behaviour are gone, replaced by `an_older_binding_version_is_ours_and_an_upgrade_target`, `a_future_binding_version_is_refused_at_both_tiers`, `a_binding_version_that_is_not_a_number_is_not_ours`, Task 12's `a_prior_version_agent_is_upgraded_not_refused`, Task 10's `a_secret_from_an_older_binding_version_is_rolled_forward`, and Task 13's `a_prior_version_agent_is_still_removable`. |
+| P1-2 `remove` stops a unit it has not proven it owns | Task 13's `remove` now opens with a **pre-stop gate**: one remote shell reads all four per-agent artifacts (`observe::agent_file_rows`, the same emitter the observer uses), and `verify_removable` requires at least one present artifact whose own `agent-pubkey-full` equals `--pubkey`. It runs before `secrets::destroy` and before `removal_script`, so nothing is stopped, disabled or destroyed on the strength of a 12-hex prefix match. A refusal names the four paths it looked at and tells the operator how to reclaim the agent by hand. `an_env_absent_agent_with_a_marked_sibling_is_removable` and `an_agent_with_no_matching_marker_is_refused_before_anything_stops` cover both directions, and the second also asserts the refusal is reached before any `systemctl` verb is sent. |
+| P1-3 the marker guard counts lines, not distinct patterns | `grep -c -F -x{needles}` compared against `required.len()` is gone from both sites. Task 9's `marker_fn` emits a `marker_ok` shell function that captures the header once and asserts **each needle on its own** with `printf '%s\n' "$h" \| grep -Fqx -- <needle>`, returning non-zero on the first miss, then checks the binding version numerically. Task 9's `marker_guard` and Task 13's `removal_script` both call it, so there is one implementation rather than two copies of the same bug. `a_header_that_repeats_one_marker_line_does_not_satisfy_the_guard` and `a_repeated_marker_line_does_not_authorize_a_delete` feed a header whose first lines duplicate `# managed-by:` and omit `# agent-pubkey-full:` — and, for the shared tier, `# scope:` — and require a refusal. |
+| P1-4 the lease is acquired after the decision it protects | Task 12's `deploy` keeps a cheap **pre-lease look** — it costs no lease to refuse an unowned file or to no-op a live agent — and then takes the lease and observes and classifies **again** under it, acting only on that second observation: the fenced stop, the shared writes, the secret, the per-agent writes, the trail and `enable --now` all read from it. The authoritative observation is `DeployLease::observe`, a method on the guard, so it is unreachable without one and the ordering is a compile-time property rather than a convention; its first act is `renew`, a verify-then-refresh of the owner record, so a lease lost between acquire and observe stops the deploy instead of feeding it stale state. `operator::remove` takes the same per-agent lease and holds it across the ownership scan, `secrets::destroy` and the removal script. `the_authoritative_observation_cannot_run_without_a_held_lease` asserts the verify-before-refresh ordering and the `LOCK_UNAVAILABLE` exit. |
+
+**Round 3's P2s.** All four folded in. P2-1: `DEPLOY_LEASE_SECONDS` is raised to 900 s — above the desktop's 600 s provider timeout — **and** `DeployLease::renew` is called at each phase boundary of the mutating window, which is the half that covers an unbounded direct CLI run; the renewal verifies the record still names this holder before refreshing it, so losing the lease stops the deploy rather than being papered over. P2-2: `render::plan` refuses a `secret_body()` over `SECRET_MANAGER_MAX_PAYLOAD_BYTES` (64 KiB) in the **pure** phase, before a transport exists, and the core's 2 MiB test is kept and re-documented to say exactly what it does and does not claim. P2-3: the lease record moved to a private `install -d -m 0700 -o root -g root /run/buzz-backend-gcp`, a non-regular or non-root-owned record is treated as corrupt and replaced, and a future-dated timestamp is corrupt rather than fresh. P2-4: `a_value_that_changes_side_diverges_the_intent` holds the key set and the value multiset fixed and swaps which half of the split each value lands in.
+
 
 ### The three rejected findings
 
@@ -8497,13 +9906,15 @@ Each is recorded in Global Constraints with its evidence, and repeated at the co
 - `config::parse_resource_name(field, value)` — defined Task 4, called three times in `ProviderConfig::parse` and nowhere else; `parse_memory_max` is additionally read back by Task 11's reserved-memory sum.
 - `naming::header_line(name, value)` — defined Task 6; the single renderer of every marker line, used by Task 7 (`agent_owner_marker`, `shared_owner_marker`), Task 9's tests, Task 11 (`observe_script`, `parse_agent_file_row`), and Task 13 (`listing_script`, `removal_script`). Every reader matches strings this produces.
 - `Names` — defined Task 6 with both constructors; `new(&AgentIdentity)` used in Tasks 7 and 12; `from_pubkey_hex(&str)` in Task 13's `remove` and in Tasks 11 and 12's tests. Its eleven accessors are used in Tasks 7, 11 (via `agent_paths`), 12 (`unit`, `secret_unit`, `env_path`, `instance`), and 13 (all of them plus `dropin_dir`, `secret_dropin_dir`).
-- `AgentMarker { pubkey_full, create_intent }` — defined Task 6; rendered Task 7, parsed Tasks 11 and 13, compared Task 12. `shared_marker()` / `is_shared_marker()` replace the former `SharedMarker` type: rendered Task 7, matched line-wise by Tasks 11 and 9.
-- `RemoteFile { path, mode, body, owner_marker }` and `SharedArtifact { file, sha256 }` — defined Task 7; consumed Tasks 9 (`install`, `append`) and 12 (`shared_writes`, and both test constructors, which pass `owner_marker: Vec::new()` because those files are never installed).
+- `AgentMarker { pubkey_full, create_intent }` — defined Task 6; rendered Task 7, parsed Tasks 11 and 13, compared Task 12. `AgentMarker::parse` returns `Some` for a header this build may act on — its own version *or older* — and `None` otherwise, so a parsed marker is by construction actionable and the version question is answered separately by `agent_ownership`. `shared_marker()` / `shared_ownership()` replace the former `SharedMarker` type and the former `is_shared_marker` boolean: rendered Task 7, matched line-wise by Tasks 11 and 9.
+- `RemoteFile { path, mode, body, owner_marker }` and `SharedArtifact { file, sha256 }` — defined Task 7; consumed Tasks 9 (`install`, `append`) and 12 (`shared_writes`, and both test constructors, which pass `owner_marker: Vec::new()` because those files are never installed). `owner_marker` carries the tier's **identity** lines only — `managed-by` plus `agent-pubkey-full` or `scope` — because the binding version is compared as an ordering by `marker_fn`, not matched as a literal line; an exact `# binding-version: N` needle is what made an install refuse the very file it was upgrading.
 - `Plan { per_agent, shared, secret_env, create_intent, trail }` with `secret_body()` / `redacted_secret_body()` — defined Task 7; consumed Tasks 12 and 13. `trail` is a `RemoteFile` rather than the former `trail_header: String`, which is what lets `Remote::append` carry the same fence as `Remote::install` without a fifth parameter.
 - `Observation { systemd, markers, harness_installed, reserved_bytes, available_bytes }` and `MarkerState { env, siblings, shared }` with `agent_files()` — defined Task 11; consumed Task 12. `SHARED_PATHS` is the shared ordering between Tasks 11, 12 and 13, and matches the three `shared_artifact` calls in Task 7; `agent_paths` is the shared ordering between Task 11's script and its parser.
 - `remote::Gcloud` — defined Task 9, implemented for `Remote` there, consumed by Task 10 (`&dyn Gcloud`) and implemented again by Task 10's test `Recorder`. `&Remote` coerces at every call site (Tasks 12 and 13).
-- `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED, MARKER_SCAN_LINES}` — defined Task 9; `OWNERSHIP_REFUSED` mapped by `Remote::install`/`append` in the same task, the other three by Task 12, and `MARKER_SCAN_LINES` used by Tasks 11, 12 and 13.
-- `secrets::{verify_owned, store, destroy}` take `pubkey_full: &str` — defined Task 10; `deploy` passes `identity.pubkey_hex()` (Task 12), `remove` passes the operator's normalized value (Task 13). `naming::normalize_pubkey` (Task 6) is the single validation point.
+- `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED, MARKER_SCAN_LINES}` — defined Task 9; `OWNERSHIP_REFUSED` mapped by `Remote::install`/`append` in the same task, the other three by Task 12, and `MARKER_SCAN_LINES` used by Tasks 11, 12 and 13. `remote::marker_fn(required) -> String` is `pub(crate)`, defined Task 9 and consumed by Task 9's own `marker_guard` and Task 13's `removal_script` — one definition of "does the header in `$h` carry every needle, at a binding version this build may act on", because `grep -c` counting lines rather than patterns was the same defect in both.
+- `secrets::{verify_owned, store, destroy}` take `pubkey_full: &str` — defined Task 10; `deploy` passes `identity.pubkey_hex()` (Task 12), `remove` passes the operator's normalized value (Task 13). `naming::normalize_pubkey` (Task 6) is the single validation point. `verify_owned` returns `Result<Ownership, String>` so `store` can tell an upgrade from a steady state; `destroy` discards it.
+- `naming::{Ownership, ownership_of, agent_ownership, shared_ownership, BINDING_VERSION_NUM}` — defined Task 6. `ownership_of` is the single rule turning a `managed-by`/`binding-version` pair into a verdict, fed by both file-header tiers (Task 6) and by Secret Manager's two labels (Task 10), so the four states have one definition per binding rather than one per storage medium. `Ownership` is consumed by Task 10 (`verify_owned`), Task 11 (`AgentFileState::ownership`, `SharedFileState::ownership`), Task 12 (`classify`) and Task 13 (`verify_removable`). `BINDING_VERSION_NUM` additionally reaches the shell, in Task 9's `marker_fn`, Task 12's `fenced_stop_script` and Task 13's `listing_script`, as the right-hand side of a `-le` comparison.
+- `observe::{FIELD_HELPER, agent_file_rows, parse_agent_file_row}` — `pub(crate)`, defined Task 11 and consumed by Task 13's pre-stop ownership scan. Factored out of `observe_script` rather than re-spelled there: the row format is a contract between an emitter and a parser, and a second emitter is a second thing to keep in sync.
 - `capacity::{GIB, warning_lines, trail_record, now_rfc3339, parse_reported_bytes}` — defined Task 8; used in Task 7's leak test, Task 11's parser, Task 12, and Task 13 (both `dry_run` and the writer→reader test).
 - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload)` — signature fixed in Task 5 and unchanged by Task 12, so `main.rs` is written once.
 
@@ -8511,26 +9922,28 @@ Each is recorded in Global Constraints with its evidence, and repeated at the co
 
 Every block was walked again after this round's edits:
 
-- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile. The mutating window is a block expression whose value is `started_at: u64`; `_lease` is dropped at its closing brace and on every `?` inside it. `plan.per_agent`, `plan.shared` and `plan.trail` are disjoint field borrows. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared.
-- Task 12 `DeployLease` holds `&'a Remote` and a `String`; `Drop` takes `&mut self` and calls `self.remote.run(…)`, which needs only `&Remote` — no aliasing conflict. `acquire_lease` returns the guard with the `remote` borrow it was given, so the lease cannot outlive the transport.
+- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile. Both now sit inside the mutating block, beside the `obs` they were computed from. The block is an expression whose value is `started_at: u64`; `lease` is dropped at its closing brace and on every `?` inside it, and the two `return`s inside it exit `deploy` — dropping the lease — rather than yielding a block value, which is why the block's type stays `u64`. `plan.per_agent`, `plan.shared` and `plan.trail` are disjoint field borrows. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared. `authorizing_intent` is a `&str` borrowed out of `obs` and read by `fenced_stop` before any later statement touches `obs` mutably — nothing does.
+- Task 12 `DeployLease` holds `&'a Remote` and a `String`; `Drop` takes `&mut self` and calls `self.remote.run(…)`, which needs only `&Remote` — no aliasing conflict. `acquire_lease` returns the guard with the `remote` borrow it was given, so the lease cannot outlive the transport. `DeployLease::observe` and `DeployLease::renew` take `&self` and call `self.remote.run(…)`, another shared borrow, so they compose with the `&Remote` every other call in the window already holds. The struct is `pub(crate)` because `acquire_lease` is — a private type in a `pub(crate)` signature does not compile — and Task 13's `remove` names neither type: `let lease = acquire_lease(remote, &names)?;` and inference does the rest. `renew` is `pub(crate)` for the same reason; `observe` stays private because only `deploy` takes it.
 - Task 12 `fenced_stop` matches `out.code` against three `const i32` patterns plus a guarded `_` and a binding arm; constants are legal patterns and the arms are exhaustive because the last binds.
 - Task 11 `parse_observation`: `agent_files.remove(0)` moves the env row out of the `Vec` before the remainder becomes `siblings`; every `section(...)` borrow of `stdout` ends at the `String` conversion. `MarkerState::agent_files` returns `impl Iterator<Item = &AgentFileState>` borrowing `&self`, which every caller consumes inside one expression.
-- Task 10 `store` takes `&dyn Gcloud`; `labels`/`annotations`/`member` are locals whose `&str` views live to the end of their `gcloud` call. The `match describe(...)?` arms both end before the first mutation, so no borrow of the described value survives into it.
+- Task 10 `store` takes `&dyn Gcloud`; `labels`/`annotations`/`member` are locals whose `&str` views live to the end of their `gcloud` call. The `match describe(...)?` arms both end before the first mutation, so no borrow of the described value survives into it. `verify_owned` now returns `Result<Ownership, String>`; `Ownership` is `Copy`, so the `if let Ownership::OursButOlder(from)` binding in `store` copies out of a temporary rather than borrowing it, and `destroy` discards the value with a plain `?;`.
 - Task 9 `Gcloud for Remote`: `pipe` is a named binding so the `BrokenPipe` branch can inspect the error, and it is `drop`ped explicitly before `wait_with_output` — without that the child would never see EOF.
-- Task 9 `install_script`/`append_script`/`marker_guard` are pure `String` builders over `&RemoteFile`; `staged` is computed before the `format!` that consumes it by value.
+- Task 9 `install_script`/`append_script`/`marker_guard`/`marker_fn` are pure `String` builders over `&RemoteFile`; `staged` is computed before the `format!` that consumes it by value. `marker_fn` returns the `marker_ok` shell definition and `marker_guard` prepends it, so a caller cannot emit the call without the definition.
 - Task 7 `plan`: `agent` is shadowed by the owned `with_instance_harness(agent)` copy and then borrowed as `&agent` for `build_env` — the parameter is not used after the shadow. `for (key, value) in env` consumes the map **after** the newline scan that borrows it. `secret_body` is computed before the hasher and read once. `owner_marker` is cloned into each of the three `per_agent` files and moved into `trail` last.
 - Task 7 `feed` is a `FnMut` closure capturing `hasher` mutably; it is dropped before `hasher.finalize()` because its last call is in a `for` loop that ends first. **If the borrow checker objects, replace the closure with a plain `fn feed(hasher: &mut Sha256, label: &str, value: &str)` and pass `&mut hasher` at each call** — same behavior, no capture.
 - Task 13 `run`: `Cli` is destructured first, so `command` moves while `project`/`zone`/`instance` remain owned locals.
-- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String`; `removal_script(&names, &pubkey)` borrows both after `secrets::destroy` has finished with them.
+- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String`; `removal_script(&names, &pubkey)` borrows both after `secrets::destroy` has finished with them. The lease is bound to `lease` before the ownership scan and lives to the end of `remove` — it is *used* (two `renew` calls), so no leading underscore — and `secrets::destroy` and the removal script both run under it; it borrows the same `&Remote` the later `remote.run(…)` calls take, which is a shared borrow either way. `files` is an owned `Vec<AgentFileState>`, so the `verify_removable(&files, …)` slice borrow ends before the `files.iter()` check below it.
 - Task 5 `respond`: `raw` is borrowed by `refuse_relay_mesh(&raw)` and then **moved** into `serde_json::from_value(raw)` — the borrow has ended. Same shape as `crates/buzz-backend-kubernetes/src/main.rs:65-77`, which compiles.
 
 ### Remaining risk, stated honestly
 
-1. **The deploy lease is advisory and TTL-bounded, not a mutex.** A provider killed between acquire and release blocks the next deploy of that agent for up to `DEPLOY_LEASE_SECONDS` (300 s), and a lease older than that is stolen rather than waited on — so a pathologically slow mutating window could be overtaken. The window is six to eleven round trips at 3-5 s, so the margin is roughly 5×, and the loser's failure is clean either way. A real mutex would need a long-lived SSH master connection, which is the same change residual risk 3 wants.
+1. **The deploy lease is advisory and TTL-bounded, not a mutex.** A provider killed between acquire and release blocks the next deploy of that agent for up to `DEPLOY_LEASE_SECONDS` (900 s), and a lease older than that is stolen rather than waited on. Round 3's P2-1 raised the TTL above the desktop's 600 s provider timeout and added `DeployLease::renew` at each phase boundary of the mutating window, so a live holder cannot age its own lease out and a dead one still expires — but the longest un-renewed gap is still one phase (up to seven installs), and a direct CLI run whose link stalls for 900 s inside a phase can be overtaken. The loser's failure is clean either way, because every write carries its own marker guard. A real mutex would need a long-lived SSH master connection, which is the same change residual risk 4 wants.
 2. **Capacity is computed once and acted on up to 240 s later** (round 2, P2-5). `warning_lines` runs against the observation taken before the mutating window; another agent started in between is not counted. The warning is advisory and never vetoes, so the failure mode is an under-reported warning rather than a wrong action.
 3. **The pre-existing non-instanced `buzz-acp.service` is counted in capacity but never fenced** (round 2, P2-6). It contributes its declared `MemoryMax` to `reserved_bytes` and is otherwise invisible to this provider — it carries no marker, is not named `buzz-acp@*`, and is itself non-conforming (`Restart=always`). Nothing this binding does can touch it; nothing it does protects it either.
-4. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups. Correct but wasteful; a future revision should hold one SSH master connection open, which would also let the lease be a real `flock`.
+4. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups, and round 3's lease renewals add four more round trips to the mutating window. Correct but wasteful; a future revision should hold one SSH master connection open, which would also let the lease be a real `flock` and make renewal free.
 5. **`list` enumerates from the instance, never from Secret Manager.** It now unions the env glob, `systemctl list-units`/`list-unit-files` and the drop-in directories, so a deleted env file no longer hides a running agent — but an agent whose *entire* on-instance footprint is gone while its secret survives is still invisible, and the operator has to run the `gcloud secrets list --filter="labels.managed_by=buzz-backend-gcp"` the README prints. The labels exist precisely so a follow-up can cross-check both sides; this revision does not.
 6. **No test proves the fetcher script actually runs.** Its content is asserted byte-wise offline, but its behavior — arity refusal, shape refusal, the chmod/chown ordering that keeps `CapabilityBoundingSet=CAP_CHOWN` sufficient, the atomic rename — is only exercised by Task 15's live deploy succeeding. Task 15 Step 7 reads the loaded unit's directives back, which catches a documentation/unit divergence but not a script defect. A shellcheck step or a container-based script test would close it; neither is in scope here.
 7. **The desktop still cannot render a success-path warning.** Task 8 works around it durably and Task 14's README tells the operator so, but closing it properly needs a `warning` field added to `docs/remote-agents.md:421` and rendered desktop-side. Recorded as design §Follow-ups item 4, deliberately not attempted here.
 8. **A stale `<path>.<token>.tmp` can survive a hard connection loss.** The install script's `trap` removes it on every shell exit, but a connection dropped mid-write leaves the remote shell killed by SIGHUP with the staging file behind. It is inert — never at a target path, never loaded by systemd, and reaped from `/run` on reboot for the fetcher's own temp — but a `/etc` one persists until an operator removes it. This is the cost of P1-9's fix, and it is the right side of the trade: a stray `.tmp` is visible and harmless, a truncated unit file is neither.
+9. **A future binding version is refused, and that refusal is one-directional.** Round 3's P1-1 made ownership version-aware: an artifact written at an *older* `binding-version` is an upgrade target, and one written at a *newer* one is a refusal in both `deploy` and `remove`. That is deliberate — a build that does not understand a layout must not overwrite or delete it — but it means an operator who installs a newer provider, deploys, and then rolls back to an older binary cannot remove those agents with the old binary. The recovery is to run the newer binary's `remove`, which the refusal names. There is no in-band downgrade path and this revision does not invent one.
+10. **`list` reports a newer-version agent as unmarked.** `listing_script` recovers a pubkey from any header at a binding version this build may act on, which now includes older ones; a *newer* one is skipped, so the row appears with `<pubkey unknown>`. The rendered note says "no marker this build recognises" rather than "no marker", so the text is not a lie, but the operator still has to reach for `gcloud secrets list` or a newer binary. Distinguishing the two would need a fourth flag value on the row and a fourth render arm; the failure is visible and recoverable, so it is recorded rather than built.

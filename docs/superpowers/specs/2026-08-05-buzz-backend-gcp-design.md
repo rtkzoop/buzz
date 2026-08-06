@@ -508,6 +508,40 @@ name.
 > `PathModified=` unit, or GCE OS Config — not in a comment the editor can
 > rewrite.
 
+> **Amendment (round-3 review, P1-1).** Deleting the content hash removed the
+> *tamper* half of the upgrade lockout the amendment above describes. The other
+> half survived, in the ownership predicate itself: "is this ours" was
+> `managed-by == buzz-backend-gcp ∧ binding-version == <this build's>`, so the
+> first bump of `binding-version` — a designed-for event, since the line exists
+> to be bumped when the artifact shape changes — would make every artifact
+> already on the instance read as *present and not ours*. Deploy would refuse
+> to upgrade it, remove would refuse to delete it, and the refusal would tell
+> the operator that their own prior-version agent was somebody else's file.
+>
+> **Ownership is therefore version-aware, at every tier and on every medium.**
+> A marker is read as one of four states: this provider at this binding version;
+> this provider at an **older** one; this provider at a **newer** one; or not
+> ours. An older version is an **authorised upgrade target** — a per-agent
+> artifact is replaced (which rolls its marker forward), a shared artifact takes
+> the ordinary write-if-absent-or-bytes-differ path, the Secret Manager labels
+> are rolled forward with `--update-labels` before the next version is added,
+> and `remove` may still delete it. Refusal is reserved for a *newer* version,
+> whose layout this build cannot reason about and must not downgrade, and for a
+> foreign or absent `managed-by`. The two refusals carry different messages,
+> because "upgrade this provider" and "somebody else's file is in the way" send
+> the operator to different places.
+>
+> The rule applies to the shell fences as well as to the Rust: an install
+> guard, a delete veto, or a listing scan that required an exact
+> `# binding-version: N` line would refuse the very artifact the upgrade is
+> rewriting. They compare the version as an ordering instead.
+>
+> The compatibility floor this creates is explicit: a future bump may add or
+> reshape header lines freely, but `# managed-by:`, `# binding-version:`,
+> `# agent-pubkey-full:` and `# scope:` must keep their spellings, or the new
+> build stops recognising the previous release's artifacts and the lockout
+> returns.
+
 So the invariant the tests enforce is *"every installed file carries the marker
 of its own tier"* — never *"every installed file carries the per-agent marker"*,
 which is enforceable only by making the shared marker a lie.
@@ -555,11 +589,29 @@ marker. An unmarked object is never GC'd regardless of its labels"
 (`crates/buzz-backend-kubernetes/src/gc.rs:3-7`).
 
 Without that gate, a name-matching secret created by anything else — an operator,
-another tool, an older binding version — receives this agent's whole secret env
-as a new version *and* a grant of read access to the VM service account. Name
-collision is not ownership. A present-but-unmarked secret, or one whose
-`agent-pubkey-full` differs, is a **refusal naming the conflict**, never a
-takeover.
+another tool, a *foreign* binding — receives this agent's whole secret env as a
+new version *and* a grant of read access to the VM service account. Name
+collision is not ownership. A present-but-unmarked secret, one from a **newer**
+binding version, or one whose `agent-pubkey-full` differs, is a **refusal naming
+the conflict**, never a takeover.
+
+A secret from an **older** binding version is not in that list, and deliberately
+so (round-3 review, P1-1): it is this provider's own secret at a layout this
+build supersedes. `store` rolls its labels forward with
+`gcloud secrets update --update-labels` — verified immediately before, like
+every other mutation here — and then adds the version. Treating it as foreign
+would strand every existing agent's secret behind a `binding-version` bump, in
+the same way it stranded their files.
+
+**Nothing is stopped before ownership is proven** (round-3 review, P1-2).
+Stopping a unit is itself a destructive action, so it sits behind the same
+full-identity evidence as a delete: `remove` first reads all four per-agent
+artifacts in one shell and requires at least one present marker carrying the
+supplied pubkey. Only then does it destroy the secret and run the removal
+script. A `--pubkey` that merely shares its first twelve hex with the unit id is
+exactly the collision the full pubkey exists to close, and it authorizes
+nothing. `remove` holds the same per-agent lease a deploy takes, across the
+scan, the secret destroy and the file deletions.
 
 **Destroy-before-forget.** `remove` destroys the secret *before* deleting the
 local marker files. The reverse order — the earlier design — fails in a specific
