@@ -204,7 +204,7 @@ Each hit becomes `buzz_backend_core::wire::`. At the time of writing the only on
 - [ ] **Step 6: Verify the Kubernetes suite is still green**
 
 Run: `cargo test -p buzz-backend-kubernetes`
-Expected: PASS — 154 unit tests + 4 integration tests, the same counts as the pre-extraction baseline. **No test file may be edited in this task.** If a test needed changing, the extraction changed behavior; revert and find out why.
+Expected: PASS. **Counts move with the code, so check the total, not one crate.** `wire.rs` carries its own `#[cfg(test)] mod tests` (7 tests), and Step 3 moves that file — so those 7 relocate to `buzz-backend-core` and kubernetes drops to **147 unit + 4 integration**, with `cargo test -p buzz-backend-core` reporting **7**. The invariant is `147 + 7 = 154`, the pre-extraction total, conserved. **No test file may be edited in this task** — relocation is not modification. If an assertion needed changing to make either crate pass, the extraction changed behavior; revert and find out why.
 
 - [ ] **Step 7: Commit**
 
@@ -615,7 +615,7 @@ Run: `cargo test -p buzz-backend-core`
 Expected: PASS — the moved `env` and `wire` test modules plus the four new `identity` tests.
 
 Then run: `cargo test -p buzz-backend-kubernetes`
-Expected: PASS — 154 unit + 4 integration, unchanged counts. **No `#[cfg(test)]` module and no file under `crates/buzz-backend-kubernetes/tests/` may be edited in this task.** The only test edits permitted anywhere in the extraction are the two `AuthoritativeInputs` struct literals enumerated in Step 4, which live in the *moved* `env.rs` and are forced by a new required field — **no assertion, no expectation, and no test count changes anywhere**. If anything else needs touching, the extraction changed behavior; stop and find out why.
+Expected: PASS. **Check the conserved total, not one crate's count** — see Task 1 Step 6 for why. `env.rs` and the identity code carry their own test modules, so moving them relocates those tests into `buzz-backend-core`; kubernetes falls by exactly that many and core rises by the same. Record both numbers and confirm the sum still equals 154. **No `#[cfg(test)]` module and no file under `crates/buzz-backend-kubernetes/tests/` may be edited in this task.** The only test edits permitted anywhere in the extraction are the two `AuthoritativeInputs` struct literals enumerated in Step 4, which live in the *moved* `env.rs` and are forced by a new required field — **no assertion and no expectation changes anywhere**. If anything else needs touching, the extraction changed behavior.
 
 - [ ] **Step 10: Commit**
 
@@ -790,7 +790,7 @@ Every `#[test]` body in the file stays byte-identical. The old `use std::io::Wri
 - [ ] **Step 4: Verify**
 
 Run: `cargo test -p buzz-backend-core && cargo test -p buzz-backend-kubernetes`
-Expected: PASS in both, k8s at 154 unit + 4 integration — the same counts as the baseline, with no assertion changed.
+Expected: PASS in both. **The conserved total across the two crates is 154 + 4 integration**, distributed according to which files have moved by this point; no assertion changed. Task 3 moves the fixtures and the pipe harness, so the integration tests may execute from a different crate than they did at baseline — the count that must hold is the total, and every one of them must still be exercising the built binary over a real pipe.
 
 - [ ] **Step 5: Commit**
 
