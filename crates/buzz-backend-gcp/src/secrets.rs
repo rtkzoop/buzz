@@ -311,7 +311,6 @@ pub fn store(
 ///
 /// Delete-of-absent is success ([L2] item 4), which is what makes an
 /// interrupted `remove` idempotent.
-#[allow(dead_code)] // Called once reconcile::remove / operator destroy tears the secret down.
 pub fn destroy(
     remote: &dyn Gcloud,
     project: &str,

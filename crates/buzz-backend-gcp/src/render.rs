@@ -477,7 +477,6 @@ pub fn plan(
 /// construction — if a non-allowlisted key appears there, that *is* the
 /// finding — and the Secret Manager payload is printed keys-only, so a human
 /// can confirm the allowlist held for one particular payload.
-#[allow(dead_code)] // Called once the operator dry-run path renders a plan for review.
 pub fn dry_run_report(plan: &Plan, names: &Names, trail_record: &str) -> String {
     let mut out = format!(
         "agent_id: {}\nsecret:   {}\n",

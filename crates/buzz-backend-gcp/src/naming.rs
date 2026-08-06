@@ -144,7 +144,6 @@ impl Names {
     /// the pubkey `list` printed. This is the single entry point where a
     /// caller-supplied identity becomes a path, so the shape is checked here
     /// and nowhere else.
-    #[allow(dead_code)] // Called once operator::resolve_target derives it from an operator-supplied pubkey.
     pub fn from_pubkey_hex(pubkey_hex: &str) -> Result<Self, String> {
         Ok(Self {
             instance: normalize_pubkey(pubkey_hex)?[..12].to_string(),

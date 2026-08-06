@@ -12,6 +12,7 @@ mod capacity;
 mod config;
 mod naming;
 mod observe;
+mod operator;
 mod reconcile;
 mod remote;
 mod render;
@@ -28,9 +29,19 @@ use std::io::Read;
 const RELAY_MESH_PROVIDER: &str = "relay-mesh";
 
 fn main() {
+    // The desktop invokes this binary with no arguments, so anything on argv
+    // is a human running an operator command.
+    if std::env::args_os().count() > 1 {
+        use clap::Parser;
+        if let Err(e) = operator::run(operator::Cli::parse()) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        // No request means no response contract to honor. The one nonzero path.
         eprintln!("could not read the request from stdin: {e}");
         std::process::exit(1);
     }
@@ -39,8 +50,6 @@ fn main() {
     println!(
         "{}",
         serde_json::to_string(&response).unwrap_or_else(|e| {
-            // The response types are plain data; this cannot fail in practice,
-            // and a hand-built object is still a conforming response.
             format!(r#"{{"ok":false,"error":"could not serialize a response: {e}"}}"#)
         })
     );
