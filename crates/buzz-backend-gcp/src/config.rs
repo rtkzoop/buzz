@@ -27,7 +27,6 @@ pub const DEFAULT_INACTIVITY_SECONDS: u64 = 7200;
 /// The instance has 2 vCPU, so a quota above this is unenforceable: it is
 /// always either a typo or an attempt to probe the parser, and both deserve
 /// the same refusal.
-#[allow(dead_code)] // Read by parse_cpu_quota, wired into respond's Deploy arm by Task 5.
 const MAX_CPU_QUOTA_PERCENT: u32 = 200;
 
 /// The JSON Schema the desktop renders into the "Where to run" form.
@@ -75,7 +74,6 @@ pub fn config_schema() -> serde_json::Value {
 
 /// Parsed, defaulted, validated provider configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Constructed by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 pub struct ProviderConfig {
     pub project: String,
     pub zone: String,
@@ -104,7 +102,6 @@ pub struct ProviderConfig {
 /// and the character class and **never echoes the value** — an
 /// attacker-supplied value could itself be secret material, which
 /// `docs/remote-agents.md:1477-1478` forbids emitting.
-#[allow(dead_code)] // Called by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 fn reject_control_characters(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
@@ -140,7 +137,6 @@ fn reject_control_characters(
 /// required `> 0`. Lowercase suffixes are refused rather than folded: systemd
 /// reads a bare number as bytes, so quietly accepting `512m` would hand the
 /// operator 512 bytes when they asked for 512 mebibytes.
-#[allow(dead_code)] // Called by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 pub fn parse_memory_max(value: &str) -> Result<u64, String> {
     let refuse = || {
         "provider_config.memory_max is not a size this binding accepts \
@@ -200,7 +196,6 @@ pub fn parse_memory_max(value: &str) -> Result<u64, String> {
 
 /// Parse `cpu_quota` against its closed grammar: `^[0-9]{1,3}%$`, with the
 /// integer in `1..=MAX_CPU_QUOTA_PERCENT`.
-#[allow(dead_code)] // Called by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 pub fn parse_cpu_quota(value: &str) -> Result<u32, String> {
     let refuse = || {
         format!(
@@ -227,7 +222,6 @@ pub fn parse_cpu_quota(value: &str) -> Result<u32, String> {
 
 /// The longest resource name this binding will interpolate. 63 is the RFC 1035
 /// label limit GCE enforces on instance names, and the tightest of the three.
-#[allow(dead_code)] // Read by parse_resource_name, wired into respond's Deploy arm by Task 5.
 const MAX_RESOURCE_NAME_LEN: usize = 63;
 
 /// Parse `project`, `zone` or `instance` against a closed grammar:
@@ -248,7 +242,6 @@ const MAX_RESOURCE_NAME_LEN: usize = 63;
 /// project ids, zones and instance names, so nothing legitimate is excluded.
 /// Byte-wise throughout, so a multi-byte character fails the character-class
 /// check rather than splitting a code point.
-#[allow(dead_code)] // Called by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 pub fn parse_resource_name(field: &str, value: &str) -> Result<(), String> {
     let refuse = || {
         format!(
@@ -291,7 +284,6 @@ impl ProviderConfig {
     /// `provider_config` against `config_schema`, and the same agent record is
     /// redeployable across bindings, so a Kubernetes key must not brick a GCE
     /// deploy. A key this binding *does* know always has its value validated.
-    #[allow(dead_code)] // Wired into respond's Deploy arm by Task 5; only this module's tests call it today.
     pub fn parse(value: &serde_json::Value) -> Result<Self, String> {
         let empty = serde_json::Map::new();
         let fields = match value {

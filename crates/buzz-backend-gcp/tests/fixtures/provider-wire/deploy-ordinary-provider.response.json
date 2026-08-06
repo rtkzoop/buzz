@@ -1,0 +1,1 @@
+{"ok":false,"error":"deploy refused: provider_config.inactivity_seconds is 0 (indefinite lifetime), which this binding does not support yet: it requires Restart=on-failure, and docs/remote-agents.md withholds that until the harness clean-exit contract is pinned (Known Defect 6). Set a positive number of seconds."}

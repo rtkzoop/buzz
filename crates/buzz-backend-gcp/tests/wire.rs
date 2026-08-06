@@ -88,3 +88,85 @@ fn malformed_input_is_an_in_band_error_with_exit_zero() {
         .unwrap_or_default()
         .contains("valid JSON"));
 }
+
+/// This binding's response goldens, plus the one GCE-specific request.
+/// Everything else is shared and lives in `buzz-backend-core`.
+fn local_fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-wire")
+}
+
+fn local(name: &str) -> String {
+    std::fs::read_to_string(local_fixtures().join(name))
+        .unwrap_or_else(|e| panic!("could not read fixture {name}: {e}"))
+}
+
+/// Every deploy response fixture, compared after parsing so a field rename
+/// fails here rather than in a desktop reading `undefined`.
+#[test]
+#[ignore = "enabled in Task 7, when render::plan supplies these two refusals"]
+fn deploy_responses_match_their_fixtures() {
+    // (case, request comes from the shared fixture directory)
+    let cases = [
+        ("deploy-relay-mesh", true),
+        ("deploy-relay-mesh-padded", true),
+        ("deploy-no-owner", true),
+        ("deploy-ordinary-provider", false),
+    ];
+
+    // The list must cover every response fixture on disk. A literal array is
+    // never empty, so what can actually go wrong is a fixture added to the
+    // directory and never added here — a suite that exercises one case fewer
+    // than it appears to.
+    let mut on_disk: Vec<String> = std::fs::read_dir(local_fixtures())
+        .expect("could not read the fixture directory")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|name| Some(name.strip_suffix(".response.json")?.to_string()))
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = cases.iter().map(|(c, _)| (*c).to_string()).collect();
+    listed.sort();
+    assert_eq!(on_disk, listed, "response fixtures and cases disagree");
+
+    for (case, shared) in cases {
+        let request_name = format!("{case}.request.json");
+        let request = if shared {
+            fixture(&request_name)
+        } else {
+            local(&request_name)
+        };
+        let (stdout, code) = run(&binary(), &request);
+        assert_eq!(code, 0, "{case}: a produced response must exit 0");
+        assert_eq!(
+            stdout.matches('\n').count(),
+            1,
+            "{case}: expected exactly one line, got {stdout:?}"
+        );
+        let actual: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{case}: {e}: {stdout:?}"));
+        let expected: serde_json::Value =
+            serde_json::from_str(&local(&format!("{case}.response.json"))).unwrap();
+        assert_eq!(
+            actual, expected,
+            "{case}: response drifted from its fixture"
+        );
+    }
+}
+
+/// The control, stated as a property rather than only as a golden: an
+/// ordinary provider value must not trip the shared-compute backstop, and the
+/// request must reach the deploy path's own gates.
+#[test]
+#[ignore = "enabled in Task 7, when render::plan supplies these two refusals"]
+fn an_ordinary_provider_is_not_refused_as_shared_compute() {
+    let (stdout, _) = run(&binary(), &local("deploy-ordinary-provider.request.json"));
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let error = v["error"].as_str().unwrap_or_default();
+    assert!(
+        !error.contains("relay-mesh"),
+        "the backstop fired on an ordinary provider: {error}"
+    );
+    assert!(
+        error.contains("indefinite lifetime"),
+        "the request must reach the deploy path's own gates: {error}"
+    );
+}
