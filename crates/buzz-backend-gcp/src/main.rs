@@ -75,11 +75,14 @@ fn respond(input: &str) -> Response {
 
 /// Refuse a shared-compute agent, reading the **raw wire value**.
 ///
-/// Trimmed before comparing: the desktop's own layers disagree about padding
-/// (`relay_mesh.rs:17` and `effective_config/mod.rs:46` trim; the deploy guard
-/// at `agents_deploy.rs:116` did not), and `non_blank` preserves surrounding
-/// whitespace on a non-blank value. A backstop that shares its bypass with the
-/// layer it backs is not a backstop.
+/// Trimmed before comparing, and deliberately so even though the desktop now
+/// trims too. `ensure_remote_provider_supported`
+/// (`desktop/src-tauri/src/commands/agents_deploy.rs:93-94`) compares
+/// `provider.map(str::trim)`, so a padded value is refused there today — but a
+/// backstop that assumes its front layer is correct is not a backstop, and this
+/// one exists precisely for the callers that are not the desktop. `non_blank`
+/// also preserves surrounding whitespace on a non-blank value, so an untrimmed
+/// comparison here would let `" relay-mesh "` through.
 fn refuse_relay_mesh(raw: &serde_json::Value) -> Option<String> {
     let provider = raw.get("agent")?.get("provider")?.as_str()?;
     (provider.trim() == RELAY_MESH_PROVIDER).then(|| {
@@ -121,7 +124,8 @@ mod tests {
         to GCE.";
 
     /// The spec's backstop for the relay-mesh MUST. The desktop refuses first
-    /// (`agents_deploy.rs:116`); this is the layer that owes the obligation.
+    /// (`desktop/src-tauri/src/commands/agents_deploy.rs:93-94`); this is the
+    /// layer that owes the obligation.
     #[test]
     fn refuses_a_relay_mesh_agent() {
         let request = r#"{"op":"deploy","agent":{
