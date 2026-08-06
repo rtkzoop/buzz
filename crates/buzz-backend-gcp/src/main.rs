@@ -12,6 +12,7 @@ mod capacity;
 mod config;
 mod naming;
 mod reconcile;
+mod remote;
 mod render;
 
 use buzz_backend_core::wire::{self, Request, Response};
