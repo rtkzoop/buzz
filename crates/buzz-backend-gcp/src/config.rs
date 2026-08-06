@@ -8,10 +8,18 @@
 
 use serde_json::json;
 
+/// The only GCP project the real `buzz-agent` VM this binding targets lives
+/// in (design §Host Facts) — this binding has exactly one deployment target.
 pub const DEFAULT_PROJECT: &str = "zoop-innovation";
+/// The zone the real `buzz-agent` VM was provisioned in.
 pub const DEFAULT_ZONE: &str = "asia-south1-a";
+/// The name of the one GCE instance this binding deploys to today.
 pub const DEFAULT_INSTANCE: &str = "buzz-agent";
+/// Leaves headroom on the instance's ~2.7G available memory (design §Host
+/// Facts) for the host's own processes rather than claiming it all.
 pub const DEFAULT_MEMORY_MAX: &str = "2G";
+/// Leaves half a core of the instance's 2 vCPU for the host's own processes
+/// rather than claiming the whole box for one agent.
 pub const DEFAULT_CPU_QUOTA: &str = "150%";
 /// Two hours, matching the Kubernetes binding's default.
 pub const DEFAULT_INACTIVITY_SECONDS: u64 = 7200;
@@ -82,19 +90,31 @@ pub struct ProviderConfig {
     pub inactivity_seconds: Option<u64>,
 }
 
-/// Refuse any string value carrying CR, LF, or NUL.
+/// Refuse any string value carrying CR, LF, or NUL, scoped to the six keys
+/// `ProviderConfig::parse` reads.
 ///
-/// A belt for the next field added to the schema: `memory_max` and
-/// `cpu_quota` have closed grammars that already exclude these, but a field
-/// added later would not, and this class of defect must not be able to recur
-/// by omission. The refusal names the field and the character class and
-/// **never echoes the value** — an attacker-supplied value could itself be
-/// secret material, which `docs/remote-agents.md:1477-1478` forbids emitting.
+/// Scoped rather than map-wide: `parse`'s own doc comment promises that a key
+/// foreign to this binding is ignored, not refused, so the same agent record
+/// stays redeployable across bindings — a Kubernetes-only key must not brick
+/// a GCE deploy. Scanning the whole map would break that promise by refusing
+/// a redeploy over a control character in a value this binding never reads.
+/// `memory_max` and `cpu_quota` have closed grammars that already exclude
+/// these characters, but a field added later would not, and this class of
+/// defect must not be able to recur by omission. The refusal names the field
+/// and the character class and **never echoes the value** — an
+/// attacker-supplied value could itself be secret material, which
+/// `docs/remote-agents.md:1477-1478` forbids emitting.
 #[allow(dead_code)] // Called by ProviderConfig::parse, wired into respond's Deploy arm by Task 5.
 fn reject_control_characters(
     fields: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
     for (key, value) in fields {
+        if !matches!(
+            key.as_str(),
+            "project" | "zone" | "instance" | "memory_max" | "cpu_quota" | "inactivity_seconds"
+        ) {
+            continue;
+        }
         let Some(text) = value.as_str() else { continue };
         let Some(bad) = text.chars().find(|c| matches!(c, '\r' | '\n' | '\0')) else {
             continue;
@@ -572,5 +592,41 @@ mod tests {
     fn a_non_object_config_is_refused() {
         assert!(ProviderConfig::parse(&json!("2G")).is_err());
         assert!(ProviderConfig::parse(&json!([1, 2])).is_err());
+    }
+
+    /// The scoping fix for the contradiction above: a key foreign to this
+    /// binding is ignored even when its value carries a control character —
+    /// `reject_control_characters` reads only the six keys `parse` itself
+    /// reads, matching `parse`'s doc comment instead of scanning the whole
+    /// map. A Kubernetes-only key must not brick a GCE deploy of the same
+    /// agent record just because it happens to contain a newline.
+    #[test]
+    fn a_foreign_binding_key_with_a_control_character_is_ignored_not_refused() {
+        let c = ProviderConfig::parse(&json!({
+            "namespace": "buzz-agents-test\n",
+            "memory_max": "512M"
+        }))
+        .unwrap();
+        assert_eq!(c.memory_max, "512M");
+    }
+
+    /// Pins a deliberate asymmetry: a wrong-typed *string* field (a JSON
+    /// number where the schema wants a string) is treated as absent and
+    /// takes its default — the same lenient posture already extended to an
+    /// unknown key, because the desktop does not validate `provider_config`
+    /// against `config_schema`, so a value of the wrong JSON shape is not
+    /// distinguishable from a stale caller. `inactivity_seconds` does not get
+    /// the same leniency: its type gates whether the indefinite-lifetime
+    /// opt-in is honored, so guessing wrong would silently flip a
+    /// supervision-affecting decision the caller never made, and it is
+    /// refused instead.
+    #[test]
+    fn a_wrong_typed_string_field_defaults_but_a_wrong_typed_inactivity_seconds_is_refused() {
+        let c = ProviderConfig::parse(&json!({"cpu_quota": 150})).unwrap();
+        assert_eq!(c.cpu_quota, DEFAULT_CPU_QUOTA);
+
+        let err = ProviderConfig::parse(&json!({"inactivity_seconds": "7200"}))
+            .expect_err("a wrong-typed inactivity_seconds must be refused, not defaulted");
+        assert!(err.contains("inactivity_seconds"), "{err}");
     }
 }
