@@ -8,6 +8,7 @@
 //! `ok` field, because a provider that encoded outcomes in exit codes would
 //! have a second, redundant error channel to keep in sync ([L2] item 1).
 
+mod capacity;
 mod config;
 mod naming;
 mod reconcile;
