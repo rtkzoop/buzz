@@ -65,7 +65,7 @@ The desktop passes no argv, so argv selects operator mode.
 | Command | Effect |
 |---|---|
 | `buzz-backend-gcp list` | Every marked unit with its state, full pubkey, and every `warning` line from its deploy trail. |
-| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Prove ownership, then stop, disable, destroy the secret, and delete this agent's enumerated files — each one only if its **own** header carries this pubkey; anything else is reported and left in place. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. Nothing is stopped until at least one of the four per-agent artifacts is found carrying a marker for that exact pubkey — stopping a unit is destructive, and a 12-hex prefix match is not evidence that it is yours. |
+| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Prove ownership, then stop, disable, destroy the secret, and delete this agent's enumerated files — each one only if its **own** header carries this pubkey; anything else is reported and left in place. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. Nothing is stopped until **every present** per-agent artifact carries this provider's marker for that exact pubkey (at this binding version or older) **and** at least one such artifact is found — stopping a unit is destructive, and a 12-hex prefix match is not evidence that it is yours. A half-migrated mix (this build's marker beside a newer build's sibling) is refused before anything stops. |
 | `buzz-backend-gcp dry-run < request.json` | Print every rendered artifact with all secret-classified values redacted. Touches nothing. |
 
 `list` is the only place a capacity warning is readable. **Buzz Desktop will not
@@ -126,5 +126,7 @@ the binary back, run the newer one to remove those agents.
 Every instance runs as the same Unix user, `buzzacp`. Per-secret IAM shrinks
 the blast radius *outside* the VM and gives a per-secret audit trail; inside
 the VM, agents are mutually trusting — a compromised agent can read a
-sibling's materialized key. Agents on this instance are isolated from the
-network and from the metadata server, **not from each other**.
+sibling's materialized key. Agents on this instance are denied the GCE
+metadata server (`IPAddressDeny=169.254.169.254/32`) and run under a systemd
+sandbox; they are **not** isolated from the network (they must reach the
+relay) and **not** isolated from each other.
