@@ -125,8 +125,6 @@ pub struct Plan {
     /// Fingerprint of everything that decides the unit's behavior, excluding
     /// the generation and every secret *value* — though a digest of the secret
     /// body is included, so a rotated credential is a divergence.
-    #[allow(dead_code)]
-    // Read once reconcile::classify compares the create-intent for divergence.
     pub create_intent: String,
     /// The deploy trail. `body` is the four-line marker header the file gets
     /// when it does not exist yet; records are **appended** to it, so it is
@@ -136,7 +134,6 @@ pub struct Plan {
 
 impl Plan {
     /// The exact bytes uploaded as the secret version.
-    #[allow(dead_code)] // Called once secrets::store uploads the Secret Manager version payload.
     pub fn secret_body(&self) -> String {
         env_file_body(&self.secret_env, "")
     }
@@ -240,7 +237,6 @@ fn basename_or_default(command: Option<&str>) -> String {
 /// `launch.command` is resolved against the **desktop's** PATH; on the VM that
 /// path is meaningless, so only the basename carries over. Task 12 uses this to
 /// decide which `/usr/local/bin/<name>` must exist before the deploy proceeds.
-#[allow(dead_code)] // Called once reconcile's installation check verifies the harness binary exists.
 pub fn harness_basename(agent: &AgentPayload) -> String {
     basename_or_default(agent.launch.as_ref().and_then(|l| l.command.as_deref()))
 }

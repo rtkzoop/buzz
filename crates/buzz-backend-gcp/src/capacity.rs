@@ -39,7 +39,6 @@ fn human(bytes: u64) -> String {
 /// Three lines rather than one: the arithmetic, the consequence, and the
 /// remedy. They are appended verbatim to the deploy trail and each is
 /// individually greppable, which is what `list` relies on.
-#[allow(dead_code)] // Called once reconcile::deploy computes the capacity warning before a create.
 pub fn warning_lines(
     available_bytes: u64,
     reserved_bytes: u64,
@@ -68,7 +67,6 @@ pub fn warning_lines(
 /// Carries timestamps, the generation, the create-intent digest, and capacity
 /// arithmetic — **never an environment value**. The trail is a 0644 file on a
 /// shared host, so treating it as public is the only safe reading.
-#[allow(dead_code)] // Called once reconcile::deploy appends a record to the deploy trail.
 pub fn trail_record(
     timestamp: &str,
     generation: &str,
@@ -88,7 +86,6 @@ pub fn trail_record(
 }
 
 /// The current UTC instant, second precision, as the trail spells it.
-#[allow(dead_code)] // Called once reconcile::deploy timestamps a deploy-trail record.
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

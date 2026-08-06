@@ -82,7 +82,6 @@ impl Names {
     }
 
     /// The systemd instance name, i.e. what `%i` expands to.
-    #[allow(dead_code)] // Called once reconcile::acquire_lease builds the lease path from it.
     pub fn instance(&self) -> &str {
         &self.instance
     }
@@ -93,7 +92,6 @@ impl Names {
     }
 
     /// The per-instance key-fetcher unit the agent unit `Requires=`.
-    #[allow(dead_code)] // Called once reconcile::fenced_stop_script names the fetcher unit.
     pub fn secret_unit(&self) -> String {
         format!("buzz-acp-secret@{}.service", self.instance)
     }

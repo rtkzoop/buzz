@@ -23,21 +23,16 @@ use std::process::{Command, Stdio};
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, which contains none of the places `gcloud`
 /// installs to. Same fix and same cause as
 /// `crates/buzz-backend-kubernetes/src/client.rs:12-19`.
-#[allow(dead_code)] // Read once prepended_path / gcloud_not_found name the search dirs.
 const PATH_PREPEND: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 
 /// "This path is present but is not this agent's." Not a transport failure,
 /// and must not read as one.
-#[allow(dead_code)] // Called once reconcile/install maps exit 76 to not_ours.
 pub const OWNERSHIP_REFUSED: i32 = 76;
 /// "Another deploy of this agent holds the instance lease."
-#[allow(dead_code)] // Called once reconcile maps exit 75 to lease_lost / acquire refusal.
 pub const LOCK_UNAVAILABLE: i32 = 75;
 /// "The authorizing marker moved between the observation and the write."
-#[allow(dead_code)] // Called once reconcile::fenced_stop maps exit 77 when the marker moved.
 pub const MARKER_CHANGED: i32 = 77;
 /// "The agent started between the observation and the stop."
-#[allow(dead_code)] // Called once reconcile::fenced_stop maps exit 78 when the agent restarted under the fence.
 pub const AGENT_STARTED: i32 = 78;
 
 /// How many leading lines of a file can hold a marker header.
@@ -46,11 +41,9 @@ pub const AGENT_STARTED: i32 = 78;
 /// a shared header is three lines starting at line 2 when a shebang precedes
 /// it. One bound covers both, because the checks count exact whole-line
 /// matches rather than comparing a fixed slice.
-#[allow(dead_code)] // Called once marker_guard (and operator::removal_script) bounds the header window.
 pub const MARKER_SCAN_LINES: usize = 4;
 
 /// One completed `gcloud` invocation.
-#[allow(dead_code)] // Constructed once Remote::gcloud returns a completed invocation.
 pub struct Output {
     pub stdout: String,
     pub stderr: String,
@@ -62,7 +55,6 @@ impl Output {
     /// that fails prints nothing useful on stdout, and treating an empty
     /// stdout as an empty result is how an auth failure becomes a silent
     /// success.
-    #[allow(dead_code)] // Called once every gcloud caller distinguishes exit 0 from a silent empty stdout.
     pub fn ok(&self) -> bool {
         self.code == 0
     }
@@ -74,13 +66,11 @@ impl Output {
 /// `secrets` enforces is a property of the **command sequence** — describe,
 /// verify, mutate, describe, verify, mutate — and a sequence can only be tested
 /// by recording it. `Remote` is the sole production implementation.
-#[allow(dead_code)] // Implemented by Remote; secrets::store takes &dyn Gcloud for the command sequence.
 pub trait Gcloud {
     fn gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>;
 }
 
 /// A bound instance this provider can run commands on.
-#[allow(dead_code)] // Constructed once reconcile::deploy binds the instance for a deploy.
 pub struct Remote {
     project: String,
     zone: String,
@@ -89,7 +79,6 @@ pub struct Remote {
 }
 
 /// Quote a value for a single-quoted POSIX shell context.
-#[allow(dead_code)] // Called once observe/reconcile/operator render remote shell fragments.
 pub fn sq(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -110,13 +99,11 @@ pub fn sq(value: &str) -> String {
 /// the proof a transport concern; how long a lease lives, when it is taken and
 /// when an abandoned one may be stolen are questions about deploys, which
 /// makes them the reconciler's.
-#[allow(dead_code)] // Called once reconcile::acquire_lease creates the lease directory.
 pub(crate) const LEASE_DIR: &str = "/run/buzz-backend-gcp";
 
 /// How long to wait for the lease's `flock`. Every critical section under it
 /// is a handful of local file operations — never a network read — so anything
 /// longer means a wedged holder rather than a busy one.
-#[allow(dead_code)] // Called once under_lease and reconcile lease scripts share the wait.
 pub(crate) const LEASE_FLOCK_WAIT_SECONDS: u64 = 5;
 
 /// Where one agent's deploy lease lives: `(lock, owner)`.
@@ -125,7 +112,6 @@ pub(crate) const LEASE_FLOCK_WAIT_SECONDS: u64 = 5;
 /// (`naming::Names::instance`) — **not** the GCE instance this `Remote` is
 /// bound to — and the closed grammar it comes from is what makes it safe to
 /// interpolate into a path.
-#[allow(dead_code)] // Called once reconcile::acquire_lease / renew / release name the two files.
 pub(crate) fn lease_paths(agent: &str) -> (String, String) {
     (
         format!("{LEASE_DIR}/{agent}.lock"),
@@ -142,7 +128,6 @@ pub(crate) fn lease_paths(agent: &str) -> (String, String) {
 /// discipline round 3 applied to the authoritative observation, applied to the
 /// writes. Adding a second implementor is a deliberate act with a compiler
 /// error's worth of friction, which is the point.
-#[allow(dead_code)] // Implemented once by reconcile::DeployLease; install/append/run_fenced take it.
 pub(crate) trait Held {
     /// The 12-lowercase-hex agent whose lease is held.
     fn agent(&self) -> &str;
@@ -169,7 +154,6 @@ pub(crate) trait Held {
 ///
 /// [`LOCK_UNAVAILABLE`] for every failure, because the operator's remedy is
 /// the same in each case: another operation owns this agent right now.
-#[allow(dead_code)] // Called once under_lease embeds the proof at the head of every critical section.
 pub(crate) fn lease_gate(owner: &str, token: &str) -> String {
     format!(
         "now=$(date +%s)\n\
@@ -207,7 +191,6 @@ pub(crate) fn lease_gate(owner: &str, token: &str) -> String {
 /// have to account for that; the `nested` helper in Tasks 9 and 12 is that
 /// accounting, written down rather than worked around by matching only on
 /// quote-free fragments.
-#[allow(dead_code)] // Called once install/append/run_fenced and reconcile lease scripts wrap a body.
 pub(crate) fn under_lease(agent: &str, token: &str, root_script: &str) -> String {
     let (lock, owner) = lease_paths(agent);
     let inner = format!(
@@ -231,7 +214,6 @@ pub(crate) fn under_lease(agent: &str, token: &str, root_script: &str) -> String
 /// remedy. It must not read like [`Remote::not_ours`]: that one tells the
 /// operator to move a file aside, and following that advice when the real
 /// cause is a concurrent deploy is how a healthy artifact gets deleted.
-#[allow(dead_code)] // Called once install/append translate LOCK_UNAVAILABLE for the operator.
 pub(crate) fn lease_lost(target: &str) -> String {
     format!(
         "the deploy lease for {target} was not held at the instant the write \
@@ -245,7 +227,6 @@ pub(crate) fn lease_lost(target: &str) -> String {
 /// Compute the new `PATH` value: `gcloud` directories first, inherited entries
 /// after, in order. Pure, so the ordering is testable without mutating the
 /// process environment.
-#[allow(dead_code)] // Called once prepend_gcloud_path rewrites PATH before the first gcloud spawn.
 fn prepended_path(home: Option<&Path>, existing: &OsStr) -> Option<OsString> {
     let mut dirs: Vec<PathBuf> = PATH_PREPEND.iter().map(PathBuf::from).collect();
     if let Some(home) = home {
@@ -263,7 +244,6 @@ fn prepended_path(home: Option<&Path>, existing: &OsStr) -> Option<OsString> {
 /// Modifying the provider's environment is sound here: one process per
 /// operation, called before any child exists, and the only child that reads it
 /// is the `gcloud` this exists for.
-#[allow(dead_code)] // Called once Remote::new resolves gcloud on a launchd PATH.
 fn prepend_gcloud_path() {
     let home = std::env::var_os("HOME");
     let existing = std::env::var_os("PATH").unwrap_or_default();
@@ -273,7 +253,6 @@ fn prepend_gcloud_path() {
 }
 
 /// Is `command` an executable somewhere on the current `PATH`?
-#[allow(dead_code)] // Called once Remote::new refuses a missing gcloud with a named remedy.
 fn resolves_on_path(command: &str) -> bool {
     std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
@@ -282,7 +261,6 @@ fn resolves_on_path(command: &str) -> bool {
 
 /// The refusal for a `gcloud` that still does not resolve — never a bare
 /// `NotFound`, whose cause has nothing to do with GCP.
-#[allow(dead_code)] // Called once Remote::new and Gcloud::gcloud name the install remedy.
 fn gcloud_not_found() -> String {
     format!(
         "gcloud was not found. This provider is launched by the desktop app, \
@@ -315,7 +293,6 @@ fn gcloud_not_found() -> String {
 /// upgrades a file be refused by that file's own fence. A non-numeric or newer
 /// version is a refusal — a layout this build cannot reason about must not be
 /// rewritten.
-#[allow(dead_code)] // Called once install's guard and operator::removal_script share the per-needle check.
 pub(crate) fn marker_fn(required: &[String]) -> String {
     let checks: String = required
         .iter()
@@ -359,7 +336,6 @@ pub(crate) fn marker_fn(required: &[String]) -> String {
 /// An empty `required` means unguarded, which `render::plan` never produces —
 /// that invariant is asserted where it is established (Task 7), not defended
 /// again here.
-#[allow(dead_code)] // Called once install_script and append_script fence a target on its own header.
 fn marker_guard(path: &str, required: &[String]) -> String {
     if required.is_empty() {
         return String::new();
@@ -408,7 +384,6 @@ fn marker_guard(path: &str, required: &[String]) -> String {
 /// The staging path carries the per-process token, so two providers installing
 /// the same shared artifact at the same moment cannot collide on it, and the
 /// `trap` removes it on every exit path including both refusals.
-#[allow(dead_code)] // Called once Remote::install renders the staged atomic write.
 fn install_script(file: &RemoteFile, agent: &str, token: &str) -> String {
     let parent = Path::new(&file.path)
         .parent()
@@ -449,7 +424,6 @@ fn install_script(file: &RemoteFile, agent: &str, token: &str) -> String {
 /// record is a few hundred bytes, well inside a pipe buffer, so the whole
 /// thing fits inside the critical section without the `flock` ever waiting on
 /// the network.
-#[allow(dead_code)] // Called once Remote::append renders the fenced trail write.
 fn append_script(file: &RemoteFile, agent: &str, token: &str) -> String {
     let critical = format!(
         "set -e\n\
@@ -473,7 +447,6 @@ fn append_script(file: &RemoteFile, agent: &str, token: &str) -> String {
 ///
 /// Pure, so the two properties that matter — the tunnel is used, and no
 /// `StrictHostKeyChecking` option is passed — are asserted without a network.
-#[allow(dead_code)] // Called once Remote::run_with_stdin builds the IAP ssh argv.
 fn ssh_argv(project: &str, zone: &str, instance: &str, script: &str) -> Vec<String> {
     vec![
         "compute".to_string(),
@@ -496,7 +469,6 @@ fn ssh_argv(project: &str, zone: &str, instance: &str, script: &str) -> Vec<Stri
 
 impl Gcloud for Remote {
     /// Invoke `gcloud`, optionally piping `stdin`. Never logs `stdin`.
-    #[allow(dead_code)] // Called once secrets and Remote::run_with_stdin invoke gcloud with optional stdin.
     fn gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String> {
         let mut child = Command::new("gcloud")
             .args(args)
@@ -546,7 +518,6 @@ impl Remote {
     /// The `PATH` prepend and the resolution probe live here so there is
     /// exactly one place they can be forgotten, and so a missing `gcloud` is a
     /// named refusal rather than a `NotFound` from some later spawn.
-    #[allow(dead_code)] // Called once reconcile::deploy binds the instance at the start of a deploy.
     pub fn new(project: &str, zone: &str, instance: &str) -> Result<Self, String> {
         prepend_gcloud_path();
         if !resolves_on_path("gcloud") {
@@ -564,18 +535,15 @@ impl Remote {
     /// This process's token, mixed into every staging path and into the deploy
     /// lease record, so two concurrent providers can neither collide on a
     /// staging path nor release each other's lease.
-    #[allow(dead_code)] // Called once reconcile::acquire_lease stamps the owner record with this process token.
     pub fn token(&self) -> &str {
         &self.token
     }
 
     /// Run a shell script on the instance over IAP.
-    #[allow(dead_code)] // Called once observe/reconcile/operator run unfenced read-only scripts on the instance.
     pub fn run(&self, script: &str) -> Result<Output, String> {
         self.run_with_stdin(script, None)
     }
 
-    #[allow(dead_code)] // Called once install/append/run pipe a body or script to the instance.
     fn run_with_stdin(&self, script: &str, stdin: Option<&str>) -> Result<Output, String> {
         let argv = ssh_argv(&self.project, &self.zone, &self.instance, script);
         let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -588,7 +556,6 @@ impl Remote {
     /// version N": the guard admits an *older* version — that is the upgrade
     /// path — and refuses a newer or foreign one, so naming this build's exact
     /// version would describe a check the script does not perform.
-    #[allow(dead_code)] // Called once install/append translate OWNERSHIP_REFUSED for the operator.
     fn not_ours(&self, path: &str, verb: &str) -> String {
         format!(
             "{path} is present on the instance but does not carry this agent's \
@@ -611,7 +578,6 @@ impl Remote {
     /// [`LOCK_UNAVAILABLE`] and [`OWNERSHIP_REFUSED`] earn different
     /// sentences: one tells the operator to re-run, the other tells them to
     /// move a file aside, and acting on the wrong one deletes a healthy file.
-    #[allow(dead_code)] // Called once reconcile::deploy installs each rendered RemoteFile under the lease.
     pub(crate) fn install(&self, file: &RemoteFile, lease: &dyn Held) -> Result<(), String> {
         let script = install_script(file, lease.agent(), &self.token);
         let out = self.run_with_stdin(&script, Some(&file.body))?;
@@ -634,7 +600,6 @@ impl Remote {
     }
 
     /// Append one record, creating the file with its marker header when absent.
-    #[allow(dead_code)] // Called once reconcile::deploy appends the trail record under the lease.
     pub(crate) fn append(
         &self,
         file: &RemoteFile,
@@ -669,7 +634,6 @@ impl Remote {
     /// ownership proof. The exit code reaches the caller untouched, because
     /// each of those three speaks its own vocabulary on top of
     /// [`LOCK_UNAVAILABLE`].
-    #[allow(dead_code)] // Called once reconcile stop/start and operator removal mutate under the lease.
     pub(crate) fn run_fenced(&self, lease: &dyn Held, root_script: &str) -> Result<Output, String> {
         self.run(&format!(
             "set -uo pipefail\n{}",

@@ -67,14 +67,12 @@ impl SystemdState {
     /// exists, `systemctl show buzz-acp@<anything>.service` reports
     /// `LoadState=loaded` for every instance name. An install symlink
     /// (`UnitFileState=enabled`) or a live job is the real evidence.
-    #[allow(dead_code)] // Called once reconcile::classify decides Create vs act-on-known.
     pub fn instance_known(&self) -> bool {
         self.unit_file_state == "enabled" || !matches!(self.active_state.as_str(), "" | "inactive")
     }
 
     /// Is the harness process confirmed running? I4's "live" means *started*,
     /// not that systemd accepted the unit body.
-    #[allow(dead_code)] // Called once reconcile::classify treats a live harness as RestartSame.
     pub fn running(&self) -> bool {
         self.active_state == "active" && self.main_pid > 0
     }
@@ -127,7 +125,6 @@ pub struct MarkerState {
     /// The agent drop-in, the fetcher drop-in, and the deploy trail, in
     /// [`agent_paths`] order after the env file.
     pub siblings: Vec<AgentFileState>,
-    #[allow(dead_code)] // Read once reconcile::classify refuses foreign shared artifacts.
     pub shared: Vec<SharedFileState>,
 }
 
@@ -141,24 +138,18 @@ impl MarkerState {
 /// Everything one reconciliation pass needs, read in a single round trip.
 #[derive(Debug, Clone, Default)]
 pub struct Observation {
-    #[allow(dead_code)] // Read once reconcile::classify branches on instance_known/running.
     pub systemd: SystemdState,
     pub markers: MarkerState,
     /// The requested harness binary exists and is executable in
     /// `/usr/local/bin` on the instance.
-    #[allow(dead_code)] // Read once reconcile::deploy refuses a missing harness binary.
     pub harness_installed: bool,
     /// Summed `MemoryMax` of every *other* marked agent plus the standing
     /// `buzz-acp.service`.
-    #[allow(dead_code)]
-    // Read once capacity::warning_lines quotes the other agents' reserved total.
     pub reserved_bytes: u64,
-    #[allow(dead_code)] // Read once capacity::warning_lines quotes MemAvailable before a create.
     pub available_bytes: u64,
 }
 
 /// One round trip that collects everything the reconciler needs.
-#[allow(dead_code)] // Called once reconcile::deploy observes the instance before classify.
 pub fn look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation, String> {
     let out = remote.run(&observe_script(names, harness))?;
     if !out.ok() {
@@ -192,7 +183,6 @@ pub fn look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation
 /// pre-stop ownership scan reuses [`agent_file_rows`], and a helper defined in
 /// one script and called from another is the kind of coupling that breaks
 /// silently.
-#[allow(dead_code)] // Embedded once by observe_script and Task 13's pre-stop ownership scan.
 pub(crate) const FIELD_HELPER: &str =
     "field() { printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }\n";
 
@@ -206,7 +196,6 @@ pub(crate) const FIELD_HELPER: &str =
 /// [`parse_agent_file_row`], and `deploy` and `remove` disagreeing about what
 /// a header says is precisely the failure the marker exists to prevent.
 /// Assumes [`FIELD_HELPER`] is already defined in the surrounding script.
-#[allow(dead_code)] // Called once observe_script and Task 13's pre-stop ownership scan emit per-agent rows.
 pub(crate) fn agent_file_rows(names: &Names) -> String {
     format!(
         "for p in {agent_files}; do \
@@ -236,7 +225,6 @@ pub(crate) fn agent_file_rows(names: &Names) -> String {
 /// direction. Nothing here decides ownership; that is `naming::agent_ownership`
 /// / `AgentMarker::parse` and `naming::shared_ownership`, in Rust, for both
 /// tiers.
-#[allow(dead_code)] // Called once look builds the single observation round trip.
 fn observe_script(names: &Names, harness: &str) -> String {
     format!(
         "set -uo pipefail\n\
@@ -288,7 +276,6 @@ fn observe_script(names: &Names, harness: &str) -> String {
 /// `pub(crate)` because `reconcile` drives scripts of the same sectioned shape;
 /// two copies of a text splitter would be two places to get the terminator
 /// wrong.
-#[allow(dead_code)] // Called once parse_observation and reconcile's startup poll / start round trip.
 pub(crate) fn section<'a>(body: &'a str, name: &str) -> &'a str {
     let opener = format!("---{name}---\n");
     let Some(rest) = body.split(opener.as_str()).nth(1) else {
@@ -298,7 +285,6 @@ pub(crate) fn section<'a>(body: &'a str, name: &str) -> &'a str {
 }
 
 /// Read one `Key=value` line out of a `systemctl show` block.
-#[allow(dead_code)] // Called once parse_observation and reconcile's startup poll / start round trip.
 pub(crate) fn property<'a>(block: &'a str, key: &str) -> &'a str {
     let prefix = format!("{key}=");
     block
@@ -315,7 +301,6 @@ pub(crate) fn property<'a>(block: &'a str, key: &str) -> &'a str {
 /// is decided by exactly one pair of functions for the bytes this provider
 /// renders and the bytes it reads back. `pub(crate)` because Task 13's
 /// pre-stop scan parses the same rows.
-#[allow(dead_code)] // Called once parse_observation and Task 13's pre-stop ownership scan.
 pub(crate) fn parse_agent_file_row(line: &str) -> AgentFileState {
     let mut parts = line.split('|');
     let path = parts.next().unwrap_or("").to_string();

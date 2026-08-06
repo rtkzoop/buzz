@@ -29,7 +29,6 @@ const ANNOTATION_PUBKEY_FULL: &str = "agent-pubkey-full";
 /// already be 64 lowercase hex; the truncation below is by `chars()` so the
 /// function is total for any input rather than panicking on a short or
 /// non-ASCII one.
-#[allow(dead_code)] // Called once secrets::store writes labels on create/update.
 pub fn labels_for(pubkey_full: &str) -> String {
     let selector: String = pubkey_full.chars().take(32).collect();
     format!(
@@ -40,7 +39,6 @@ pub fn labels_for(pubkey_full: &str) -> String {
 }
 
 /// The `--set-annotations` argument value for `gcloud secrets create`.
-#[allow(dead_code)] // Called once secrets::store stamps the full-pubkey annotation on create.
 pub fn annotations_for(pubkey_full: &str) -> String {
     format!("{ANNOTATION_PUBKEY_FULL}={pubkey_full}")
 }
@@ -56,7 +54,6 @@ pub fn annotations_for(pubkey_full: &str) -> String {
 /// definition in this binding rather than one per storage medium. `Ok` carries
 /// the verdict because the caller has to act on it: `OursButOlder` means the
 /// labels need rolling forward before anything else happens.
-#[allow(dead_code)] // Called once secrets::{store,destroy} fence every mutation.
 pub fn verify_owned(
     described: &serde_json::Value,
     pubkey_full: &str,
@@ -108,7 +105,6 @@ pub fn verify_owned(
 }
 
 /// Read a secret's metadata. `Ok(None)` means it does not exist.
-#[allow(dead_code)] // Called once secrets::{store,destroy,describe_owned} read metadata before mutate.
 pub fn describe(
     remote: &dyn Gcloud,
     project: &str,
@@ -182,7 +178,6 @@ fn already_exists(out: &Output) -> bool {
 /// Idempotent: versions are cheap, and adding one is the only way to guarantee
 /// the latest value matches this deploy. Both mutations are individually
 /// fenced — see `describe_owned`.
-#[allow(dead_code)] // Called once reconcile::deploy uploads the secret-classified environment.
 pub fn store(
     remote: &dyn Gcloud,
     project: &str,
@@ -346,7 +341,6 @@ pub fn destroy(
 
 /// The instance's attached service account — the identity the fetcher unit
 /// authenticates as, and the only principal granted access to the secret.
-#[allow(dead_code)] // Called once reconcile::deploy resolves the VM identity before secrets::store.
 pub fn instance_service_account(
     remote: &dyn Gcloud,
     project: &str,
