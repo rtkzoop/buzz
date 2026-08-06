@@ -10310,26 +10310,33 @@ Expected: the install line prints, and `list` prints either agent rows or
 reported with a nonzero exit, not swallowed — if it prints nothing and exits
 0, Task 13's `out.ok()` check regressed.
 
-- [ ] **Step 5: Sweep for suppressions that never came due**
+- [ ] **Step 5: Sweep for deferred work that never came due**
 
-Every `#[allow(dead_code)]` in this crate was interim, added because a module
-landed a task or more before the code that calls it, and each carries a comment
-naming the condition that retires it (Global Constraints). By this point every
-module is wired, so every one of them should be gone.
+This plan defers two kinds of thing across task boundaries, and both are
+promises with an expiry date. `#[allow(dead_code)]` marks code that landed
+before its caller (Global Constraints). `#[ignore]` marks a test whose subject
+does not exist yet — Task 5 ignored two wire goldens that Task 7's
+`render::plan` was to supply. By this point every module is wired and every
+fixture reachable, so **both should be extinct**.
 
 Run:
 ```bash
-grep -rn "allow(dead_code)" crates/buzz-backend-gcp/ && echo "STRAGGLERS ABOVE" || echo "clean"
+grep -rn "allow(dead_code)\|#\[ignore" crates/buzz-backend-gcp/ && echo "STRAGGLERS ABOVE" || echo "clean"
 ```
 Expected: `clean`, with no matches printed.
 
 A match is one of exactly two things, and they need opposite responses. Either
-the item **is** now reachable and the annotation is stale — delete it, and
-confirm `cargo clippy -p buzz-backend-gcp --all-targets -- -D warnings` still
-passes. Or the item is genuinely still unreachable, which means the plan
-shipped code nothing calls: say so in the report rather than deleting the
-annotation to make the grep quiet. Do not silence this step; a suppression that
-outlived its stated reason is precisely what it exists to catch.
+the annotation is **stale** — the item is reachable now, or the test's subject
+exists — so delete it and confirm the crate still passes
+`cargo test -p buzz-backend-gcp` and
+`cargo clippy -p buzz-backend-gcp --all-targets -- -D warnings`. Or it is still
+**live**, which means this plan shipped code nothing calls, or a test nothing
+runs: report that plainly rather than deleting the annotation to quiet the grep.
+
+An ignored test is the more dangerous of the two, because it is invisible in a
+green run — `cargo test` prints `ok` and counts it as ignored, so a suite can be
+entirely green while the thing it was written to prove has never once executed.
+Do not silence this step.
 
 - [ ] **Step 6: Commit**
 
