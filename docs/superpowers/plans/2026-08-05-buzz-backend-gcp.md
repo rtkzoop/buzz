@@ -2677,6 +2677,16 @@ git add -A && git commit -s -m "feat(backend-gcp): pubkey-derived naming and two
 
 ## Task 7: `render.rs` — six artifacts, the non-secret allowlist, and the hardened fetcher
 
+> **Ordering defect — read before starting.** These two tasks are numbered in the
+> wrong order. Task 7's test module calls `crate::capacity::warning_lines` and
+> `crate::capacity::trail_record`, but `capacity.rs` is built by Task 8, so Task 7
+> cannot compile until Task 8 has landed. The tell is Step 2, which expects a
+> "cannot find function `plan`" error rather than a missing-module one — this
+> sequence was never executed as written. **Build Task 8 first.** During the real
+> run, one implementer built `capacity.rs` to Task 8's spec inside Task 7's
+> execution, landing it as its own commit (`6fc8bf47b`) with Task 8's message so
+> each half stayed reviewable against the task text that specifies it.
+
 Resolves review **P1-7** and **P2-8**, round 2's **P1-1** (`launch.command` reaches the VM verbatim), the render half of **P1-6** (the shared marker loses its content hash), **P1-7** (credential rotation) and **P2-4** (the fetcher unit does not carry the hardening the docs claim), and round 3's **P2-2** (Secret Manager's 64 KiB version-payload cap is enforced as a preflight) and **P2-4** (a value that changes side must diverge the intent).
 
 **Files:**
@@ -4148,6 +4158,19 @@ git add -A && git commit -s -m "feat(backend-gcp): render six artifacts across t
 ---
 
 ## Task 8: Capacity arithmetic and the durable deploy trail
+
+> **Ordering defect — this task is a prerequisite of Task 7, not a successor.**
+> Task 7's tests call `capacity::warning_lines` and `capacity::trail_record`, so
+> nothing in Task 7 compiles until this module exists. Build this first. In the
+> real run it landed as commit `6fc8bf47b` during Task 7's execution, which makes
+> this task verification-only there; on a fresh run, execute it in full before
+> Task 7. Two corrections found while implementing it, both approved and both
+> now folded into the code below: the literal `bytes % GIB == 0` trips clippy's
+> `manual_is_multiple_of` on any toolchain past 1.87 and must be
+> `bytes.is_multiple_of(GIB)` (stable since 1.87.0, at or below the workspace's
+> declared 1.88.0 floor, and already the convention in five sibling crates); and
+> the `OTHER_NSEC` fixture constant in Task 7's test module was not a decodable
+> bech32 string at all.
 
 Resolves review **P1-1**, and the writer half of round 2's **P2-1** (the capacity warning is findable but never found).
 
