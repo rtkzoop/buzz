@@ -91,6 +91,13 @@ build:
 build-release:
     cargo build --workspace --release
 
+# Build and install the GCE backend provider for the desktop app
+install-backend-gcp:
+    cargo build --release -p buzz-backend-gcp
+    mkdir -p ~/.local/bin
+    install -m 0755 target/release/buzz-backend-gcp ~/.local/bin/buzz-backend-gcp
+    @echo "installed to ~/.local/bin/buzz-backend-gcp — restart Buzz Desktop to discover it"
+
 # Run repo lint and formatting checks
 check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
 

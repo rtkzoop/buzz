@@ -1569,6 +1569,96 @@ the wrong tool here: the failure modes found in review were wrong
 delete, phase-as-readiness, non-atomic Secret→pod against GC), which a
 hand-written model would have reproduced convincingly.
 
+### [L3] GCE/systemd binding conformance — `buzz-backend-gcp`
+
+The second binding's realization of the two lists above, in its own vocabulary:
+
+1. **L2 item 4's terms.** Identity evidence is the `agent-pubkey-full` line of
+   the four-line marker header this provider writes into every per-agent file,
+   compared in full — the 12-hex instance name is collision-resistant only —
+   and it is read from **each artifact's own header**, not from one sibling's:
+   an unmarked drop-in beside a marked env file stops the deploy and survives
+   it. "Started" is `ActiveState=active` **and** a non-zero `MainPID` **and**
+   the harness's own `buzz-acp starting:` line in the journal, scoped to the
+   unit's *current* `InvocationID` and to a timestamp taken on the instance
+   immediately before `enable --now`; systemd accepting the unit is not a
+   start, and neither is a line the previous run left behind. Most-recent
+   semantics come from re-reading the whole marker tuple and the running state
+   **in the same remote shell** as the stop that depends on them, so the
+   compare and the act are not separated by a round trip. Every write is
+   staged to `<path>.<token>.tmp` and `mv`d into place, so no target path is
+   ever observed half-written and the fence never has a truncated fragment to
+   refuse forever. The mutating window is serialized by a per-agent lease on
+   the instance (`flock` over a lease record in a private `0700 root:root`
+   `/run/buzz-backend-gcp`), acquired **before** the observation the deploy
+   acts on and held by `remove` across the secret destroy and the file
+   deletions. Every mutation re-proves that lease *inside its own shell, under
+   the same `flock` the record can only be changed under*, and refreshes it
+   there — so a holder that stalls past the TTL and is legitimately overtaken
+   has its next write refused rather than landed, and a deploy that loses the
+   lease mutates nothing and says so. `remove` additionally proves ownership
+   before it stops anything: at least one of the four per-agent artifacts must
+   be present, and **every** present one must carry this provider's marker at
+   this binding version or older and name this pubkey, or nothing is stopped,
+   disabled or destroyed. The
+   auto-repair fence is the marker itself — no destructive action touches a
+   file lacking the marker of its own tier.
+2. **Two marker tiers.** Per-agent artifacts carry `managed-by`,
+   `binding-version`, `agent-pubkey-full`, and `create-intent`. Shared
+   artifacts — the two template units and the fetcher script — carry
+   `managed-by`, `binding-version`, and `scope: provider-shared`, and **no
+   agent identity at all**, because a file used by every instance belongs to
+   none of them. The provider-level marker records provenance and nothing
+   else: it makes no claim about the file's content, because a claim a file
+   makes about itself is worth exactly what its writer is worth. Shared
+   artifacts are written only when absent or when the bytes on the instance
+   differ from the bytes this provider would render — compared by hashing both,
+   not by trusting a digest stored in the file — which is what makes the
+   live-instance no-op zero-mutation rather than "no-op except three files
+   rewritten identically". A shared file present with no provider marker is a
+   refusal, not an overwrite. **Ownership is version-aware at both tiers**: an
+   artifact carrying an *older* `binding-version` is this provider's own work
+   at a layout this build supersedes, so it is an authorised upgrade target —
+   a per-agent one is replaced, a shared one is rewritten if its bytes differ,
+   and the Secret Manager labels are rolled forward — while a *newer* one is a
+   refusal, because a build that cannot reason about a layout must not
+   overwrite or delete it. `binding-version` is documented as a
+   bump-when-the-shape-changes value, so treating an older one as foreign
+   would make every such bump lock the operator out of both `deploy` and
+   `remove` for every agent already on the box.
+3. **Lifetime policy.** Bounded (`inactivity_seconds > 0`) is `Restart=no`.
+   Indefinite (`inactivity_seconds: 0`) parses — it is the blessed opt-in and
+   must not be rejected as invalid — and is then **refused by deploy** with a
+   message naming its prerequisite, because honoring it needs
+   `Restart=on-failure` against a clean-exit convention Known Defect 6 has not
+   yet pinned. [L1] item 5 forbids the alternative.
+4. **Signal delivery.** `ExecStart=` invokes `/usr/local/bin/buzz-acp`
+   directly — no shell wrapper — so `SIGTERM` reaches the harness itself.
+   `TimeoutStopSec=120` is the graceful-shutdown budget: in-flight drain,
+   presence→offline, and a graceful relay close before `SIGKILL`.
+5. **I2 and L2 item 5.** `provider_config` carries no credentials, and the
+   environment is split by an **allowlist of non-secret keys**: everything not
+   on that list — both nsec keys, `BUZZ_AUTH_TAG`, and every unrecognized
+   tier-1/tier-2 key — goes to Secret Manager and is materialized only to
+   tmpfs. The deploy trail records timestamps, generations, intent digests,
+   and capacity arithmetic, never an environment value. `dry-run` prints the
+   secret payload keys-only.
+6. **The fetcher unit.** The agent unit's `IPAddressDeny=169.254.169.254/32`
+   is a cgroup-wide filter, so a metadata-authenticated fetch cannot live
+   inside it; `buzz-acp-secret@%i.service` exists solely to run outside that
+   cgroup. It carries `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`,
+   `ProtectSystem=strict`, `ProtectHome`, `ProtectKernelTunables`,
+   `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`,
+   `RestrictRealtime`, `LockPersonality`,
+   `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `AmbientCapabilities=`,
+   `TasksMax=128`, and `ReadWritePaths=` scoped to its own runtime directory.
+   It differs from the agent unit in exactly three places, each deliberate:
+   no `IPAddressDeny` (its reason to exist); `CapabilityBoundingSet=CAP_CHOWN`
+   rather than empty, because the fetched file is `chown`ed to `buzzacp` so the
+   agent unit's manager can hand it over as an `EnvironmentFile=` while the
+   agent *process* cannot reach it; and `ReadWritePaths=-/run/buzz-acp-%i`
+   rather than `/var/lib/buzzacp`.
+
 ## Known Defects (at `28ae6cd21`)
 
 **Citation pin:** every `file:line` reference in this document was verified
@@ -1695,6 +1785,8 @@ Desktop- and harness-side, discovered during this design:
 | Clean-exit exit-code contract | *to be added*: `crates/buzz-acp` distinguished exit codes + pinning test (Known Defect 6; gates `OnFailure`) |
 | Auto-stop flag | *to be added*: `crates/buzz-acp/src/config.rs` + a pool-independent timer (NOT the `pool_ready`-gated maintenance tick — Known Defect 4) + `RESERVED_ENV_KEYS` entry |
 | Kubernetes binding | *to be added*: `crates/buzz-backend-kubernetes` |
+| GCE/systemd binding | `crates/buzz-backend-gcp/` |
+| shared provider contract | `crates/buzz-backend-core/` |
 | Sprig image | *to be added*: `Dockerfile.sprig` + workflow |
 
 ## Open Decisions
