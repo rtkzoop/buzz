@@ -14,6 +14,7 @@ mod naming;
 mod reconcile;
 mod remote;
 mod render;
+mod secrets;
 
 use buzz_backend_core::wire::{self, Request, Response};
 use std::io::Read;
