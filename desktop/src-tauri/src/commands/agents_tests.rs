@@ -416,7 +416,7 @@ fn legacy_avatar_empty_when_nothing_resolves() {
 #[test]
 fn deploy_payload_matches_the_shared_full_launch_fixture() {
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../../crates/buzz-backend-kubernetes/tests/fixtures/provider-wire/deploy-full-launch.request.json",
+        "../../crates/buzz-backend-core/fixtures/provider-wire/deploy-full-launch.request.json",
     );
     let fixture: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&fixture_path)

@@ -8,6 +8,12 @@ Each `*.request.json` is a request the desktop can emit; each matching
 provider side is asserted by `tests/wire_fixtures.rs`; the desktop side should
 assert that its emitted payloads parse as the corresponding request.
 
+Requests live here because they are the desktop's payloads and every binding
+must accept the same ones. **Responses do not**: each binding's refusal text
+names its own substrate, so `*.response.json` stays in the crate that produces
+it — `crates/buzz-backend-kubernetes/tests/fixtures/provider-wire/` and
+`crates/buzz-backend-gcp/tests/fixtures/provider-wire/`.
+
 Three rules keep these useful rather than decorative:
 
 * **Requests are recorded, not invented.** A fixture that no caller emits

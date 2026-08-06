@@ -7,5 +7,6 @@
 //! these live in one place rather than being reimplemented per binding.
 
 pub mod env;
+pub mod harness;
 pub mod identity;
 pub mod wire;

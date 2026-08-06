@@ -7,41 +7,36 @@
 //! actually break — the process writing nothing, writing two objects, or
 //! signalling the outcome through the exit code.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
+/// This binding's **response** goldens. Requests are shared and live in
+/// `buzz-backend-core`.
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-wire")
 }
 
 /// Feed one request to the binary; return `(stdout, exit code)`.
+///
+/// The `KUBECONFIG` override is not incidental: it points at a path that
+/// cannot exist, so a fixture that accidentally reaches the cluster fails
+/// loudly here instead of depending on whatever cluster the developer is
+/// pointed at — and several assertions below read `error.contains("kubeconfig")`
+/// as proof that an earlier gate passed.
 fn run(request: &str) -> (String, i32) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buzz-backend-kubernetes"))
-        // A kubeconfig that does not exist, so a fixture that accidentally
-        // reaches the cluster fails loudly here instead of depending on
-        // whatever cluster the developer is pointed at.
-        .env("KUBECONFIG", "/nonexistent/kubeconfig-for-fixture-tests")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("could not run the provider binary");
-    child
-        .stdin
-        .take()
-        .expect("no stdin")
-        .write_all(request.as_bytes())
-        .expect("could not write the request");
-    let out = child.wait_with_output().expect("provider did not exit");
-    (
-        String::from_utf8(out.stdout).expect("stdout was not UTF-8"),
-        out.status.code().unwrap_or(-1),
+    buzz_backend_core::harness::run_with_env(
+        Path::new(env!("CARGO_BIN_EXE_buzz-backend-kubernetes")),
+        request,
+        &[("KUBECONFIG", "/nonexistent/kubeconfig-for-fixture-tests")],
     )
 }
 
 fn read(name: &str) -> String {
-    std::fs::read_to_string(fixtures().join(name))
-        .unwrap_or_else(|e| panic!("could not read fixture {name}: {e}"))
+    if name.ends_with(".request.json") {
+        buzz_backend_core::harness::fixture(name)
+    } else {
+        std::fs::read_to_string(fixtures().join(name))
+            .unwrap_or_else(|e| panic!("could not read fixture {name}: {e}"))
+    }
 }
 
 /// Every response fixture, byte-compared after key-sorted re-serialization so
