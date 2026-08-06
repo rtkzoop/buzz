@@ -790,7 +790,7 @@ Every `#[test]` body in the file stays byte-identical. The old `use std::io::Wri
 - [ ] **Step 4: Verify**
 
 Run: `cargo test -p buzz-backend-core && cargo test -p buzz-backend-kubernetes`
-Expected: PASS in both. **The conserved total across the two crates is 154 + 4 integration**, distributed according to which files have moved by this point; no assertion changed. Task 3 moves the fixtures and the pipe harness, so the integration tests may execute from a different crate than they did at baseline — the count that must hold is the total, and every one of them must still be exercising the built binary over a real pipe.
+Expected: PASS in both, with **every count unchanged from where Task 2 left them** — `buzz-backend-core` at **36 unit**, `buzz-backend-kubernetes` at **123 unit + 4 integration**, total **159 unit + 4 integration**. That 159 is the 154 pre-existing tests conserved plus the 5 Task 2 prescribed; it is not drift. This task moves fixture *data* and the harness, and repoints three private helpers inside an integration test file — no unit test is in scope, so a moved number here is a finding to report, not a discrepancy to explain away. The count that carries the real risk is the **4**: after the harness moves, each integration test must still spawn the built binary and talk to it over a real pipe. A fixture test that quietly stopped spawning a process would keep passing while proving nothing, so confirm the mechanism, not just the colour of the result.
 
 - [ ] **Step 5: Commit**
 
