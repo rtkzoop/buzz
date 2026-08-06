@@ -26,6 +26,7 @@
 - **No secret material in any output** — stdout, stderr, error strings, the deploy trail, or `dry-run`. ([L2] item 5, `:1477-1478`)
 - Object names derive from the pubkey the provider decodes itself, never from a caller-supplied pubkey or a display name.
 - Run `just fmt` and `cargo clippy --workspace --all-targets -- -D warnings` before each commit. Do not run the full `just ci` per task; run it once at the end (Task 15).
+- **`--workspace` does not mean the whole repo.** Root `Cargo.toml:33` has `exclude = ["desktop/src-tauri"]`, so the desktop crate is a *separate* Cargo workspace that no `--workspace` or `-p` command in this plan reaches (AGENTS.md gotcha 5). It nonetheless depends on things this plan moves: `desktop/src-tauri/src/commands/agents_tests.rs:417` reads the shared `deploy-full-launch.request.json` fixture by relative path, because that fixture is the arbiter of a contract the desktop and every provider share. **Any task that moves, renames, or changes a shared fixture must also run** `cargo test --manifest-path desktop/src-tauri/Cargo.toml deploy_payload_matches_the_shared_full_launch_fixture` **and report the result.** Task 3 discovered this the hard way: the extraction broke that test, every plan-scoped command stayed green, and only a clean-cutover sweep for callers caught it.
 
 ### Three facts that were verified and must not be "fixed"
 
