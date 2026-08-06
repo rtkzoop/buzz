@@ -37,6 +37,10 @@ A future reader will be tempted to change each of these. Each was tested; changi
 
 `sudo -n` is used on every privileged step. Passwordless sudo is verified on this host, so `-n` changes no outcome today; it stays because on a host that *did* prompt, the prompt would consume the piped file body as keystrokes and write a truncated root-owned unit file.
 
+### One mechanism that was deliberately removed
+
+The revision before this one gave shared artifacts a `# content-hash:` marker line and had the observer recompute it with the header stripped, to detect out-of-band edits to root-owned units. **That mechanism is deleted, not disabled, and must not be reintroduced.** A digest a file declares about itself cannot detect an editor who can also edit the digest; the strip was a GNU-`sed` range that removed every matching block anywhere in the file, so hidden directives were excluded from the hash and executed by systemd anyway; and a `binding-version` bump hashed differently and read as "tampered", making a provider upgrade an unrecoverable lockout. Nothing in the approved design asks for it. Shared artifacts are **write-if-absent-or-content-differs**, compared by hashing the installed bytes and the rendered bytes independently, and the provider-level marker is a plain provenance comment. See Task 6's preamble. (Review r2, P1-6.)
+
 ---
 
 ## Task 1: Create `buzz-backend-core` with the wire types
@@ -126,6 +130,23 @@ In the moved file, replace the whole `pub fn info()` constructor (it referenced 
             config_schema,
         })
     }
+```
+
+Two more changes to the moved file, and nothing else:
+
+1. Add `Clone` to the derive lists of `AgentPayload` and `LaunchBlock` — `#[derive(Debug, Clone, Deserialize)]` and `#[derive(Debug, Default, Clone, Deserialize)]`. Every field is already `Clone`, so this is additive and changes no behavior. Task 7 needs it: the GCE binding rewrites `launch.command` to the instance's spelling of the harness on a **copy** of the payload before `build_env` reads it, which is what stops a desktop host path from reaching the VM (review r2, P1-1).
+2. Correct `LaunchBlock::command`'s doc comment, which currently reads *"Command **name**, resolved against the image's PATH — never a host path."* That is a statement of intent the desktop does not honor: `discovery.rs:443-449` deliberately preserves an explicit host path. Replace it with what is true, so the next reader does not rely on the wrong half:
+
+```rust
+    /// The command the desktop resolved, **as the desktop resolved it** — which
+    /// may be a bare name or an absolute host path
+    /// (`desktop/src-tauri/src/managed_agents/discovery.rs:443-449`). A host
+    /// path is meaningless on any remote substrate, so each binding is
+    /// responsible for reducing this to something its own substrate can exec
+    /// before it reaches an environment (see `buzz-backend-gcp`'s
+    /// `render::with_instance_harness`).
+    #[serde(default)]
+    pub command: Option<String>,
 ```
 
 Leave every other item in the file byte-identical, including its test module.
@@ -766,7 +787,7 @@ git add -A && git commit -s -m "refactor(backend): share provider-wire requests 
 
 ## Task 4: `buzz-backend-gcp` skeleton — `info`, the config schema, and the closed value grammars
 
-Resolves review **P1-6**.
+Resolves review **P1-6**, and round 2's **P1-3** (`project` reaches a root drop-in as an unvalidated `Environment=` value).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/Cargo.toml`
@@ -779,12 +800,14 @@ Resolves review **P1-6**.
 - Produces:
   - `config::config_schema() -> serde_json::Value`
   - `config::ProviderConfig { project: String, zone: String, instance: String, memory_max: String, memory_max_bytes: u64, cpu_quota: String, inactivity_seconds: Option<u64> }` with `ProviderConfig::parse(&serde_json::Value) -> Result<Self, String>`
-  - `config::parse_memory_max(&str) -> Result<u64, String>`, `config::parse_cpu_quota(&str) -> Result<u32, String>`
+  - `config::parse_memory_max(&str) -> Result<u64, String>`, `config::parse_cpu_quota(&str) -> Result<u32, String>`, `config::parse_resource_name(field: &str, value: &str) -> Result<(), String>`
   - `config::{DEFAULT_PROJECT, DEFAULT_ZONE, DEFAULT_INSTANCE, DEFAULT_MEMORY_MAX, DEFAULT_CPU_QUOTA, DEFAULT_INACTIVITY_SECONDS}`
   - `respond(input: &str) -> Response` in `main.rs`
 - Consumes: `buzz_backend_core::wire::{Request, Response}`, `buzz_backend_core::harness`.
 
 **Why the grammars are closed and rejecting, not sanitizing.** `memory_max` and `cpu_quota` are the only config values this binding interpolates into a **root-installed systemd drop-in**. A drop-in is line-oriented and systemd accepts every `[Service]` directive it finds, so an accepted value containing a newline *is* arbitrary unit content: `2G\nEnvironmentFile=/tmp/x.env` adds a second environment source that overrides the authoritative tier, and `2G\nExecStart=\nExecStart=/bin/sh -c …` uses systemd's empty-assignment reset to replace the agent command outright — both while the file still carries a valid management marker, so every fence in this design reads it as legitimately ours. The desktop cannot catch this: `validate_provider_config` (`desktop/src-tauri/src/managed_agents/backend.rs:536-566`) checks flatness, field count, scalar-ness and secret-like key *names*, never a value's contents. The provider is the only place this stops.
+
+**The third interpolation, and why it gets the same treatment.** The revision that closed `memory_max` and `cpu_quota` introduced a value the threat model had not covered: `Environment=BUZZ_GCP_PROJECT={cfg.project}` in the fetcher's per-agent drop-in. `project` was only trimmed and CR/LF/NUL-scanned — but systemd's `Environment=` is *whitespace- and quote-parsed* and expands `%` specifiers, so a space, a quote, an `=` or a `%` appends a second assignment to the one unit deliberately allowed to reach the metadata server and Secret Manager. `project = "zoop BUZZ_GCP_SECRET=evil"` renames the secret that unit fetches; `CLOUDSDK_CONFIG` or `HTTPS_PROXY` redirect where it fetches from. `zone` and `instance` reach `gcloud` argv rather than a unit file, which is a weaker exposure — but they are the same class of caller-supplied name and get the same grammar rather than a second, weaker rule that has to be remembered. The grammar is the intersection of what GCE and Secret Manager accept for project ids, zones and instance names, so nothing legitimate is excluded.
 
 - [ ] **Step 1: Write the failing wire test**
 
@@ -1029,6 +1052,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resource_names_inside_the_grammar_parse() {
+        let c = ProviderConfig::parse(&json!({
+            "project": "zoop-innovation",
+            "zone": "asia-south1-a",
+            "instance": "buzz-agent"
+        }))
+        .unwrap();
+        assert_eq!(c.project, "zoop-innovation");
+        assert_eq!(c.zone, "asia-south1-a");
+        assert_eq!(c.instance, "buzz-agent");
+    }
+
+    /// P1-3: `project` is interpolated into `Environment=BUZZ_GCP_PROJECT=…`
+    /// in a **root-installed** drop-in on the one unit allowed to reach the
+    /// metadata server. systemd's `Environment=` is whitespace- and
+    /// quote-parsed and expands `%` specifiers, so anything outside the closed
+    /// grammar can append a second assignment. `zone` and `instance` get the
+    /// same grammar rather than a second, weaker rule.
+    #[test]
+    fn resource_names_that_could_inject_a_systemd_directive_are_refused() {
+        let cases = [
+            // A second assignment on the same Environment= line.
+            ("project", "zoop BUZZ_GCP_SECRET=evil"),
+            ("project", "zoop CLOUDSDK_CONFIG=/tmp/x"),
+            // systemd unquotes Environment= values, so quotes are structural.
+            ("project", "\"zoop\""),
+            ("project", "zoop'q"),
+            // `%` is a specifier prefix, expanded before the value is used.
+            ("project", "%i"),
+            ("project", "zoop%n"),
+            // Shape rules, so a typo is a refusal rather than a lookup failure
+            // against a project that happens to exist.
+            ("project", "-leading-hyphen"),
+            ("project", "trailing-hyphen-"),
+            ("project", "UPPERCASE"),
+            ("project", "under_score"),
+            ("project", "dot.separated"),
+            ("project", "sl/ash"),
+            ("zone", "asia-south1-a EnvironmentFile=/tmp/x"),
+            ("instance", "buzz agent"),
+            ("instance", "../../etc/passwd"),
+        ];
+        for (field, payload) in cases {
+            let err = ProviderConfig::parse(&json!({ field: payload }))
+                .err()
+                .unwrap_or_else(|| panic!("accepted out-of-grammar {field} {payload:?}"));
+            assert!(
+                err.contains(field),
+                "{field}: the refusal must name the field: {err}"
+            );
+            assert!(
+                !err.contains(payload),
+                "{field}: the refusal echoed the value, which L2 item 5 forbids: {err}"
+            );
+        }
+    }
+
+    /// Both length bounds, kept out of the refusal test above because a
+    /// one-character payload appears in any English sentence and would trip
+    /// that test's does-not-echo assertion for the wrong reason. 64 is one over
+    /// the RFC 1035 label limit GCE enforces on instance names.
+    #[test]
+    fn resource_name_length_bounds_are_enforced() {
+        assert!(parse_resource_name("project", "a").is_err());
+        assert!(parse_resource_name("project", "").is_err());
+        assert!(parse_resource_name("project", "ab").is_ok());
+        assert!(parse_resource_name("project", &"a".repeat(63)).is_ok());
+        assert!(parse_resource_name("project", &"a".repeat(64)).is_err());
+    }
+
+    /// The control-character scan runs before trimming for **every** string
+    /// field, not only the two with closed size grammars — and neither refusal
+    /// echoes the value.
+    #[test]
+    fn a_resource_name_carrying_a_control_character_is_refused_not_trimmed() {
+        for payload in [
+            "zoop-innovation\n",
+            "zoop-innovation\r",
+            "zoop-innovation\u{0}",
+        ] {
+            let err = ProviderConfig::parse(&json!({"project": payload}))
+                .expect_err("a control character must be refused, never trimmed away");
+            assert!(err.contains("project"), "{err}");
+            assert!(
+                !err.contains("zoop-innovation"),
+                "the refusal echoed the value: {err}"
+            );
+        }
+    }
+
     /// The control-character scan must run **before** trimming. `str::trim`
     /// removes a trailing newline, so a scan placed after it would accept
     /// `"2G\n"` — and teach the next reviewer that trimming is a defense.
@@ -1112,14 +1226,17 @@ pub fn config_schema() -> serde_json::Value {
         "properties": {
             "project": {
                 "type": "string", "default": DEFAULT_PROJECT,
+                "pattern": "^[a-z][a-z0-9-]{0,61}[a-z0-9]$",
                 "description": "GCP project containing the instance"
             },
             "zone": {
                 "type": "string", "default": DEFAULT_ZONE,
+                "pattern": "^[a-z][a-z0-9-]{0,61}[a-z0-9]$",
                 "description": "Compute zone of the instance"
             },
             "instance": {
                 "type": "string", "default": DEFAULT_INSTANCE,
+                "pattern": "^[a-z][a-z0-9-]{0,61}[a-z0-9]$",
                 "description": "Instance the agent runs on"
             },
             "memory_max": {
@@ -1281,6 +1398,61 @@ pub fn parse_cpu_quota(value: &str) -> Result<u32, String> {
     Ok(percent)
 }
 
+/// The longest resource name this binding will interpolate. 63 is the RFC 1035
+/// label limit GCE enforces on instance names, and the tightest of the three.
+const MAX_RESOURCE_NAME_LEN: usize = 63;
+
+/// Parse `project`, `zone` or `instance` against a closed grammar:
+/// `^[a-z][a-z0-9-]{0,61}[a-z0-9]$`.
+///
+/// `project` is not decoration. It is interpolated into
+/// `Environment=BUZZ_GCP_PROJECT=<value>` inside a **root-installed** drop-in
+/// on the one unit deliberately allowed to reach the metadata server and Secret
+/// Manager. systemd's `Environment=` is whitespace- and quote-parsed and
+/// expands `%` specifiers, so a value carrying a space, a quote, an `=` or a
+/// `%` appends a second assignment to that unit's environment —
+/// `BUZZ_GCP_SECRET`, `CLOUDSDK_CONFIG`, `HTTPS_PROXY`. `zone` and `instance`
+/// reach `gcloud` argv rather than a unit file, a weaker exposure, but they are
+/// the same class of caller-supplied name and get the same rule rather than a
+/// second one somebody has to remember.
+///
+/// The grammar is the intersection of what GCE and Secret Manager accept for
+/// project ids, zones and instance names, so nothing legitimate is excluded.
+/// Byte-wise throughout, so a multi-byte character fails the character-class
+/// check rather than splitting a code point.
+pub fn parse_resource_name(field: &str, value: &str) -> Result<(), String> {
+    let refuse = || {
+        format!(
+            "provider_config.{field} is not a name this binding accepts (2 to \
+             {MAX_RESOURCE_NAME_LEN} characters: a lowercase letter, then \
+             lowercase letters, digits or '-', ending in a lowercase letter or \
+             digit — for example zoop-innovation, asia-south1-a, buzz-agent). \
+             It is refused rather than sanitized because it is interpolated \
+             into a root-installed systemd drop-in, where a space, a quote, an \
+             '=' or a '%' becomes a second unit directive. The value is not \
+             echoed."
+        )
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes.len() > MAX_RESOURCE_NAME_LEN {
+        return Err(refuse());
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return Err(refuse());
+    }
+    let last = bytes[bytes.len() - 1];
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        return Err(refuse());
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
 impl ProviderConfig {
     /// Parse with defaults.
     ///
@@ -1325,15 +1497,22 @@ impl ProviderConfig {
             }
         };
 
+        let project = text("project", DEFAULT_PROJECT);
+        parse_resource_name("project", &project)?;
+        let zone = text("zone", DEFAULT_ZONE);
+        parse_resource_name("zone", &zone)?;
+        let instance = text("instance", DEFAULT_INSTANCE);
+        parse_resource_name("instance", &instance)?;
+
         let memory_max = text("memory_max", DEFAULT_MEMORY_MAX);
         let memory_max_bytes = parse_memory_max(&memory_max)?;
         let cpu_quota = text("cpu_quota", DEFAULT_CPU_QUOTA);
         parse_cpu_quota(&cpu_quota)?;
 
         Ok(Self {
-            project: text("project", DEFAULT_PROJECT),
-            zone: text("zone", DEFAULT_ZONE),
-            instance: text("instance", DEFAULT_INSTANCE),
+            project,
+            zone,
+            instance,
             memory_max,
             memory_max_bytes,
             cpu_quota,
@@ -1405,7 +1584,7 @@ The single-stage parse and the placeholder `Deploy` arm are both temporary: Task
 - [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 4 integration tests (`tests/wire.rs`) and 13 unit tests (`config`).
+Expected: PASS — 4 integration tests (`tests/wire.rs`) and 17 unit tests (`config`).
 
 - [ ] **Step 9: Commit**
 
@@ -1417,7 +1596,7 @@ git add -A && git commit -s -m "feat(backend-gcp): provider skeleton with info a
 
 ## Task 5: The raw-JSON `relay-mesh` refusal, before deserialization
 
-Resolves review **P1-4**.
+Resolves review **P1-4**, and round 2's **P2-7** (the golden was satisfied by any error mentioning the string `relay-mesh`).
 
 **Files:**
 - Modify: `crates/buzz-backend-gcp/src/main.rs`
@@ -1703,6 +1882,16 @@ mod tests {
         json["error"].as_str().unwrap_or_default().to_string()
     }
 
+    /// The exact refusal, so no assertion here can be satisfied by an error
+    /// that merely *mentions* `relay-mesh` — "gcloud was not found while
+    /// deploying relay-mesh" would pass a `contains` check while proving the
+    /// backstop never fired. This is the same sentence the two response
+    /// goldens carry, so drift breaks the unit tests and the fixtures together.
+    const RELAY_MESH_REFUSAL: &str = "deploy refused: this agent is configured \
+        for shared compute (relay-mesh), which runs on the relay rather than on \
+        a GCE instance. Switch the agent to a local runtime before deploying it \
+        to GCE.";
+
     /// The spec's backstop for the relay-mesh MUST. The desktop refuses first
     /// (`agents_deploy.rs:116`); this is the layer that owes the obligation.
     #[test]
@@ -1710,19 +1899,33 @@ mod tests {
         let request = r#"{"op":"deploy","agent":{
             "relay_url":"wss://r","private_key_nsec":"nsec1x","provider":"relay-mesh"},
             "provider_config":{}}"#;
-        assert!(error_of(&respond(request)).contains("relay-mesh"));
+        assert_eq!(error_of(&respond(request)), RELAY_MESH_REFUSAL);
     }
 
-    /// Padding must not bypass the backstop. Reachable by construction:
-    /// `GlobalConfig.provider` is a bare `Option<String>` with no trim on
-    /// write, and `non_blank` rejects whitespace-only while preserving
-    /// surrounding whitespace on everything else.
+    /// Padding must not bypass the backstop, and must not change the answer
+    /// either. Reachable by construction: `GlobalConfig.provider` is a bare
+    /// `Option<String>` with no trim on write, and `non_blank` rejects
+    /// whitespace-only while preserving surrounding whitespace on everything
+    /// else.
     #[test]
     fn refuses_a_padded_relay_mesh_agent() {
         let request = r#"{"op":"deploy","agent":{
             "relay_url":"wss://r","private_key_nsec":"nsec1x","provider":"  relay-mesh  "},
             "provider_config":{}}"#;
-        assert!(error_of(&respond(request)).contains("relay-mesh"));
+        assert_eq!(error_of(&respond(request)), RELAY_MESH_REFUSAL);
+    }
+
+    /// The refusal must precede deserialization, or it is not the backstop the
+    /// spec asks for — `AgentPayload` deliberately does not carry `provider`,
+    /// so after `from_value` the evidence is gone. A `relay-mesh` payload that
+    /// is *also* malformed for `DeployRequest` must still produce this exact
+    /// sentence; if the order ever flips, the error becomes a serde message
+    /// and this fails.
+    #[test]
+    fn the_relay_mesh_refusal_precedes_deserialization() {
+        let request = r#"{"op":"deploy","agent":{"provider":"relay-mesh"},
+            "provider_config":{}}"#;
+        assert_eq!(error_of(&respond(request)), RELAY_MESH_REFUSAL);
     }
 
     /// A guard that refuses everything passes its own test and ships a
@@ -1768,7 +1971,7 @@ git add -A && git commit -s -m "feat(backend-gcp): refuse relay-mesh from the ra
 
 ## Task 6: Naming and the two marker tiers
 
-Resolves review **P2-2**.
+Resolves review **P2-2**, and round 2's **P1-6** — by *deleting* the shared-artifact content-hash tamper check rather than repairing it.
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/naming.rs`
@@ -1778,13 +1981,22 @@ Resolves review **P2-2**.
 - Produces:
   - `naming::{MANAGED_BY, BINDING_VERSION, SHARED_SCOPE}`
   - `naming::sha256_hex(&[u8]) -> String`
-  - `naming::Names::new(&AgentIdentity) -> Names` with `instance()`, `unit()`, `secret_unit()`, `env_path()`, `trail_path()`, `dropin_dir()`, `dropin_path()`, `secret_dropin_dir()`, `secret_dropin_path()`, `secret_name()`, `runtime_dir()`
-  - `naming::Names::from_pubkey_hex(pubkey_hex: &str) -> Result<Names, String>` and `naming::normalize_pubkey(value: &str) -> Result<String, String>` — the operator route, used only by `remove`
+  - `naming::header_line(name: &str, value: &str) -> String`
+  - `naming::Names::new(&AgentIdentity) -> Names` with `instance()`, `unit()`, `secret_unit()`, `env_path()`, `trail_path()`, `dropin_dir()`, `dropin_path()`, `secret_dropin_dir()`, `secret_dropin_path()`, `secret_name()`. There is deliberately **no** `runtime_dir()`: `/run/buzz-acp-%i` is spelled by systemd's `RuntimeDirectory=` and by the fetcher script, never by this provider, and a `pub` accessor nothing calls is `dead_code` in a binary crate — which `-D warnings` turns into a build failure.
+  - `naming::Names::from_pubkey_hex(pubkey_hex: &str) -> Result<Names, String>` and `naming::normalize_pubkey(value: &str) -> Result<String, String>` — the operator route, used by `remove` and by the reconciler's tests
   - `naming::AgentMarker { pubkey_full: String, create_intent: String }` with `render() -> String`, `parse(&str) -> Option<AgentMarker>`
-  - `naming::SharedMarker { content_hash: String }` with `render() -> String`, `parse(&str) -> Option<SharedMarker>`
+  - `naming::shared_marker() -> String` and `naming::is_shared_marker(body: &str) -> bool`
 - Consumes: `buzz_backend_core::identity::AgentIdentity`, `sha2`, `hex`.
 
 **Why two tiers.** A template unit is installed once and used by every instance. Stamping it with one agent's `agent-pubkey-full` and `create-intent` means the next deploy of a *different* agent rewrites the same file with a different identity, so the identity recorded on a shared file means nothing more than "whoever deployed most recently" — while the fence that reads it is asking "is this file *this* agent's?". Answering that from a shared file is wrong in both directions: it authorizes destroying a file three other agents depend on, and it refuses when the file is legitimately ours. The invariant the tests enforce is therefore *"every installed file carries the marker of its own tier"* — never *"every installed file carries the per-agent marker"*, which is enforceable only by making the shared marker a lie.
+
+**Why the provider-level marker carries no content hash — and why that mechanism is deleted rather than fixed.** The previous revision put a `# content-hash:` line in the shared header and had the observer recompute it with the header stripped. Round 2 found three defects in that one mechanism. The presence of the line alone was read as "this file is ours", so a foreign file carrying it was adopted. The strip was `sed '/^# managed-by: buzz-backend-gcp$/,+3d'`, which deletes **every** matching four-line block anywhere in the file, so directives hidden inside a second such block were removed before hashing and executed by systemd anyway. And a future `binding-version: 2` hashes differently, reads as "tampered", and turns a provider upgrade into an unrecoverable lockout. It also owned this binding's only GNU-`sed` dependency.
+
+All three are symptoms of one thing: **a digest a file declares about itself cannot detect an editor who can also edit the digest.** The check was unsound as specified, not merely buggy. It was also the only mechanism in the plan solving a problem the approved spec does not pose — the spec asks for write-if-absent-or-different and for an unmarked shared file to be a refusal, and asks for nothing about detecting out-of-band edits to root-owned units.
+
+What replaces it is what the spec already asked for: a shared artifact is written when it is **absent, or when the bytes on the instance differ from the bytes this provider would render**, compared by independently hashing both sides — `sha256sum` over the whole file on one, `sha256_hex` over the rendered body on the other. Neither side trusts a claim stored in the file. An out-of-band edit is therefore still *detected*, because it makes the bytes differ; the response is to converge, which is the right answer for a shared, identity-free, byte-identical, idempotent artifact. A `binding-version` bump becomes an ordinary rewrite instead of a lockout, and the GNU-`sed` dependency is gone. The provider-level marker survives as a plain provenance comment feeding the one fence the spec *does* state: a shared file present with **no** marker is a refusal, not an overwrite.
+
+**Header shapes.** A per-agent header is four contiguous lines; a shared header is three. Neither reader depends on the position: they take the first `remote::MARKER_SCAN_LINES` of a file and count exact whole-line matches, which is why the fetcher script's shebang above its header costs nothing.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1821,11 +2033,11 @@ mod tests {
             format!("/etc/systemd/system/buzz-acp-secret@{s}.service.d/agent.conf")
         );
         assert_eq!(n.secret_name(), format!("buzz-agent-{s}-private-key"));
-        assert_eq!(n.runtime_dir(), format!("/run/buzz-acp-{s}"));
     }
 
-    /// The instance name is what `%i` expands to and what the fetcher script's
-    /// shape check enforces, so it must be exactly 12 lowercase hex.
+    /// The instance name is what `%i` expands to, what the fetcher script's
+    /// shape check enforces, and what the deploy lease path is built from, so
+    /// it must be exactly 12 lowercase hex.
     #[test]
     fn the_instance_name_is_twelve_lowercase_hex() {
         let n = Names::new(&identity());
@@ -1845,17 +2057,26 @@ mod tests {
         assert_eq!(AgentMarker::parse(&m.render()).expect("parses"), m);
     }
 
+    /// The provider-level marker states exactly three things: this provider
+    /// wrote the file, at this binding version, for every instance. It carries
+    /// no agent identity because a shared file belongs to no agent — and no
+    /// content digest, because a claim a file makes about its own contents is
+    /// worth exactly what its writer is worth.
     #[test]
-    fn a_shared_marker_round_trips() {
-        let m = SharedMarker {
-            content_hash: sha256_hex(b"body"),
-        };
-        assert_eq!(SharedMarker::parse(&m.render()).expect("parses"), m);
+    fn the_provider_marker_says_only_what_is_true() {
+        let header = shared_marker();
+        assert!(is_shared_marker(&header));
+        assert!(header.contains(&header_line("managed-by", MANAGED_BY)));
+        assert!(header.contains(&header_line("binding-version", BINDING_VERSION)));
+        assert!(header.contains(&header_line("scope", SHARED_SCOPE)));
+        for absent in ["content-hash", "agent-pubkey", "create-intent"] {
+            assert!(!header.contains(absent), "the shared marker claims {absent}");
+        }
     }
 
-    /// The tiers must not be readable as each other. A shared file parsed as
+    /// The tiers must not be readable as each other. A shared file read as
     /// per-agent would hand a fence an identity that is not there; a per-agent
-    /// file parsed as shared would hand it a content hash that is not there.
+    /// file read as shared would let a shared-file rule act on one agent's file.
     #[test]
     fn the_two_tiers_do_not_parse_as_one_another() {
         let agent = AgentMarker {
@@ -1863,11 +2084,8 @@ mod tests {
             create_intent: "c0ffee".to_string(),
         }
         .render();
-        let shared = SharedMarker {
-            content_hash: sha256_hex(b"body"),
-        }
-        .render();
-        assert!(SharedMarker::parse(&agent).is_none());
+        let shared = shared_marker();
+        assert!(!is_shared_marker(&agent));
         assert!(AgentMarker::parse(&shared).is_none());
     }
 
@@ -1875,11 +2093,15 @@ mod tests {
     fn an_unmarked_file_yields_no_marker_of_either_tier() {
         let body = "# just some file\nFOO=bar\n";
         assert!(AgentMarker::parse(body).is_none());
-        assert!(SharedMarker::parse(body).is_none());
+        assert!(!is_shared_marker(body));
     }
 
     /// A marker from a future binding version must not be read as ours: the
     /// artifact layout it describes is one this build does not understand.
+    /// Note what this is *not*: with the content-hash check gone, a future
+    /// version is an unmarked-at-this-version file, which is a refusal for a
+    /// per-agent artifact and an ordinary rewrite for a shared one — never the
+    /// permanent "tampered" lockout the previous revision produced.
     #[test]
     fn a_foreign_binding_version_is_not_our_marker() {
         let body = format!(
@@ -1888,6 +2110,7 @@ mod tests {
             "ab".repeat(32)
         );
         assert!(AgentMarker::parse(&body).is_none());
+        assert!(!is_shared_marker(&body));
     }
 
     #[test]
@@ -1898,6 +2121,12 @@ mod tests {
             "ab".repeat(32)
         );
         assert!(AgentMarker::parse(&body).is_none());
+        // …and a foreign file that merely declares our scope is still not ours.
+        let scoped = format!(
+            "# managed-by: some-other-tool\n# binding-version: {BINDING_VERSION}\n\
+             # scope: {SHARED_SCOPE}\n"
+        );
+        assert!(!is_shared_marker(&scoped));
     }
 
     /// `remove` names its target by pubkey, because the operator holds no
@@ -1933,25 +2162,30 @@ mod tests {
         assert_eq!(from_key.trail_path(), from_pubkey.trail_path());
     }
 
-    /// The marker header must be exactly four contiguous lines starting at
-    /// `# managed-by: `, because the observer strips it with
-    /// `sed '/^# managed-by: buzz-backend-gcp$/,+3d'` before hashing the body.
-    /// A fifth line would silently shift what gets hashed.
+    /// Every header line is produced by `header_line`, and every reader — the
+    /// observer's `grep -F -x`, the install guard, `remove`'s fence — matches
+    /// those exact strings. A hand-rolled `format!` anywhere else would be a
+    /// second spelling nobody notices until a deploy refuses a file it wrote.
     #[test]
-    fn each_marker_header_is_exactly_four_lines() {
+    fn each_tier_renders_the_header_shape_its_readers_expect() {
         let agent = AgentMarker {
             pubkey_full: "ab".repeat(32),
             create_intent: "ci".to_string(),
         }
         .render();
-        let shared = SharedMarker {
-            content_hash: "hh".to_string(),
-        }
-        .render();
+        let shared = shared_marker();
+        assert_eq!(agent.lines().count(), 4, "{agent}");
+        assert_eq!(shared.lines().count(), 3, "{shared}");
         for header in [&agent, &shared] {
-            assert_eq!(header.lines().count(), 4, "{header}");
-            assert!(header.starts_with(&format!("# managed-by: {MANAGED_BY}\n")));
+            assert!(header.starts_with(&header_line("managed-by", MANAGED_BY)));
             assert!(header.ends_with('\n'));
+            for line in header.lines() {
+                let (name, value) = line
+                    .strip_prefix("# ")
+                    .and_then(|rest| rest.split_once(": "))
+                    .unwrap_or_else(|| panic!("{line:?} is not a header line"));
+                assert_eq!(line, header_line(name, value));
+            }
         }
     }
 }
@@ -1973,6 +2207,18 @@ Prepend to `crates/buzz-backend-gcp/src/naming.rs`:
 //! Names come from [`AgentIdentity`], which can only be constructed by
 //! decoding the nsec — so a caller-supplied pubkey or a mutable display name
 //! can never reach a path this provider writes to or deletes.
+//!
+//! The provider-level marker deliberately carries **no content digest**. An
+//! earlier revision stored one and had the observer recompute it with the
+//! header stripped: the strip was a GNU-`sed` range that deleted every matching
+//! block anywhere in the file, the presence of the digest line alone was read
+//! as ownership, and a future `binding-version` hashed differently and read as
+//! tampering — an unrecoverable upgrade lockout. All three follow from one
+//! thing: a digest a file declares about itself cannot detect an editor who can
+//! also edit the digest. The mechanism was deleted rather than repaired, and
+//! the job it should have been doing is done by comparing the installed bytes
+//! against the bytes this provider would render, hashed independently on each
+//! side (`observe.rs`, `reconcile::shared_writes`).
 
 use buzz_backend_core::identity::AgentIdentity;
 use sha2::{Digest, Sha256};
@@ -1992,6 +2238,16 @@ pub const SHARED_SCOPE: &str = "provider-shared";
 /// Lowercase hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Render one `# <name>: <value>` header line, without its newline.
+///
+/// One function, so the writer and every reader agree byte for byte: the
+/// observer's `grep -F -x`, the install guard, and `remove`'s fence all match
+/// against strings this produces. A hand-rolled `format!` elsewhere would be a
+/// second spelling nobody notices until a deploy refuses a file it wrote.
+pub fn header_line(name: &str, value: &str) -> String {
+    format!("# {name}: {value}")
 }
 
 /// Every path and name one agent implies.
@@ -2064,11 +2320,6 @@ impl Names {
         format!("buzz-agent-{}-private-key", self.instance)
     }
 
-    /// tmpfs directory systemd creates and reaps for the fetcher unit.
-    pub fn runtime_dir(&self) -> String {
-        format!("/run/buzz-acp-{}", self.instance)
-    }
-
     /// Derive every name from an **operator-supplied** full pubkey.
     ///
     /// `deploy` never uses this: it decodes the nsec and takes the identity
@@ -2127,17 +2378,16 @@ pub struct AgentMarker {
 impl AgentMarker {
     /// The four-line header, exactly as it appears at the top of the file.
     ///
-    /// Exactly four contiguous lines beginning with `# managed-by: ` — the
-    /// observer strips the header with a `sed` range anchored on that first
-    /// line and a `+3` offset, so a fifth line here would change what gets
-    /// hashed on the instance.
+    /// Four contiguous lines beginning with `# managed-by: `, which is what
+    /// lets every reader take the first `remote::MARKER_SCAN_LINES` of a file
+    /// and have the whole marker.
     pub fn render(&self) -> String {
         format!(
-            "# managed-by: {MANAGED_BY}\n\
-             # binding-version: {BINDING_VERSION}\n\
-             # agent-pubkey-full: {}\n\
-             # create-intent: {}\n",
-            self.pubkey_full, self.create_intent
+            "{}\n{}\n{}\n{}\n",
+            header_line("managed-by", MANAGED_BY),
+            header_line("binding-version", BINDING_VERSION),
+            header_line("agent-pubkey-full", &self.pubkey_full),
+            header_line("create-intent", &self.create_intent),
         )
     }
 
@@ -2157,41 +2407,30 @@ impl AgentMarker {
     }
 }
 
-/// The header written into every artifact shared by all instances: the two
-/// template units and the fetcher script.
+/// The provider-level header written into every artifact shared by all
+/// instances: the two template units and the fetcher script.
 ///
-/// It states exactly what is true — this provider wrote it, at this binding
-/// version, with this content — and **nothing that is not**. In particular it
-/// carries no pubkey and no create-intent, because a shared file belongs to no
-/// single agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedMarker {
-    /// SHA-256 of the artifact's content excluding this four-line header.
-    pub content_hash: String,
+/// Three lines, and deliberately nothing more. It states exactly what is true —
+/// this provider wrote it, at this binding version, for every instance — and
+/// **nothing that is not**: no pubkey and no create-intent, because a shared
+/// file belongs to no single agent, and no content digest, for the reason in
+/// the module preamble.
+pub fn shared_marker() -> String {
+    format!(
+        "{}\n{}\n{}\n",
+        header_line("managed-by", MANAGED_BY),
+        header_line("binding-version", BINDING_VERSION),
+        header_line("scope", SHARED_SCOPE),
+    )
 }
 
-impl SharedMarker {
-    /// The four-line header. Same four-line rule as [`AgentMarker::render`].
-    pub fn render(&self) -> String {
-        format!(
-            "# managed-by: {MANAGED_BY}\n\
-             # binding-version: {BINDING_VERSION}\n\
-             # scope: {SHARED_SCOPE}\n\
-             # content-hash: {}\n",
-            self.content_hash
-        )
-    }
-
-    /// Parse a provider-level marker from a file body. A per-agent header
-    /// parses to `None` here because it declares no scope.
-    pub fn parse(body: &str) -> Option<Self> {
-        if !is_ours(body) || header_field(body, "scope").as_deref() != Some(SHARED_SCOPE) {
-            return None;
-        }
-        Some(Self {
-            content_hash: header_field(body, "content-hash")?,
-        })
-    }
+/// Does `body` carry the provider-level marker at this binding version?
+///
+/// The whole question about a shared file, and the only one: presence licenses
+/// a rewrite when the bytes differ, absence is a refusal. A per-agent header
+/// answers `false` because it declares no scope.
+pub fn is_shared_marker(body: &str) -> bool {
+    is_ours(body) && header_field(body, "scope").as_deref() == Some(SHARED_SCOPE)
 }
 ```
 
@@ -2212,7 +2451,7 @@ git add -A && git commit -s -m "feat(backend-gcp): pubkey-derived naming and two
 
 ## Task 7: `render.rs` — six artifacts, the non-secret allowlist, and the hardened fetcher
 
-Resolves review **P1-7** and **P2-8**.
+Resolves review **P1-7** and **P2-8**, and round 2's **P1-1** (`launch.command` reaches the VM verbatim), the render half of **P1-6** (the shared marker loses its content hash), **P1-7** (credential rotation), and **P2-4** (the fetcher unit does not carry the hardening the docs claim).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/render.rs`
@@ -2222,18 +2461,22 @@ Resolves review **P1-7** and **P2-8**.
 
 **Interfaces:**
 - Produces:
-  - `render::RemoteFile { path: String, mode: &'static str, body: String }`
-  - `render::SharedArtifact { file: RemoteFile, content_hash: String }`
-  - `render::Plan { per_agent: Vec<RemoteFile>, shared: Vec<SharedArtifact>, secret_env: BTreeMap<String, String>, create_intent: String, trail_header: String }` with `Plan::secret_body(&self) -> String` and `Plan::redacted_secret_body(&self) -> String`
+  - `render::RemoteFile { path: String, mode: &'static str, body: String, owner_marker: Vec<String> }`
+  - `render::SharedArtifact { file: RemoteFile, sha256: String }`
+  - `render::Plan { per_agent: Vec<RemoteFile>, shared: Vec<SharedArtifact>, secret_env: BTreeMap<String, String>, create_intent: String, trail: RemoteFile }` with `Plan::secret_body(&self) -> String` and `Plan::redacted_secret_body(&self) -> String`
   - `render::plan(agent: &AgentPayload, cfg: &ProviderConfig, names: &Names, identity: &AgentIdentity, generation: &str) -> Result<Plan, String>`
   - `render::dry_run_report(plan: &Plan, names: &Names, trail_record: &str) -> String`
   - `render::NON_SECRET_KEYS: [&str; 9]`
-  - `render::harness_basename(agent: &AgentPayload) -> String`
-- Consumes: `buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY}`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::AgentPayload`, `crate::capacity` (tests only), `crate::config::ProviderConfig`, `crate::naming::{sha256_hex, AgentMarker, Names, SharedMarker}`.
+  - `render::DEFAULT_HARNESS: &str` and `render::harness_basename(agent: &AgentPayload) -> String`
+- Consumes: `buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY}`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::AgentPayload`, `crate::capacity` (tests only), `crate::config::ProviderConfig`, `crate::naming::{header_line, sha256_hex, shared_marker, AgentMarker, Names, BINDING_VERSION, MANAGED_BY, SHARED_SCOPE}`.
 
-**Classification is an allowlist of non-secret keys, not a denylist of known-secret ones.** A denylist leaves `BUZZ_AUTH_TAG` — a bearer credential the relay treats as interchangeable with a resolved owner pubkey (`docs/remote-agents.md:1416-1419`) — plus every `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GITHUB_TOKEN` that tiers 1 and 2 routinely carry, on the **persistent boot disk**, where a disk snapshot or image capture picks them up. The desktop already refuses to draw that distinction: `env_secrets_from_request` treats *every* non-empty value in `env_vars`, `launch.env`, and `launch.policy_env` as redaction-worthy (`backend.rs:395-415`), and its doc comment says why. A provider whose classification is narrower than the redaction defending it has the polarity backwards. The list below is closed and the default is *secret*, so a new authoritative key added to `buzz_backend_core::env` lands on the safe side without anyone remembering to classify it.
+**Classification is an allowlist of non-secret keys, not a denylist of known-secret ones.** A denylist leaves `BUZZ_AUTH_TAG` — a bearer credential the relay treats as interchangeable with a resolved owner pubkey (`docs/remote-agents.md:1416-1419`) — plus every `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `GITHUB_TOKEN` that tiers 1 and 2 routinely carry, on the **persistent boot disk**, where a disk snapshot or image capture picks them up. The desktop already refuses to draw that distinction: `env_secrets_from_request` treats *every* non-empty value in `env_vars`, `launch.env`, and `launch.policy_env` as redaction-worthy (`backend.rs:395-415`), and its doc comment says why. A provider whose classification is narrower than the redaction defending it has the policy backwards.
 
-**Six artifacts, not five.** The design's §Remote Artifacts lists five files; its §fetcher hardening independently requires the fetcher's `--project` to come from `cfg.project`. Those two requirements meet where the two-tier marker rule resolves them: `project` is per-agent configuration, the fetcher unit and script are *shared*, and a shared artifact must carry no per-agent data. So the project reaches the fetcher through a **sixth artifact** — a per-agent drop-in on `buzz-acp-secret@<short12>.service` carrying two `Environment=` lines. Both shared files then stay byte-identical across every agent, which is exactly what makes the strict no-op strict.
+**Six artifacts, not five.** The design's §Remote Artifacts lists five files; its §fetcher hardening independently requires the fetcher's `--project` to come from `cfg.project`. Those two requirements meet where the two-tier marker rule resolves them: `project` is per-agent configuration, the fetcher unit and script are *shared*, and a shared artifact must carry no per-agent data. So the project reaches the fetcher through a **sixth artifact** — a per-agent drop-in on `buzz-acp-secret@<short12>.service` carrying two `Environment=` lines. Both shared files then stay byte-identical across every agent, which is exactly what makes the strict no-op strict. The deploy trail is a seventh file but is *appended*, not installed, so it travels in `Plan::trail` rather than in `per_agent`.
+
+**`launch.command` is normalized to the VM's spelling before `build_env` sees it.** The desktop deliberately preserves an explicit host path (`desktop/src-tauri/src/managed_agents/discovery.rs:443-449`), the shared `build_env` writes `launch.command` through unchanged (`crates/buzz-backend-kubernetes/src/env.rs:254-259`), and `buzz-acp` execs that exact string (`crates/buzz-acp/src/acp.rs:451-459`). A payload carrying `/opt/homebrew/bin/codex-acp` therefore passes Task 12's installation check for `codex-acp` and then tries to exec a macOS path on Debian. The rewrite happens on a **projected copy of the payload, before `build_env` reads it**, rather than by patching the rendered map afterwards: a second consumer of `launch.command` added to `build_env` later would silently escape a post-hoc fix, and this one it cannot. The rewritten value is absolute (`/usr/local/bin/<basename>`) rather than bare, so the `test -x` that gates the deploy and the `exec` that follows it name the same file instead of both resolving a name against systemd's `PATH`. The harness's own per-command defaults are unaffected: `normalize_agent_command_identity` reduces the absolute form back to the basename (`crates/buzz-acp/src/config.rs:678-698`).
+
+**A digest of the secret payload is part of the create-intent.** Secret *values* stay out of everything readable — the marker lives in a 0644 file on a shared host — but leaving them out of the *fingerprint* meant an agent whose `auth_tag` or API key rotated, with nothing else changed, classified as `RestartSame`, which skips `secrets::store` and restarts against the previous secret version while reporting success. A `sha256` of the rendered secret body carries the divergence without carrying the material: confirming a guess against it requires already knowing the nsec the body contains, so it discloses nothing a reader did not already have. It also subsumes the secret *key* set, since adding or removing a key changes the body.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2243,6 +2486,7 @@ Resolves review **P1-7** and **P2-8**.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naming::is_shared_marker;
     use buzz_backend_core::wire::DeployRequest;
 
     /// A second valid nsec, for the cross-agent shared-artifact test.
@@ -2308,24 +2552,40 @@ mod tests {
         assert!(unit.contains("\nTimeoutStopSec=120\n"));
     }
 
-    /// The fetcher unit deliberately omits the agent unit's metadata block —
-    /// that block being cgroup-wide is the entire reason a second unit exists.
+    /// P2-4: Task 14's `[L3]` section and the README both enumerate this unit's
+    /// sandbox directives, and a directive that is documented but absent is
+    /// worse than one that is neither. The only omission is `IPAddressDeny`,
+    /// whose absence is this unit's entire reason to exist.
     #[test]
-    fn the_fetcher_unit_is_sandboxed_but_can_still_reach_the_metadata_server() {
+    fn the_fetcher_unit_carries_every_directive_the_docs_claim() {
         let p = plan_for(&request());
         let unit = shared(&p, "/buzz-acp-secret@.service");
         for directive in [
-            "ProtectSystem=strict",
-            "ProtectHome=true",
             "NoNewPrivileges=true",
             "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
             "RestrictSUIDSGID=true",
+            "RestrictRealtime=true",
             "LockPersonality=true",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "\nAmbientCapabilities=\n",
+            "\nTasksMax=128\n",
             "RuntimeDirectoryMode=0750",
+            "ReadWritePaths=-/run/buzz-acp-%i",
         ] {
             assert!(unit.contains(directive), "the fetcher unit lacks {directive}");
         }
+        // Exactly one capability, and it is the one `chown buzzacp` needs.
+        assert!(unit.contains("\nCapabilityBoundingSet=CAP_CHOWN\n"), "{unit}");
+        assert!(
+            !unit.contains("ReadWritePaths=/run\n"),
+            "the whole of /run is not this unit's runtime directory"
+        );
         assert!(
             !unit.contains("IPAddressDeny"),
             "IPAddressDeny would block the metadata fetch this unit exists to perform"
@@ -2343,6 +2603,9 @@ mod tests {
         assert!(script.contains("--project="), "explicit project, never ambient");
         assert!(script.contains("secret.env.tmp"), "atomic temp file");
         assert!(script.contains("mv -f"), "rename into place");
+        // Written as root, then tightened, then handed over — which is what
+        // keeps `CapabilityBoundingSet=` down to CAP_CHOWN.
+        assert!(script.contains("chown buzzacp:buzzacp"), "{script}");
         assert!(
             script.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             "a script run by systemd inherits systemd's environment, not a shell's"
@@ -2361,6 +2624,37 @@ mod tests {
         assert!(dropin.contains(&format!("Environment=BUZZ_GCP_SECRET={}", names.secret_name())));
         // …and the shared script stays identical for every agent and project.
         assert!(!shared(&p, "/buzz-acp-fetch-key").contains("other-project"));
+    }
+
+    /// P1-3: this drop-in is a **root-installed** unit file and `project`
+    /// reaches it as an `Environment=` value, which systemd parses for
+    /// whitespace, quotes and `%` specifiers. Task 4's closed grammar is what
+    /// makes the interpolation safe; this asserts the rendered value cannot be
+    /// anything the parser would treat specially, so the two stay in step.
+    #[test]
+    fn the_fetcher_dropin_environment_values_carry_no_systemd_metacharacters() {
+        let req = request();
+        let identity = AgentIdentity::from_nsec(&req.agent.private_key_nsec).unwrap();
+        let names = Names::new(&identity);
+        let p = plan(&req.agent, &gcp_config(), &names, &identity, "deadbeef").unwrap();
+        let dropin = per_agent(&p, &names.secret_dropin_path());
+        let assignments: Vec<&str> = dropin
+            .lines()
+            .filter_map(|line| line.strip_prefix("Environment="))
+            .collect();
+        assert_eq!(assignments.len(), 2, "{dropin}");
+        for assignment in assignments {
+            let (_, value) = assignment
+                .split_once('=')
+                .expect("an Environment= line is NAME=VALUE");
+            assert!(
+                value
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{assignment} carries a character systemd's Environment= parser \
+                 treats specially"
+            );
+        }
     }
 
     #[test]
@@ -2429,9 +2723,12 @@ mod tests {
         for a in &p.shared {
             surfaces.push((a.file.path.clone(), a.file.body.as_str()));
         }
-        surfaces.push(("trail header".into(), p.trail_header.as_str()));
+        surfaces.push(("trail header".into(), p.trail.body.as_str()));
         surfaces.push(("trail record".into(), record.as_str()));
         surfaces.push(("dry-run report".into(), report.as_str()));
+        // The intent now covers a *digest* of the secret payload; a digest of a
+        // value is not the value, and this is where that stops being a claim.
+        surfaces.push(("create-intent".into(), p.create_intent.as_str()));
         for warning in &warnings {
             surfaces.push(("stderr warning".into(), warning.as_str()));
         }
@@ -2506,19 +2803,20 @@ mod tests {
         let identity = AgentIdentity::from_nsec(&req.agent.private_key_nsec).unwrap();
         let p = plan_for(&req);
 
-        for f in &p.per_agent {
+        for f in p.per_agent.iter().chain(std::iter::once(&p.trail)) {
             let marker = AgentMarker::parse(&f.body)
                 .unwrap_or_else(|| panic!("{} carries no per-agent marker", f.path));
             assert_eq!(marker.pubkey_full, identity.pubkey_hex());
             assert_eq!(marker.create_intent, p.create_intent);
-            assert!(SharedMarker::parse(&f.body).is_none());
+            assert!(!is_shared_marker(&f.body));
         }
-        assert!(AgentMarker::parse(&p.trail_header).is_some());
 
         for a in &p.shared {
-            let marker = SharedMarker::parse(&a.file.body)
-                .unwrap_or_else(|| panic!("{} carries no provider-level marker", a.file.path));
-            assert_eq!(marker.content_hash, a.content_hash);
+            assert!(
+                is_shared_marker(&a.file.body),
+                "{} carries no provider-level marker",
+                a.file.path
+            );
             assert!(
                 AgentMarker::parse(&a.file.body).is_none(),
                 "{} claims an agent identity it cannot have",
@@ -2537,6 +2835,50 @@ mod tests {
         }
     }
 
+    /// P1-4 and P1-9 are only safe if the fence travels with the file: every
+    /// installed artifact declares the header its target must already carry,
+    /// so `Remote::install` cannot be called unguarded. And the declared lines
+    /// must be lines of the body we are about to write, or the next deploy
+    /// would refuse the file this one just installed.
+    #[test]
+    fn every_rendered_file_declares_the_marker_its_target_must_carry() {
+        let req = request();
+        let identity = AgentIdentity::from_nsec(&req.agent.private_key_nsec).unwrap();
+        let p = plan_for(&req);
+
+        let agent_lines = [
+            format!("# managed-by: {MANAGED_BY}"),
+            format!("# binding-version: {BINDING_VERSION}"),
+            format!("# agent-pubkey-full: {}", identity.pubkey_hex()),
+        ];
+        for f in p.per_agent.iter().chain(std::iter::once(&p.trail)) {
+            assert_eq!(f.owner_marker, agent_lines, "{}", f.path);
+            for line in &f.owner_marker {
+                assert!(
+                    f.body.lines().any(|l| l == line),
+                    "{} would refuse itself on the next deploy: no {line:?}",
+                    f.path
+                );
+            }
+        }
+
+        let shared_lines = [
+            format!("# managed-by: {MANAGED_BY}"),
+            format!("# binding-version: {BINDING_VERSION}"),
+            format!("# scope: {SHARED_SCOPE}"),
+        ];
+        for a in &p.shared {
+            assert_eq!(a.file.owner_marker, shared_lines, "{}", a.file.path);
+            for line in &a.file.owner_marker {
+                assert!(
+                    a.file.body.lines().any(|l| l == line),
+                    "{} would refuse itself on the next deploy: no {line:?}",
+                    a.file.path
+                );
+            }
+        }
+    }
+
     /// Two different agents must render byte-identical shared artifacts, or
     /// the "zero mutation, shared files included" no-op is unreachable.
     #[test]
@@ -2549,34 +2891,23 @@ mod tests {
         let digest = |p: &Plan| -> Vec<(String, String, String)> {
             p.shared
                 .iter()
-                .map(|s| {
-                    (
-                        s.file.path.clone(),
-                        s.content_hash.clone(),
-                        s.file.body.clone(),
-                    )
-                })
+                .map(|s| (s.file.path.clone(), s.sha256.clone(), s.file.body.clone()))
                 .collect()
         };
         assert_eq!(digest(&a), digest(&b));
     }
 
-    /// The declared content hash must be the hash of what is actually below
-    /// the header, or the observer's recomputation would disagree with every
-    /// freshly rendered file.
+    /// The digest the reconciler compares must be the digest of the exact bytes
+    /// that land on disk — header included, nothing stripped. The instance
+    /// answers with `sha256sum` over the whole file, so any asymmetry here
+    /// rewrites all three shared artifacts on every deploy.
     #[test]
-    fn a_shared_marker_declares_the_hash_of_its_own_body() {
-        let p = plan_for(&request());
-        for a in &p.shared {
-            let header = SharedMarker {
-                content_hash: a.content_hash.clone(),
-            }
-            .render();
-            let without_header = a.file.body.replace(header.as_str(), "");
+    fn a_shared_artifact_digest_covers_the_exact_bytes_installed() {
+        for a in &plan_for(&request()).shared {
             assert_eq!(
-                sha256_hex(without_header.as_bytes()),
-                a.content_hash,
-                "{} declares a hash of something other than its body",
+                sha256_hex(a.file.body.as_bytes()),
+                a.sha256,
+                "{} declares a digest of something other than itself",
                 a.file.path
             );
         }
@@ -2659,6 +2990,37 @@ mod tests {
         assert_ne!(a.create_intent, b.create_intent);
     }
 
+    /// P1-7: a rotated credential must diverge the intent. Otherwise the
+    /// reconciler classifies it `RestartSame`, skips `secrets::store`, and
+    /// restarts the agent against the previous secret version — a successful
+    /// restart for the operator and the old identity for the relay.
+    #[test]
+    fn a_rotated_credential_diverges_the_intent_without_exposing_it() {
+        let a = plan_for(&request());
+        let mut rotated = request();
+        rotated.agent.auth_tag = Some("tag-ROTATED-0001".into());
+        let b = plan_for(&rotated);
+        assert_ne!(
+            a.create_intent, b.create_intent,
+            "a rotated auth_tag must not look like the same deploy"
+        );
+        assert!(!b.create_intent.contains("ROTATED"));
+        for f in b.per_agent.iter().chain(std::iter::once(&b.trail)) {
+            assert!(!f.body.contains("tag-ROTATED-0001"), "{}", f.path);
+        }
+        // A key added to the payload diverges it too — the digest covers the
+        // whole body, so the key set comes along for free.
+        let mut renamed = request();
+        renamed
+            .agent
+            .launch
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("OPENAI_API_KEY".into(), "sk-x".into());
+        assert_ne!(a.create_intent, plan_for(&renamed).create_intent);
+    }
+
     /// v1 ships bounded lifetimes only, and the refusal must name the
     /// prerequisite rather than silently downgrading the request.
     #[test]
@@ -2673,14 +3035,59 @@ mod tests {
     }
 
     /// `launch.command` is resolved against the *desktop's* PATH, so only its
-    /// basename is meaningful on the instance.
+    /// basename is meaningful on the instance — and the default is what
+    /// `buzz-acp` actually execs when nothing is named. That is `goose`
+    /// (`crates/buzz-acp/src/config.rs:190-192`), **not** `buzz-acp`, which is
+    /// the supervisor doing the exec'ing.
     #[test]
-    fn the_harness_command_is_reduced_to_a_basename() {
+    fn the_harness_command_falls_back_to_the_harnesss_own_default() {
         let mut req = request();
         req.agent.launch.as_mut().unwrap().command = Some("/opt/homebrew/bin/codex-acp".into());
         assert_eq!(harness_basename(&req.agent), "codex-acp");
         req.agent.launch.as_mut().unwrap().command = None;
-        assert_eq!(harness_basename(&req.agent), "buzz-acp");
+        assert_eq!(harness_basename(&req.agent), DEFAULT_HARNESS);
+        assert_eq!(DEFAULT_HARNESS, "goose");
+        // A payload naming nothing still gets an explicit, absolute command, so
+        // Task 12's `test -x` and the harness's exec name the same file rather
+        // than both resolving a bare name against systemd's PATH.
+        let p = plan_for(&req);
+        assert!(
+            per_agent(&p, &names_for(&req).env_path())
+                .contains("BUZZ_ACP_AGENT_COMMAND=\"/usr/local/bin/goose\""),
+            "{}",
+            per_agent(&p, &names_for(&req).env_path())
+        );
+    }
+
+    /// P1-1: the *rendered environment* must carry the instance's spelling of
+    /// the harness, never the desktop's. A host path here passes the
+    /// installation check for its basename and then fails at exec on the VM.
+    #[test]
+    fn the_env_carries_the_instance_path_never_the_desktop_one() {
+        let mut req = request();
+        req.agent.launch.as_mut().unwrap().command = Some("/opt/homebrew/bin/codex-acp".into());
+        let names = names_for(&req);
+        let p = plan_for(&req);
+        let env = per_agent(&p, &names.env_path());
+        assert!(
+            env.contains("BUZZ_ACP_AGENT_COMMAND=\"/usr/local/bin/codex-acp\""),
+            "{env}"
+        );
+
+        let record = crate::capacity::trail_record("t", "g", &p.create_intent, &[]);
+        let report = dry_run_report(&p, &names, &record);
+        let secret = p.secret_body();
+        let mut surfaces: Vec<&str> = p.per_agent.iter().map(|f| f.body.as_str()).collect();
+        surfaces.extend(p.shared.iter().map(|a| a.file.body.as_str()));
+        surfaces.push(p.trail.body.as_str());
+        surfaces.push(secret.as_str());
+        surfaces.push(report.as_str());
+        for text in surfaces {
+            assert!(
+                !text.contains("/opt/homebrew"),
+                "the desktop's path reached the instance"
+            );
+        }
     }
 }
 ```
@@ -2699,10 +3106,14 @@ Prepend to `crates/buzz-backend-gcp/src/render.rs`:
 //!
 //! No IO: a payload in, the exact bytes of every file out. Every
 //! conformance-critical decision — supervision policy, the secret split, both
-//! marker tiers — is visible here and testable without touching GCP.
+//! marker tiers, the fence each file carries into its own install — is visible
+//! here and testable without touching GCP.
 
 use crate::config::ProviderConfig;
-use crate::naming::{sha256_hex, AgentMarker, Names, SharedMarker};
+use crate::naming::{
+    header_line, sha256_hex, shared_marker, AgentMarker, Names, BINDING_VERSION, MANAGED_BY,
+    SHARED_SCOPE,
+};
 use buzz_backend_core::env::{build_env, AuthoritativeInputs, START_NONCE_KEY};
 use buzz_backend_core::identity::AgentIdentity;
 use buzz_backend_core::wire::AgentPayload;
@@ -2734,6 +3145,23 @@ pub const NON_SECRET_KEYS: [&str; 9] = [
     "BUZZ_RELAY_URL",
 ];
 
+/// Where the instance keeps harness binaries.
+///
+/// Task 12 verifies `<HARNESS_DIR>/<basename>` with `test -x` before deploying
+/// and `launch.command` is rewritten to that same absolute path, so the check
+/// and the exec name one file rather than both resolving a bare name against
+/// systemd's `PATH` — which searches `/usr/local/sbin` first.
+const HARNESS_DIR: &str = "/usr/local/bin";
+
+/// The harness `buzz-acp` execs when the payload names none.
+///
+/// `goose`, not `buzz-acp`: `BUZZ_ACP_AGENT_COMMAND` defaults to `goose` in the
+/// harness's own CLI (`crates/buzz-acp/src/config.rs:190-192`), and `buzz-acp`
+/// is the supervisor that execs it, not the child. Naming the supervisor here
+/// would make the installation check verify a binary that is certainly present
+/// while the one that actually runs is missing.
+pub const DEFAULT_HARNESS: &str = "goose";
+
 /// A file to install on the instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
@@ -2741,17 +3169,29 @@ pub struct RemoteFile {
     /// Octal mode string passed to `install -m`.
     pub mode: &'static str,
     pub body: String,
+    /// The header lines the **installed** file must already carry if it exists.
+    ///
+    /// Attached at render time rather than passed to `Remote::install`, because
+    /// the renderer is the only place that knows each file's tier and this
+    /// agent's pubkey — and because a fence that travels with the file cannot
+    /// be forgotten at one of several call sites. `create-intent` is
+    /// deliberately excluded: it changes on every legitimate reconfiguration,
+    /// so requiring it would refuse a file this agent wrote yesterday.
+    pub owner_marker: Vec<String>,
 }
 
-/// A shared artifact plus the hash its provider-level marker declares.
+/// A shared artifact plus the digest of the exact bytes it installs.
 ///
-/// The hash travels alongside so the reconciler can decide "write or skip"
-/// without re-deriving it from a body that already embeds it.
+/// The digest is **not** written into the file and makes no claim about it: it
+/// is how the reconciler answers "is what is on the instance already
+/// byte-identical to what I would write?" without shipping the body twice. The
+/// instance answers with `sha256sum` over the whole file and the two are
+/// compared, so both sides are hashes of real bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedArtifact {
     pub file: RemoteFile,
-    /// SHA-256 of the artifact's content excluding the four marker lines.
-    pub content_hash: String,
+    /// SHA-256 of `file.body` in full, marker header included.
+    pub sha256: String,
 }
 
 /// Everything one deploy needs to write.
@@ -2761,16 +3201,19 @@ pub struct Plan {
     /// fenced replace.
     pub per_agent: Vec<RemoteFile>,
     /// Files shared by every instance. Written only when absent, or when the
-    /// installed content differs from what this provider would render.
+    /// installed bytes differ from what this provider would render.
     pub shared: Vec<SharedArtifact>,
     /// The Secret Manager payload. Never written to a file this provider
     /// installs, never logged, redacted by `dry-run`.
     pub secret_env: BTreeMap<String, String>,
     /// Fingerprint of everything that decides the unit's behavior, excluding
-    /// the generation and every secret *value*.
+    /// the generation and every secret *value* — though a digest of the secret
+    /// body is included, so a rotated credential is a divergence.
     pub create_intent: String,
-    /// The per-agent marker the deploy trail gets when it is first created.
-    pub trail_header: String,
+    /// The deploy trail. `body` is the four-line marker header the file gets
+    /// when it does not exist yet; records are **appended** to it, so it is
+    /// never installed like the others and does not live in `per_agent`.
+    pub trail: RemoteFile,
 }
 
 impl Plan {
@@ -2814,47 +3257,95 @@ fn env_file_body(env: &BTreeMap<String, String>, header: &str) -> String {
     out
 }
 
-/// Build a shared artifact: hash the content, then stamp the marker onto it.
+/// The header lines a per-agent target must already carry, if it exists at all.
+fn agent_owner_marker(pubkey_full: &str) -> Vec<String> {
+    vec![
+        header_line("managed-by", MANAGED_BY),
+        header_line("binding-version", BINDING_VERSION),
+        header_line("agent-pubkey-full", pubkey_full),
+    ]
+}
+
+/// The header lines a shared target must already carry, if it exists at all.
+fn shared_owner_marker() -> Vec<String> {
+    vec![
+        header_line("managed-by", MANAGED_BY),
+        header_line("binding-version", BINDING_VERSION),
+        header_line("scope", SHARED_SCOPE),
+    ]
+}
+
+/// Build a shared artifact: stamp the provider-level marker onto it, then hash
+/// the exact bytes that will land on disk.
 ///
-/// `prologue` is content that must precede the header — a shebang. It is part
-/// of the hashed content, so a tampered shebang is detected like any other
-/// content change.
+/// `prologue` is content that must precede the header — a shebang, which the
+/// kernel only honors on line 1. It is inside the hashed bytes like everything
+/// else, because the hash covers the file rather than a chosen part of it.
 fn shared_artifact(
     path: &str,
     mode: &'static str,
     prologue: &str,
     content: &str,
 ) -> SharedArtifact {
-    let content_hash = sha256_hex(format!("{prologue}{content}").as_bytes());
-    let marker = SharedMarker {
-        content_hash: content_hash.clone(),
-    };
+    let body = format!("{prologue}{}{content}", shared_marker());
+    let sha256 = sha256_hex(body.as_bytes());
     SharedArtifact {
         file: RemoteFile {
             path: path.to_string(),
             mode,
-            body: format!("{prologue}{}{content}", marker.render()),
+            body,
+            owner_marker: shared_owner_marker(),
         },
-        content_hash,
+        sha256,
     }
+}
+
+/// The bare binary name inside a `launch.command`, or the harness's own default
+/// when the payload names none or names only a directory.
+fn basename_or_default(command: Option<&str>) -> String {
+    command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .and_then(|command| command.rsplit('/').next())
+        .filter(|basename| !basename.is_empty())
+        .unwrap_or(DEFAULT_HARNESS)
+        .to_string()
 }
 
 /// The harness binary this agent needs, as a bare name.
 ///
 /// `launch.command` is resolved against the **desktop's** PATH; on the VM that
-/// path is meaningless, so only the basename carries over. `buzz-acp` is the
-/// default because that is what the unit's `ExecStart` runs when the payload
-/// names nothing.
+/// path is meaningless, so only the basename carries over. Task 12 uses this to
+/// decide which `/usr/local/bin/<name>` must exist before the deploy proceeds.
 pub fn harness_basename(agent: &AgentPayload) -> String {
+    basename_or_default(agent.launch.as_ref().and_then(|l| l.command.as_deref()))
+}
+
+/// A copy of `agent` whose `launch.command` is the **instance's** spelling of
+/// the harness.
+///
+/// The desktop deliberately preserves an explicit host path
+/// (`desktop/src-tauri/src/managed_agents/discovery.rs:443-449`), `build_env`
+/// writes `launch.command` through unchanged
+/// (`crates/buzz-backend-kubernetes/src/env.rs:254-259`), and `buzz-acp` execs
+/// that exact string (`crates/buzz-acp/src/acp.rs:451-459`). Left alone,
+/// `/opt/homebrew/bin/codex-acp` passes the installation check for `codex-acp`
+/// and then fails at exec on Debian.
+///
+/// Rewritten **here**, before `build_env` reads it, rather than by patching the
+/// rendered map afterwards: a second consumer of `launch.command` added to
+/// `build_env` later would escape a post-hoc fix and cannot escape this one.
+///
+/// A payload with no launch block at all is left untouched — inventing one
+/// would change owner resolution — so it reaches the harness's own default,
+/// which is the same binary `harness_basename` names.
+fn with_instance_harness(agent: &AgentPayload) -> AgentPayload {
+    let mut agent = agent.clone();
+    if let Some(launch) = agent.launch.as_mut() {
+        let basename = basename_or_default(launch.command.as_deref());
+        launch.command = Some(format!("{HARNESS_DIR}/{basename}"));
+    }
     agent
-        .launch
-        .as_ref()
-        .and_then(|launch| launch.command.as_deref())
-        .map(str::trim)
-        .filter(|command| !command.is_empty())
-        .and_then(|command| command.rsplit('/').next())
-        .unwrap_or("buzz-acp")
-        .to_string()
 }
 
 /// Render every artifact for one deploy.
@@ -2882,8 +3373,12 @@ pub fn plan(
         );
     };
 
+    // Before `build_env`, so no consumer of `launch.command` — this one or a
+    // future one — can observe the desktop's path.
+    let agent = with_instance_harness(agent);
+
     let env = build_env(
-        agent,
+        &agent,
         AuthoritativeInputs {
             generation,
             inactivity_seconds: Some(inactivity),
@@ -2918,6 +3413,7 @@ pub fn plan(
             secret_env.insert(key, value);
         }
     }
+    let secret_body = env_file_body(&secret_env, "");
 
     let shared = vec![
         shared_artifact(
@@ -2941,11 +3437,9 @@ pub fn plan(
     ];
 
     // The intent fingerprint covers everything that decides the unit's
-    // behavior, and deliberately excludes two things: the generation (which
+    // behavior, and deliberately excludes one thing: the generation, which
     // changes on every attempt, so including it would make every deploy look
-    // divergent) and every secret *value* (which must not be reconstructible
-    // from a marker any reader of a 0644 file can see). Secret *keys* are
-    // included, because adding or removing one does change behavior.
+    // divergent.
     let mut hasher = Sha256::new();
     let mut feed = |label: &str, value: &str| {
         hasher.update(label.as_bytes());
@@ -2960,15 +3454,20 @@ pub fn plan(
         feed("disk-key", key);
         feed("disk-value", value);
     }
-    for key in secret_env.keys() {
-        feed("secret-key", key);
-    }
+    // Secret keys *and* values, as one digest. The values must not be
+    // reconstructible from a marker any reader of a 0644 file can see — but
+    // leaving them out of the fingerprint entirely is what let a rotated
+    // credential classify as `RestartSame`, which skips `secrets::store` and
+    // restarts the agent against the previous secret version. A digest carries
+    // the divergence without carrying the material: confirming a guess against
+    // it requires already knowing the nsec the body contains.
+    feed("secret-digest", &sha256_hex(secret_body.as_bytes()));
     feed("memory_max", &cfg.memory_max);
     feed("cpu_quota", &cfg.cpu_quota);
     feed("project", &cfg.project);
     feed("secret-name", &names.secret_name());
     for artifact in &shared {
-        feed("shared", &artifact.content_hash);
+        feed("shared", &artifact.sha256);
     }
     let create_intent = hex::encode(hasher.finalize());
 
@@ -2977,12 +3476,14 @@ pub fn plan(
         create_intent: create_intent.clone(),
     }
     .render();
+    let owner_marker = agent_owner_marker(identity.pubkey_hex());
 
     let per_agent = vec![
         RemoteFile {
             path: names.env_path(),
             mode: "0600",
             body: env_file_body(&disk_env, &marker),
+            owner_marker: owner_marker.clone(),
         },
         RemoteFile {
             path: names.dropin_path(),
@@ -2991,13 +3492,17 @@ pub fn plan(
                 "{marker}[Service]\nMemoryMax={}\nCPUQuota={}\n",
                 cfg.memory_max, cfg.cpu_quota
             ),
+            owner_marker: owner_marker.clone(),
         },
         RemoteFile {
             path: names.secret_dropin_path(),
             mode: "0644",
             // The fetcher's two inputs. They live here, per agent, rather than
             // in the shared script, because a shared artifact carries no
-            // per-agent data — see the tier rules in `naming.rs`.
+            // per-agent data — see the tier rules in `naming.rs`. Both values
+            // are safe unquoted because both come from closed grammars:
+            // `project` from `config::parse_resource_name`, the secret name
+            // from the 12-hex instance.
             body: format!(
                 "{marker}[Service]\n\
                  Environment=BUZZ_GCP_PROJECT={}\n\
@@ -3005,6 +3510,7 @@ pub fn plan(
                 cfg.project,
                 names.secret_name()
             ),
+            owner_marker: owner_marker.clone(),
         },
     ];
 
@@ -3013,7 +3519,12 @@ pub fn plan(
         shared,
         secret_env,
         create_intent,
-        trail_header: marker,
+        trail: RemoteFile {
+            path: names.trail_path(),
+            mode: "0644",
+            body: marker,
+            owner_marker,
+        },
     })
 }
 
@@ -3042,8 +3553,11 @@ pub fn dry_run_report(plan: &Plan, names: &Names, trail_record: &str) -> String 
         ));
         out.push_str(&artifact.file.body);
     }
-    out.push_str(&format!("\n=== {} (mode 0644) ===\n", names.trail_path()));
-    out.push_str(&plan.trail_header);
+    out.push_str(&format!(
+        "\n=== {} (mode {}) ===\n",
+        plan.trail.path, plan.trail.mode
+    ));
+    out.push_str(&plan.trail.body);
     out.push_str(trail_record);
     out.push_str(&format!(
         "\n=== secretmanager://{} (values redacted) ===\n",
@@ -3114,10 +3628,23 @@ WantedBy=multi-user.target
 /// systemd's *manager* reads `EnvironmentFile=` as root before dropping to
 /// `User=buzzacp` — proven on this host by the running `buzz-acp.service`,
 /// which has `User=buzzacp` and `EnvironmentFile=/etc/buzz/acp.env` at mode
-/// 0600 root:root and starts.
+/// 0600 root:root and starts. The agent *process* therefore never needs to
+/// traverse this directory itself, and 0750 root:root is what stops it.
 ///
-/// Every sandbox directive from the agent unit is carried over except
-/// `IPAddressDeny`, whose absence is this unit's entire reason to exist.
+/// It carries every sandbox directive the agent unit does, with exactly three
+/// deliberate differences:
+///
+/// * **No `IPAddressDeny`** — the absence is this unit's entire reason to exist.
+/// * **`CapabilityBoundingSet=CAP_CHOWN`, not empty.** The fetched file is
+///   `chown`ed to `buzzacp` so the manager can hand it to the agent unit as an
+///   `EnvironmentFile=`; with an empty bounding set that `chown` fails with
+///   EPERM even as root, and the agent starts *without* `BUZZ_AUTH_TAG` — a
+///   failure that looks nothing like a permissions error. One capability, for
+///   one syscall, and the script is ordered so no second one is needed.
+/// * **`ReadWritePaths=-/run/buzz-acp-%i`, not `/var/lib/buzzacp`.** Scoped to
+///   this instance's own runtime directory and nothing else. The `-` prefix
+///   tolerates the path not existing yet when the mount namespace is built;
+///   `RuntimeDirectory=` creates it for this unit either way.
 const FETCHER_UNIT: &str = "\
 [Unit]
 Description=Materialize the Buzz agent secret environment for %i
@@ -3132,12 +3659,20 @@ RuntimeDirectoryMode=0750
 ExecStart=/usr/local/sbin/buzz-acp-fetch-key %i
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/run
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
 LockPersonality=true
+CapabilityBoundingSet=CAP_CHOWN
+AmbientCapabilities=
+ReadWritePaths=-/run/buzz-acp-%i
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=128
 StandardOutput=journal
 StandardError=journal
 ";
@@ -3186,17 +3721,23 @@ tmp="$dir/secret.env.tmp"
 umask 077
 trap 'rm -f "$tmp"' EXIT
 
-# Created with its final mode and owner, then filled, then renamed. A partial
-# secret.env is not a truncated key — it is an EnvironmentFile missing its
-# later lines, which for this binding's allowlist means an agent that starts
-# *without* BUZZ_AUTH_TAG and fails identity assembly for a reason that looks
-# nothing like a write error. `mv` within one tmpfs is a rename, so the agent
-# unit never observes a half-written file. The fetched value is never echoed:
-# the journal is output, and L2 item 5 forbids secret material there.
-install -m 0400 -o buzzacp -g buzzacp /dev/null "$tmp"
+# Filled while it is still root-owned and writable, then tightened, then handed
+# over, then renamed. That order is what keeps this unit's capability set at
+# exactly CAP_CHOWN: creating the file 0400 buzzacp *first* would make the
+# redirect below fail with EACCES for a root process without CAP_DAC_OVERRIDE,
+# and chmod after chown would need CAP_FOWNER. `mv` within one tmpfs is a
+# rename, so the agent unit never observes a half-written file — and a partial
+# secret.env is not a truncated key, it is an EnvironmentFile missing its later
+# lines, which for this binding's allowlist means an agent that starts *without*
+# BUZZ_AUTH_TAG and fails identity assembly for a reason that looks nothing like
+# a write error. The fetched value is never echoed: the journal is output, and
+# L2 item 5 forbids secret material there.
+install -m 0600 /dev/null "$tmp"
 gcloud secrets versions access latest \
   --project="$BUZZ_GCP_PROJECT" \
   --secret="$BUZZ_GCP_SECRET" > "$tmp"
+chmod 0400 "$tmp"
+chown buzzacp:buzzacp "$tmp"
 mv -f "$tmp" "$out"
 trap - EXIT
 "#;
@@ -3228,7 +3769,7 @@ Remove the two `#[ignore]` attributes added in Task 5 Step 7.
 - [ ] **Step 5: Run the full crate suite**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 20 `render` tests, plus `deploy_responses_match_their_fixtures` now matching all four goldens (`deploy-no-owner` from `build_env`, `deploy-ordinary-provider` from the indefinite-lifetime refusal) and `an_ordinary_provider_is_not_refused_as_shared_compute` no longer ignored.
+Expected: PASS — 24 `render` tests, plus `deploy_responses_match_their_fixtures` now matching all four goldens (`deploy-no-owner` from `build_env`, `deploy-ordinary-provider` from the indefinite-lifetime refusal) and `an_ordinary_provider_is_not_refused_as_shared_compute` no longer ignored.
 
 - [ ] **Step 6: Commit**
 
@@ -3240,7 +3781,7 @@ git add -A && git commit -s -m "feat(backend-gcp): render six artifacts across t
 
 ## Task 8: Capacity arithmetic and the durable deploy trail
 
-Resolves review **P1-1**.
+Resolves review **P1-1**, and the writer half of round 2's **P2-1** (the capacity warning is findable but never found).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/capacity.rs`
@@ -3257,6 +3798,8 @@ Resolves review **P1-1**.
 **Why the warning is written to the instance and not only to stderr.** `invoke_provider` builds `stderr_redacted` and consults it in exactly two places: when the child exited non-zero (`backend.rs:252-260`) and when no line of stdout parses as JSON (`:271-280`). On a successful deploy it falls through to `Ok(response)` at `:287` and the buffer is dropped; `provider_deploy` then reads one field, `agent_id` (`:529-532`). A successful deploy carrying a capacity warning is a clean success in the UI, followed later by an OOM kill with nothing connecting the two. Adding a `warning` field to the response would not be *rejected* — the unknown-field check exists only for `info` (`:48-63`) — it would simply never be read, and `docs/remote-agents.md:421` defines the deploy response as `{"ok": true, "agent_id": str}`, so inventing a field is a protocol change this binding has no authority to make unilaterally. The warning is therefore recorded durably in the per-agent trail, and `list` surfaces it (Task 13). The same text still goes to stderr, which costs nothing and *is* surfaced on the two failure paths above.
 
 The trail obeys the same [L2] item 5 rule as any other output: timestamps, the generation, the create-intent digest, and capacity arithmetic — **never an environment value**. It is a 0644 file on a shared host, so treating it as public is the only safe reading.
+
+**The `warning ` prefix is a contract, not a spelling.** `operator::listing_script` greps the trail for lines beginning `warning ` and `render_listing` indents them under their unit's row. Nothing about that survives a rename of the prefix — and until round 2 nothing tested it, because the writer and the reader were each checked against hand-typed fixtures that happened to agree. Two tests close the loop from both ends: this task asserts the shape at the source, and Task 13 Step 1 feeds this function's **real** output through the real reader. Task 15 Step 9 then deploys an actually over-capacity agent, because a format both sides agree on is still worthless if no deploy ever produces one.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3317,6 +3860,31 @@ mod tests {
     fn a_clean_deploy_still_leaves_a_record() {
         let record = trail_record("2026-08-05T09:14:02Z", "3f9c1a04", &"a".repeat(64), &[]);
         assert_eq!(record.lines().count(), 1);
+    }
+
+    /// The reader greps the trail for lines beginning `warning `
+    /// (`operator::listing_script`), so that prefix is a contract between two
+    /// modules rather than an incidental spelling. Task 13 Step 1 feeds this
+    /// function's real output through the real reader; this asserts the shape
+    /// that grep depends on, at the source.
+    #[test]
+    fn every_warning_line_carries_the_prefix_the_reader_greps_for() {
+        let warnings = warning_lines(GIB, GIB, "buzz-acp@abc.service", GIB);
+        assert!(!warnings.is_empty(), "this fixture must overcommit");
+        let record = trail_record(
+            "2026-08-05T09:14:02Z",
+            "3f9c1a04",
+            &"a".repeat(64),
+            &warnings,
+        );
+        let recorded: Vec<&str> = record.lines().skip(1).collect();
+        assert_eq!(recorded.len(), warnings.len(), "one line per warning");
+        for line in &recorded {
+            assert!(
+                line.starts_with("warning "),
+                "the reader's grep would drop {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -3437,7 +4005,7 @@ Add `mod capacity;` to `main.rs`.
 - [ ] **Step 4: Run the whole crate**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — the 6 capacity tests plus every earlier test, including `no_secret_classified_value_reaches_any_artifact`, which now compiles because `crate::capacity` exists.
+Expected: PASS — the 7 capacity tests plus every earlier test, including `no_secret_classified_value_reaches_any_artifact`, which now compiles because `crate::capacity` exists.
 
 - [ ] **Step 5: Commit**
 
@@ -3449,7 +4017,7 @@ git add -A && git commit -s -m "feat(backend-gcp): capacity warning and durable 
 
 ## Task 9: `remote.rs` — the IAP SSH transport
 
-Resolves review **P1-2**.
+Resolves review **P1-2**, and round 2's **P1-9** (atomic installs), the write half of **P1-4** (each install is fenced on its own target's marker), and the transport half of **P1-8** (the exit codes the deploy lease and the narrowed fence speak).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/remote.rs`
@@ -3458,17 +4026,22 @@ Resolves review **P1-2**.
 **Interfaces:**
 - Produces:
   - `remote::Output { stdout: String, stderr: String, code: i32 }` with `ok(&self) -> bool`
-  - `remote::Remote::new(project: &str, zone: &str, instance: &str) -> Result<Remote, String>`
-  - `Remote::gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>`
+  - `remote::Gcloud` — one method, `gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>`, implemented by `Remote`
+  - `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED}: i32` and `remote::MARKER_SCAN_LINES: usize`
+  - `remote::Remote::new(project: &str, zone: &str, instance: &str) -> Result<Remote, String>` with `token(&self) -> &str`
   - `Remote::run(&self, script: &str) -> Result<Output, String>`
   - `Remote::install(&self, file: &RemoteFile) -> Result<(), String>`
-  - `Remote::append(&self, path: &str, mode: &str, header: &str, record: &str) -> Result<(), String>`
-  - `remote::sq(value: &str) -> String` — POSIX single-quoting, reused by `observe` and `operator`
-- Consumes: `crate::render::RemoteFile`.
+  - `Remote::append(&self, file: &RemoteFile, record: &str) -> Result<(), String>`
+  - `remote::sq(value: &str) -> String` — POSIX single-quoting, reused by `observe`, `reconcile` and `operator`
+- Consumes: `crate::naming::BINDING_VERSION`, `crate::render::RemoteFile`, `buzz_backend_core::identity::new_generation`.
 
 **Security rule for this module:** no secret value may ever appear in an argv element. Bodies go on stdin. That is enforced structurally by `install` taking the whole `RemoteFile` and never formatting `body` into a command string, and it is sound because `gcloud compute ssh` execs a real `ssh` that forwards local stdin to the remote command (measured — see Global Constraints).
 
-**Why `PATH` is prepended.** The provider is exec'd by a Tauri app inheriting launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. `gcloud` installs to `/opt/homebrew/bin`, `/usr/local/bin`, or `~/.local/bin` — none of which are on that `PATH` — so a bare `Command::new("gcloud")` fails to resolve for a reason that has nothing to do with GCP. The Kubernetes binding already carries this exact fix and names the same cause (`crates/buzz-backend-kubernetes/src/client.rs:12-47`). Two details carry over verbatim because they are the parts that are easy to get wrong: mutating the process's own `PATH` is sound here (one process per operation, done before any child exists, `client.rs:36-40`), and empty entries in the inherited `PATH` are **dropped** rather than propagated, because an empty entry resolves as the current directory (`client.rs:29-32`).
+**Every install is atomic and self-fencing.** Two round-2 findings meet in one script, and neither is safe alone. P1-9: a dropped connection mid-install used to leave a truncated file at the *target* path. P1-4: the fence must refuse any present file whose own header is not this agent's — which would turn every such fragment into a permanent, operator-only jam. Writing to `<path>.<token>.tmp` and `mv`ing into place means the target is never observed half-written, so the fence can be strict without being a trap. The guard sits in the same shell as the write, which is also the narrowest place to put it: an ownership check performed in an earlier round trip is a TOCTOU with a four-round-trip window.
+
+**Exit codes the remote scripts speak.** Four numeric codes carry refusals back: a refusal is not a transport failure and must not read as one. The caller turns each into a sentence naming the path and the remedy; the script itself stays silent, because it does not know which of six callers is speaking or what the operator is trying to do. Codes are drawn from the `sysexits.h` range, well clear of the 1-2 that `sudo`, `install` and `systemctl` return and of 126/127 for exec failures.
+
+**Why `PATH` is prepended.** The provider is exec'd by a Tauri app inheriting launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. `gcloud` installs to `/opt/homebrew/bin`, `/usr/local/bin`, or `~/.local/bin` — none of which are on that `PATH` — so a bare `Command::new("gcloud")` fails to resolve for a reason that has nothing to do with GCP. The Kubernetes binding already carries this exact fix and names the same cause (`crates/buzz-backend-kubernetes/src/client.rs:12-47`). Two details carry over verbatim because they are the parts that are easy to get wrong: mutating the process's own `PATH` is sound here (one process per operation, done before any child exists, `client.rs:36-40`), and empty entries in the inherited `PATH` are **dropped** rather than propagated, because POSIX resolves an empty entry as the current directory.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3478,23 +4051,35 @@ Resolves review **P1-2**.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naming::{header_line, MANAGED_BY};
     use std::ffi::OsString;
+
+    /// The three header lines a per-agent target must already carry.
+    /// `create-intent` is deliberately absent: it changes on every legitimate
+    /// reconfiguration, so requiring it would refuse a file this agent wrote.
+    fn marker_lines() -> Vec<String> {
+        vec![
+            header_line("managed-by", MANAGED_BY),
+            header_line("binding-version", BINDING_VERSION),
+            header_line("agent-pubkey-full", &"ab".repeat(32)),
+        ]
+    }
 
     fn file(path: &str, mode: &'static str, body: &str) -> RemoteFile {
         RemoteFile {
             path: path.to_string(),
             mode,
             body: body.to_string(),
+            owner_marker: marker_lines(),
         }
     }
 
     #[test]
     fn the_install_command_never_carries_the_body() {
-        let script = install_script(&file(
-            "/etc/buzz/acp-abc.env",
-            "0600",
-            "SUPER_SENSITIVE=1\n",
-        ));
+        let script = install_script(
+            &file("/etc/buzz/acp-abc.env", "0600", "SUPER_SENSITIVE=1\n"),
+            "t0ken",
+        );
         assert!(script.contains("/dev/stdin"));
         assert!(script.contains("'/etc/buzz/acp-abc.env'"));
         assert!(script.contains("-m 0600"));
@@ -3504,13 +4089,67 @@ mod tests {
         );
     }
 
+    /// P1-9: a dropped connection must never leave a fragment at the target
+    /// path. Stage with the final mode, then `mv` — a rename within one
+    /// directory, so the target goes from old bytes to new with nothing in
+    /// between.
+    #[test]
+    fn an_install_stages_and_renames_rather_than_writing_in_place() {
+        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        assert!(
+            script.contains(&sq("/etc/buzz/acp-abc.env.t0ken.tmp")),
+            "{script}"
+        );
+        assert!(script.contains("sudo -n install -m 0600 /dev/stdin"), "{script}");
+        assert!(script.contains("sudo -n mv -f"), "{script}");
+        let staged = script.find("install -m").expect("the staged write");
+        let rename = script.find("mv -f").expect("the rename");
+        assert!(
+            staged < rename,
+            "the body is written before it is renamed: {script}"
+        );
+        // The staging path carries the per-process token, so two providers
+        // installing the same shared artifact cannot collide on it.
+        assert!(script.contains("t0ken"), "{script}");
+        assert!(script.contains("trap"), "a refusal must not leak the staged file");
+    }
+
+    /// P1-4: the target's own marker vetoes the write, in the same shell as the
+    /// write — and stdin is drained before the veto can fire, so a clean
+    /// refusal never surfaces as a broken pipe.
+    #[test]
+    fn an_install_refuses_a_target_carrying_somebody_elses_marker() {
+        let script = install_script(&file("/etc/buzz/acp-abc.env", "0600", "X=1\n"), "t0ken");
+        for required in marker_lines() {
+            assert!(
+                script.contains(&sq(&required)),
+                "the guard omits {required:?}"
+            );
+        }
+        assert!(script.contains(&OWNERSHIP_REFUSED.to_string()), "{script}");
+        assert!(
+            !script.contains("create-intent"),
+            "requiring the intent would refuse a file this agent wrote: {script}"
+        );
+        let drained = script.find("/dev/stdin").expect("the staged write");
+        let guard = script.find("grep -c").expect("the ownership guard");
+        let rename = script.find("mv -f").expect("the rename");
+        assert!(
+            drained < guard && guard < rename,
+            "drain, then check, then rename: {script}"
+        );
+    }
+
     #[test]
     fn every_privileged_step_is_non_interactive() {
-        let script = install_script(&file(
-            "/etc/systemd/system/buzz-acp@abc.service.d/agent.conf",
-            "0644",
-            "",
-        ));
+        let script = install_script(
+            &file(
+                "/etc/systemd/system/buzz-acp@abc.service.d/agent.conf",
+                "0644",
+                "",
+            ),
+            "t0ken",
+        );
         assert!(script.contains("sudo -n mkdir -p '/etc/systemd/system/buzz-acp@abc.service.d'"));
         assert!(script.contains("sudo -n install"));
         // A bare `sudo` on a prompting host would consume the piped body as
@@ -3522,11 +4161,13 @@ mod tests {
     }
 
     #[test]
-    fn the_append_script_creates_the_file_once_then_appends() {
-        let script = append_script("/etc/buzz/acp-abc.trail", "0644", "# managed-by: x\n");
+    fn the_append_script_creates_the_file_once_then_appends_behind_the_same_fence() {
+        let script = append_script(&file("/etc/buzz/acp-abc.trail", "0644", "# managed-by: x\n"));
         assert!(script.contains("if [ ! -e '/etc/buzz/acp-abc.trail' ]"));
         assert!(script.contains("sudo -n install -m 0644 /dev/stdin '/etc/buzz/acp-abc.trail'"));
         assert!(script.contains("sudo -n tee -a '/etc/buzz/acp-abc.trail'"));
+        // A trail that is not ours must not be appended to either.
+        assert!(script.contains(&OWNERSHIP_REFUSED.to_string()), "{script}");
     }
 
     /// `gcloud` already selects `StrictHostKeyChecking=yes` against its own
@@ -3623,7 +4264,9 @@ Prepend to `crates/buzz-backend-gcp/src/remote.rs`:
 //! bytes in and a matching md5 out. That is what makes the stdin install path
 //! sound with no `scp` staging and no remote temp file.
 
+use crate::naming::BINDING_VERSION;
 use crate::render::RemoteFile;
+use buzz_backend_core::identity::new_generation;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -3636,6 +4279,24 @@ use std::process::{Command, Stdio};
 /// installs to. Same fix and same cause as
 /// `crates/buzz-backend-kubernetes/src/client.rs:12-19`.
 const PATH_PREPEND: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// "This path is present but is not this agent's." Not a transport failure,
+/// and must not read as one.
+pub const OWNERSHIP_REFUSED: i32 = 76;
+/// "Another deploy of this agent holds the instance lease."
+pub const LOCK_UNAVAILABLE: i32 = 75;
+/// "The authorizing marker moved between the observation and the write."
+pub const MARKER_CHANGED: i32 = 77;
+/// "The agent started between the observation and the stop."
+pub const AGENT_STARTED: i32 = 78;
+
+/// How many leading lines of a file can hold a marker header.
+///
+/// Four, not three: a per-agent header is four lines starting at line 1, while
+/// a shared header is three lines starting at line 2 when a shebang precedes
+/// it. One bound covers both, because the checks count exact whole-line
+/// matches rather than comparing a fixed slice.
+pub const MARKER_SCAN_LINES: usize = 4;
 
 /// One completed `gcloud` invocation.
 pub struct Output {
@@ -3654,11 +4315,22 @@ impl Output {
     }
 }
 
+/// The one capability `secrets` needs from a transport.
+///
+/// A trait rather than the concrete `Remote` because the ownership discipline
+/// `secrets` enforces is a property of the **command sequence** — describe,
+/// verify, mutate, describe, verify, mutate — and a sequence can only be tested
+/// by recording it. `Remote` is the sole production implementation.
+pub trait Gcloud {
+    fn gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String>;
+}
+
 /// A bound instance this provider can run commands on.
 pub struct Remote {
     project: String,
     zone: String,
     instance: String,
+    token: String,
 }
 
 /// Quote a value for a single-quoted POSIX shell context.
@@ -3714,34 +4386,107 @@ fn gcloud_not_found() -> String {
     )
 }
 
-/// The remote script that installs one file, reading its body from stdin.
-fn install_script(file: &RemoteFile) -> String {
+/// The shell fragment that refuses to touch an existing file whose own header
+/// is not ours.
+///
+/// `head -n MARKER_SCAN_LINES` rather than an exact slice: a shared artifact
+/// carries a shebang on line 1, so its three header lines sit at 2-4, while a
+/// per-agent artifact's four start at line 1. Counting exact whole-line matches
+/// makes the check independent of which.
+///
+/// The refusal carries no message. The caller knows the path, the reason and
+/// which of several operations is speaking; the script knows none of that, and
+/// a generic sentence from the wrong layer is worse than a number.
+///
+/// An empty `required` means unguarded, which `render::plan` never produces —
+/// that invariant is asserted where it is established (Task 7), not defended
+/// again here.
+fn marker_guard(path: &str, required: &[String]) -> String {
+    if required.is_empty() {
+        return String::new();
+    }
+    let needles: String = required
+        .iter()
+        .map(|line| format!(" -e {}", sq(line)))
+        .collect();
+    format!(
+        "if sudo -n test -e {path}; then \
+           n=$(sudo -n head -n {scan} {path} | grep -c -F -x{needles} || true); \
+           [ \"$n\" -eq {count} ] || exit {refused}; \
+         fi\n",
+        path = sq(path),
+        scan = MARKER_SCAN_LINES,
+        needles = needles,
+        count = required.len(),
+        refused = OWNERSHIP_REFUSED,
+    )
+}
+
+/// The remote script that installs one file: body from stdin, atomically, and
+/// only over a target whose own marker says it is ours.
+///
+/// Three properties, each load-bearing:
+///
+/// * **stdin is drained first.** The body reaches the staging path *before* the
+///   guard can exit, so a refusal cannot close the pipe under a local
+///   `write_all` still in flight and turn a clean refusal into a transport
+///   error.
+/// * **The target is never observed half-written.** `mv` within one directory
+///   is a `rename(2)`: the target goes from old bytes to new with nothing in
+///   between. Without this a dropped connection leaves a truncated file with no
+///   complete marker, which the guard must then refuse forever — P1-9 and P1-4
+///   are only safe together.
+/// * **The guard runs in the same shell as the write.** An ownership check
+///   performed in an earlier round trip is a TOCTOU with a four-round-trip
+///   window; here it is one `rename`.
+///
+/// The staging path carries the per-process token, so two providers installing
+/// the same shared artifact at the same moment cannot collide on it, and the
+/// `trap` removes it on every exit path including the guard's refusal.
+fn install_script(file: &RemoteFile, token: &str) -> String {
     let parent = Path::new(&file.path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
+    let staged = sq(&format!("{}.{token}.tmp", file.path));
     format!(
-        "set -euo pipefail; sudo -n mkdir -p {}; sudo -n install -m {} /dev/stdin {}",
-        sq(&parent),
-        file.mode,
-        sq(&file.path),
+        "set -euo pipefail\n\
+         sudo -n mkdir -p {parent}\n\
+         trap \"sudo -n rm -f {staged}\" EXIT\n\
+         sudo -n install -m {mode} /dev/stdin {staged}\n\
+         {guard}\
+         sudo -n mv -f {staged} {path}\n\
+         trap - EXIT\n",
+        parent = sq(&parent),
+        staged = staged,
+        mode = file.mode,
+        guard = marker_guard(&file.path, &file.owner_marker),
+        path = sq(&file.path),
     )
 }
 
-/// The remote script that appends one record, creating the file with `header`
-/// if it is absent.
+/// The remote script that appends one record to a file, creating it with
+/// `file.body` — its marker header — when absent.
 ///
-/// The header is a marker — pubkey, binding version, create-intent — all of
-/// which are public, so passing it in argv is safe. The *record* travels on
-/// stdin along with everything a capacity warning might carry.
-fn append_script(path: &str, mode: &str, header: &str) -> String {
+/// The header is a marker: pubkey, binding version, create-intent, all public,
+/// so passing it in argv is safe. The *record* travels on stdin along with
+/// everything a capacity warning might carry.
+///
+/// Fenced like an install, but not staged: an append has no half-written-target
+/// failure mode, and the record is a few hundred bytes — well inside a pipe
+/// buffer — so a guard refusal returns long before the local write could block.
+fn append_script(file: &RemoteFile) -> String {
     format!(
-        "set -euo pipefail; \
-         if [ ! -e {path} ]; then printf '%s' {header} | sudo -n install -m {mode} /dev/stdin {path}; fi; \
-         sudo -n tee -a {path} > /dev/null",
-        path = sq(path),
-        mode = mode,
-        header = sq(header),
+        "set -euo pipefail\n\
+         {guard}\
+         if [ ! -e {path} ]; then \
+           printf '%s' {header} | sudo -n install -m {mode} /dev/stdin {path}; \
+         fi\n\
+         sudo -n tee -a {path} > /dev/null\n",
+        guard = marker_guard(&file.path, &file.owner_marker),
+        path = sq(&file.path),
+        mode = file.mode,
+        header = sq(&file.body),
     )
 }
 
@@ -3769,6 +4514,51 @@ fn ssh_argv(project: &str, zone: &str, instance: &str, script: &str) -> Vec<Stri
     ]
 }
 
+impl Gcloud for Remote {
+    /// Invoke `gcloud`, optionally piping `stdin`. Never logs `stdin`.
+    fn gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String> {
+        let mut child = Command::new("gcloud")
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{} ({e})", gcloud_not_found()))?;
+        if let Some(body) = stdin {
+            let mut pipe = child
+                .stdin
+                .take()
+                .ok_or_else(|| "gcloud stdin was not available".to_string())?;
+            // A remote script that refuses before reading closes the pipe, so a
+            // `BrokenPipe` here is that refusal arriving early — not a transport
+            // failure. The exit code and stderr collected below are what report
+            // it, and returning an IO error instead would bury the real reason.
+            // Rust sets SIGPIPE to ignore at startup, so this surfaces as an
+            // `Err` rather than killing the process. Any other IO error is real.
+            if let Err(e) = pipe.write_all(body.as_bytes()) {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(format!("writing to gcloud stdin failed: {e}"));
+                }
+            }
+            // Dropped explicitly: the child waits for EOF, and a pipe held open
+            // by a named binding would deadlock `wait_with_output`.
+            drop(pipe);
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("waiting for gcloud failed: {e}"))?;
+        Ok(Output {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            code: out.status.code().unwrap_or(-1),
+        })
+    }
+}
+
 impl Remote {
     /// Bind to an instance, resolving `gcloud` first.
     ///
@@ -3784,38 +4574,16 @@ impl Remote {
             project: project.to_string(),
             zone: zone.to_string(),
             instance: instance.to_string(),
+            // One per provider process, which is one per operation.
+            token: new_generation(),
         })
     }
 
-    /// Invoke `gcloud`, optionally piping `stdin`. Never logs `stdin`.
-    pub fn gcloud(&self, args: &[&str], stdin: Option<&str>) -> Result<Output, String> {
-        let mut child = Command::new("gcloud")
-            .args(args)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{} ({e})", gcloud_not_found()))?;
-        if let Some(body) = stdin {
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| "gcloud stdin was not available".to_string())?
-                .write_all(body.as_bytes())
-                .map_err(|e| format!("writing to gcloud stdin failed: {e}"))?;
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("waiting for gcloud failed: {e}"))?;
-        Ok(Output {
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            code: out.status.code().unwrap_or(-1),
-        })
+    /// This process's token, mixed into every staging path and into the deploy
+    /// lease record, so two concurrent providers can neither collide on a
+    /// staging path nor release each other's lease.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// Run a shell script on the instance over IAP.
@@ -3829,9 +4597,23 @@ impl Remote {
         self.gcloud(&borrowed, stdin)
     }
 
-    /// Install one file, body on stdin.
+    /// The refusal for a target that exists and is not this agent's.
+    fn not_ours(&self, path: &str, verb: &str) -> String {
+        format!(
+            "{path} is present on the instance but does not carry this agent's \
+             marker at binding version {BINDING_VERSION}. Refusing to {verb} a \
+             file this provider did not write for this agent — it was left \
+             exactly as it was. Move it aside, or run `buzz-backend-gcp list` \
+             to see which agent owns it."
+        )
+    }
+
+    /// Install one file, body on stdin, atomically, behind its own guard.
     pub fn install(&self, file: &RemoteFile) -> Result<(), String> {
-        let out = self.run_with_stdin(&install_script(file), Some(&file.body))?;
+        let out = self.run_with_stdin(&install_script(file, &self.token), Some(&file.body))?;
+        if out.code == OWNERSHIP_REFUSED {
+            return Err(self.not_ours(&file.path, "overwrite"));
+        }
         if !out.ok() {
             // `file.body` is deliberately absent from this message.
             return Err(format!(
@@ -3844,18 +4626,16 @@ impl Remote {
         Ok(())
     }
 
-    /// Append one record to a file, creating it with `header` when absent.
-    pub fn append(
-        &self,
-        path: &str,
-        mode: &str,
-        header: &str,
-        record: &str,
-    ) -> Result<(), String> {
-        let out = self.run_with_stdin(&append_script(path, mode, header), Some(record))?;
+    /// Append one record, creating the file with its marker header when absent.
+    pub fn append(&self, file: &RemoteFile, record: &str) -> Result<(), String> {
+        let out = self.run_with_stdin(&append_script(file), Some(record))?;
+        if out.code == OWNERSHIP_REFUSED {
+            return Err(self.not_ours(&file.path, "append a deploy record to"));
+        }
         if !out.ok() {
             return Err(format!(
-                "appending to {path} failed (exit {}): {}",
+                "appending to {} failed (exit {}): {}",
+                file.path,
                 out.code,
                 out.stderr.trim()
             ));
@@ -3870,7 +4650,7 @@ Add `mod remote;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing**
 
 Run: `cargo test -p buzz-backend-gcp remote`
-Expected: PASS — 8 tests.
+Expected: PASS — 10 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3882,7 +4662,7 @@ git add -A && git commit -s -m "feat(backend-gcp): IAP ssh transport with stdin-
 
 ## Task 10: `secrets.rs` — Secret Manager storage behind an ownership gate
 
-Resolves review **P2-1**.
+Resolves review **P2-1**, and round 2's **P1-5** (ownership is verified once and then mutated twice).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/secrets.rs`
@@ -3893,15 +4673,21 @@ Resolves review **P2-1**.
   - `secrets::labels_for(pubkey_full: &str) -> String` — the `--labels` argument value
   - `secrets::annotations_for(pubkey_full: &str) -> String` — the `--set-annotations` value
   - `secrets::verify_owned(described: &serde_json::Value, pubkey_full: &str, name: &str) -> Result<(), String>` — pure, unit-tested
-  - `secrets::describe(remote: &Remote, project: &str, name: &str) -> Result<Option<serde_json::Value>, String>`
-  - `secrets::store(remote: &Remote, project: &str, name: &str, pubkey_full: &str, body: &str, service_account: &str) -> Result<(), String>`
-  - `secrets::destroy(remote: &Remote, project: &str, name: &str, pubkey_full: &str) -> Result<(), String>`
-  - `secrets::instance_service_account(remote: &Remote, project: &str, zone: &str, instance: &str) -> Result<String, String>`
-- Consumes: `crate::remote::Remote`, `crate::naming::{BINDING_VERSION, MANAGED_BY}`.
+  - `secrets::describe(remote: &dyn Gcloud, project: &str, name: &str) -> Result<Option<serde_json::Value>, String>`
+  - `secrets::store(remote: &dyn Gcloud, project: &str, name: &str, pubkey_full: &str, body: &str, service_account: &str) -> Result<(), String>`
+  - `secrets::destroy(remote: &dyn Gcloud, project: &str, name: &str, pubkey_full: &str) -> Result<(), String>`
+  - `secrets::instance_service_account(remote: &dyn Gcloud, project: &str, zone: &str, instance: &str) -> Result<String, String>`
+- Consumes: `crate::remote::{Gcloud, Output}`, `crate::naming::{BINDING_VERSION, MANAGED_BY}`.
+
+**Why the transport is a trait here and nowhere else.** Every function above takes `&dyn Gcloud` rather than `&Remote`, and `Remote` is the only production implementation. The reason is narrow and specific: the property this module has to guarantee is a property of the **command sequence** — describe, verify, mutate, describe, verify, mutate — and a sequence can only be tested by recording it. `verify_owned` can be unit-tested to exhaustion while `store` still verifies once and mutates twice, which is exactly the defect round 2 found. `&dyn` rather than a generic because the call is once per deploy and the vtable costs nothing next to an IAP round trip.
 
 **Why the operand is a `&str` and not an `AgentIdentity`.** `deploy` holds a decoded identity, but `remove` never does — the operator has the pubkey `list` printed, not the agent's key. Taking the validated 64-hex string keeps one gate for both callers instead of inventing a second, weaker one for the operator path. `naming::normalize_pubkey` (Task 13) is where an operator-supplied value is validated before it can reach this module.
 
-**The marker is verified before every add-version, IAM binding, and delete — not merely written.** The precedent is `secret_is_ours`, which requires *both* marker halves *and* a full-pubkey match (`crates/buzz-backend-kubernetes/src/observe.rs:64-67`, over `has_marker` at `:42-46` and `annotation_matches` at `:52-60`), and whose comment states the principle: *"Identity labels prove identity; the marker asserts protocol ownership. Without it an object that merely matches our schema fails closed"* (`observe.rs:38-41`). Without that gate, a name-matching secret created by anything else — an operator, another tool, an older binding version — receives this agent's whole secret environment as a new version *and* a grant of read access to the VM service account. **Name collision is not ownership.**
+**The marker is verified immediately before every add-version, IAM binding, and delete — not once per call.** The precedent is `secret_is_ours`, which requires *both* marker halves *and* a full-pubkey match (`crates/buzz-backend-kubernetes/src/observe.rs:64-67`, over `has_marker` at `:42-46` and `annotation_matches` at `:52-60`), and whose comment states the principle: *"Identity labels prove identity; the marker asserts protocol ownership. Without it an object that merely matches our schema fails closed"* (`observe.rs:38-41`). Without that gate, a name-matching secret created by anything else — an operator, another tool, an older binding version — receives this agent's whole secret environment as a new version *and* a grant of read access to the VM service account. **Name collision is not ownership.**
+
+**Once is not enough, and the distance is the point.** The previous revision verified at the top of `store` and then ran `versions add` and `add-iam-policy-binding` with no re-read between them. Each of those is a full API round trip, and a secret that changes hands inside that window is granted this agent's payload or hands the VM `secretAccessor` on a resource we no longer own. Every mutation now sits immediately after its own `describe_owned`, with **nothing** between the two, and a test asserts the resulting command sequence rather than trusting the reading of it.
+
+**A lost create race converges; it does not fail.** Two concurrent deploys can both observe "absent" and both call `create`. Returning the loser's failure contradicts this binding's own residual-risk claim that conflicts converge by re-entry. `ALREADY_EXISTS` on create is therefore not a failure: it means somebody won, and the marker on what they created — read back immediately — is what decides whether this deploy may proceed. Anything *else* on create is still a hard failure.
 
 **Destroy-before-forget.** `remove` (Task 13) destroys the secret *before* deleting local marker files. The reverse order fails in a specific way: markers gone, secret still holding a live key, and no local evidence left to identify or retry it. Ordered this way an interrupted `remove` is idempotent — a re-run finds the marked files still present, the secret already gone, and treats delete-of-absent as success ([L2] item 4, `docs/remote-agents.md:1476`).
 
@@ -4015,6 +4801,201 @@ mod tests {
             .expect_err("must refuse");
         assert!(err.contains("buzz-agent-abc-private-key"), "{err}");
     }
+
+    /// A fake transport that records every `gcloud` invocation and answers
+    /// `secrets describe` from a queue the test controls. The last queued
+    /// answer repeats, so a test only has to spell out the entries that differ.
+    struct Recorder {
+        /// One entry per `secrets describe`, in order. `None` is NOT_FOUND.
+        describes: std::cell::RefCell<std::collections::VecDeque<Option<serde_json::Value>>>,
+        /// stderr for `secrets create`, so a lost create race is expressible.
+        create_stderr: String,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new(describes: Vec<Option<serde_json::Value>>) -> Self {
+            Self {
+                describes: std::cell::RefCell::new(describes.into()),
+                create_stderr: String::new(),
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn losing_the_create_race(describes: Vec<Option<serde_json::Value>>) -> Self {
+            Self {
+                create_stderr:
+                    "ERROR: (gcloud.secrets.create) ALREADY_EXISTS: Secret already exists"
+                        .to_string(),
+                ..Self::new(describes)
+            }
+        }
+
+        /// The verbs, in the order they were invoked.
+        fn sequence(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl Gcloud for Recorder {
+        fn gcloud(&self, args: &[&str], _stdin: Option<&str>) -> Result<Output, String> {
+            let verb = match args {
+                ["secrets", "describe", ..] => "describe",
+                ["secrets", "create", ..] => "create",
+                ["secrets", "versions", "add", ..] => "versions add",
+                ["secrets", "add-iam-policy-binding", ..] => "add-iam-policy-binding",
+                ["secrets", "delete", ..] => "delete",
+                _ => "other",
+            };
+            self.calls.borrow_mut().push(verb.to_string());
+            let mut out = Output {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: 0,
+            };
+            match verb {
+                "describe" => {
+                    let mut queue = self.describes.borrow_mut();
+                    let answer = if queue.len() > 1 {
+                        queue.pop_front().flatten()
+                    } else {
+                        queue.front().cloned().flatten()
+                    };
+                    match answer {
+                        Some(value) => out.stdout = value.to_string(),
+                        None => {
+                            out.code = 1;
+                            out.stderr = "NOT_FOUND: Secret [s] not found.".to_string();
+                        }
+                    }
+                }
+                "create" if !self.create_stderr.is_empty() => {
+                    out.code = 1;
+                    out.stderr = self.create_stderr.clone();
+                }
+                _ => {}
+            }
+            Ok(out)
+        }
+    }
+
+    /// P1-5: `store` verified ownership once and then performed two mutations.
+    /// Every mutation must be immediately preceded by a describe whose marker
+    /// still matches — a property of the sequence, invisible to any test of
+    /// `verify_owned` alone.
+    #[test]
+    fn every_mutation_is_immediately_preceded_by_a_describe_and_verify() {
+        let pubkey = pubkey();
+        let fake = Recorder::new(vec![Some(described(&pubkey))]);
+        store(
+            &fake,
+            "p",
+            "s",
+            &pubkey,
+            "BODY\n",
+            "vm@p.iam.gserviceaccount.com",
+        )
+        .expect("an owned secret stores");
+        assert_eq!(
+            fake.sequence(),
+            ["describe", "versions add", "describe", "add-iam-policy-binding"]
+        );
+    }
+
+    /// The attack that sequence prevents: ownership holds when the version is
+    /// added and has moved by the time the IAM grant would be issued. The VM
+    /// service account must not be granted read access to somebody else's key.
+    #[test]
+    fn a_secret_swapped_before_the_iam_grant_is_refused() {
+        let pubkey = pubkey();
+        let mut stolen = described(&pubkey);
+        stolen["annotations"]["agent-pubkey-full"] = json!("ff".repeat(32));
+        let fake = Recorder::new(vec![Some(described(&pubkey)), Some(stolen)]);
+        let err = store(
+            &fake,
+            "p",
+            "s",
+            &pubkey,
+            "BODY\n",
+            "vm@p.iam.gserviceaccount.com",
+        )
+        .expect_err("a secret that changed hands must not be granted away");
+        assert!(err.contains("belongs to pubkey"), "{err}");
+        assert!(
+            !fake.sequence().contains(&"add-iam-policy-binding".to_string()),
+            "the grant must never have been issued: {:?}",
+            fake.sequence()
+        );
+    }
+
+    /// The loser of a create race converges by re-entry rather than failing —
+    /// which is what this binding's residual-risk note already promises.
+    #[test]
+    fn a_lost_create_race_is_re_read_and_verified_rather_than_failed() {
+        let pubkey = pubkey();
+        // Absent on the first look, then present and ours: the winner was
+        // another deploy of this same agent.
+        let fake = Recorder::losing_the_create_race(vec![None, Some(described(&pubkey))]);
+        store(
+            &fake,
+            "p",
+            "s",
+            &pubkey,
+            "BODY\n",
+            "vm@p.iam.gserviceaccount.com",
+        )
+        .expect("losing a create race must converge, not fail");
+        assert_eq!(
+            fake.sequence(),
+            [
+                "describe",
+                "create",
+                "describe",
+                "versions add",
+                "describe",
+                "add-iam-policy-binding"
+            ]
+        );
+    }
+
+    /// …and losing it to something that is *not* ours is still a refusal: the
+    /// winner's marker is what decides, not the fact that we lost.
+    #[test]
+    fn a_create_race_lost_to_a_foreign_secret_is_refused() {
+        let pubkey = pubkey();
+        let mut foreign = described(&pubkey);
+        foreign["labels"] = json!({});
+        let fake = Recorder::losing_the_create_race(vec![None, Some(foreign)]);
+        let err = store(
+            &fake,
+            "p",
+            "s",
+            &pubkey,
+            "BODY\n",
+            "vm@p.iam.gserviceaccount.com",
+        )
+        .expect_err("the winner's marker decides");
+        assert!(err.contains("not managed by"), "{err}");
+        assert!(!fake.sequence().contains(&"versions add".to_string()));
+    }
+
+    /// Delete is irreversible, so its describe-and-verify sits immediately
+    /// before it with nothing in between.
+    #[test]
+    fn destroy_verifies_immediately_before_the_delete() {
+        let pubkey = pubkey();
+        let fake = Recorder::new(vec![Some(described(&pubkey))]);
+        destroy(&fake, "p", "s", &pubkey).expect("an owned secret is deleted");
+        assert_eq!(fake.sequence(), ["describe", "delete"]);
+    }
+
+    /// Delete-of-absent is success ([L2] item 4) and must not reach the delete.
+    #[test]
+    fn destroying_an_absent_secret_is_success_and_mutates_nothing() {
+        let fake = Recorder::new(vec![None]);
+        destroy(&fake, "p", "s", &pubkey()).expect("delete-of-absent is success");
+        assert_eq!(fake.sequence(), ["describe"]);
+    }
 }
 ```
 
@@ -4039,7 +5020,7 @@ Prepend to `crates/buzz-backend-gcp/src/secrets.rs`:
 //! delete**. Name collision is not ownership.
 
 use crate::naming::{BINDING_VERSION, MANAGED_BY};
-use crate::remote::Remote;
+use crate::remote::{Gcloud, Output};
 
 /// Label key carrying the marker's identity half.
 const LABEL_MANAGED_BY: &str = "managed_by";
@@ -4119,7 +5100,7 @@ pub fn verify_owned(
 
 /// Read a secret's metadata. `Ok(None)` means it does not exist.
 pub fn describe(
-    remote: &Remote,
+    remote: &dyn Gcloud,
     project: &str,
     name: &str,
 ) -> Result<Option<serde_json::Value>, String> {
@@ -4149,13 +5130,50 @@ pub fn describe(
         .map_err(|e| format!("could not parse the description of secret {name}: {e}"))
 }
 
+/// Read the secret and verify our marker, as one step, immediately before a
+/// mutation.
+///
+/// Every mutation in this module is preceded by this call with **nothing** in
+/// between. A single verification at the top of `store` authorized an
+/// add-version and an IAM grant that happened one and two API round trips
+/// later, and a name-matching secret swapped into that window receives this
+/// agent's whole environment or hands the VM `secretAccessor` on a resource we
+/// no longer own.
+///
+/// A secret that vanished between two checks is a refusal, not a create: this
+/// is only reached on a path that has already established it exists.
+fn describe_owned(
+    remote: &dyn Gcloud,
+    project: &str,
+    name: &str,
+    pubkey_full: &str,
+) -> Result<(), String> {
+    let Some(described) = describe(remote, project, name)? else {
+        return Err(format!(
+            "secret {name} disappeared between two checks in this deploy. \
+             Nothing further was changed; run the deploy again."
+        ));
+    };
+    verify_owned(&described, pubkey_full, name)
+}
+
+/// Does this `gcloud secrets create` failure mean somebody else won the race?
+///
+/// Two spellings because `gcloud` surfaces the API status on some paths and a
+/// prose message on others. Matching either is what keeps a lost race
+/// convergent instead of turning it into a hard failure.
+fn already_exists(out: &Output) -> bool {
+    out.stderr.contains("ALREADY_EXISTS") || out.stderr.contains("already exists")
+}
+
 /// Create-if-absent behind the ownership gate, then add a version carrying
 /// `body`, then grant the instance service account read access.
 ///
 /// Idempotent: versions are cheap, and adding one is the only way to guarantee
-/// the latest value matches this deploy.
+/// the latest value matches this deploy. Both mutations are individually
+/// fenced — see `describe_owned`.
 pub fn store(
-    remote: &Remote,
+    remote: &dyn Gcloud,
     project: &str,
     name: &str,
     pubkey_full: &str,
@@ -4163,6 +5181,8 @@ pub fn store(
     service_account: &str,
 ) -> Result<(), String> {
     match describe(remote, project, name)? {
+        // Verified here and deliberately *not* re-read before the add below:
+        // no round trip separates the two.
         Some(existing) => verify_owned(&existing, pubkey_full, name)?,
         None => {
             let labels = labels_for(pubkey_full);
@@ -4183,20 +5203,19 @@ pub fn store(
                 ],
                 None,
             )?;
-            if !out.ok() {
+            // A failed create is not decisive. Two concurrent deploys can both
+            // observe "absent", and the loser must converge by re-entry rather
+            // than fail. `ALREADY_EXISTS` says somebody won; the marker on what
+            // they created is what decides whether we may proceed, and reading
+            // it is the very next thing that happens.
+            if !out.ok() && !already_exists(&out) {
                 return Err(format!(
                     "creating secret {name} failed (exit {}): {}",
                     out.code,
                     out.stderr.trim()
                 ));
             }
-            // Re-read and re-verify: two concurrent deploys can both observe
-            // "absent" and one of them loses the create. The winner's marker
-            // is the one that counts.
-            let created = describe(remote, project, name)?.ok_or_else(|| {
-                format!("secret {name} was created but cannot be read back")
-            })?;
-            verify_owned(&created, pubkey_full, name)?;
+            describe_owned(remote, project, name, pubkey_full)?;
         }
     }
 
@@ -4221,6 +5240,9 @@ pub fn store(
         ));
     }
 
+    // The IAM grant is a second mutation and gets its own re-read: a full API
+    // round trip separates it from the check above.
+    describe_owned(remote, project, name, pubkey_full)?;
     let member = format!("serviceAccount:{service_account}");
     let out = remote.gcloud(
         &[
@@ -4251,7 +5273,7 @@ pub fn store(
 /// Delete-of-absent is success ([L2] item 4), which is what makes an
 /// interrupted `remove` idempotent.
 pub fn destroy(
-    remote: &Remote,
+    remote: &dyn Gcloud,
     project: &str,
     name: &str,
     pubkey_full: &str,
@@ -4259,6 +5281,9 @@ pub fn destroy(
     let Some(existing) = describe(remote, project, name)? else {
         return Ok(());
     };
+    // The same describe-and-verify `describe_owned` performs, inlined so the
+    // absent case above costs no second round trip. Nothing separates this
+    // check from the delete it authorizes.
     verify_owned(&existing, pubkey_full, name)?;
     let out = remote.gcloud(
         &["secrets", "delete", name, "--project", project, "--quiet"],
@@ -4277,7 +5302,7 @@ pub fn destroy(
 /// The instance's attached service account — the identity the fetcher unit
 /// authenticates as, and the only principal granted access to the secret.
 pub fn instance_service_account(
-    remote: &Remote,
+    remote: &dyn Gcloud,
     project: &str,
     zone: &str,
     instance: &str,
@@ -4320,7 +5345,7 @@ Add `mod secrets;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing and clippy-clean**
 
 Run: `cargo test -p buzz-backend-gcp secrets && cargo clippy -p buzz-backend-gcp --all-targets -- -D warnings`
-Expected: PASS — 7 tests — and no clippy warnings.
+Expected: PASS — 13 tests — and no clippy warnings.
 
 - [ ] **Step 5: Commit**
 
@@ -4332,7 +5357,7 @@ git add -A && git commit -s -m "feat(backend-gcp): label-fenced Secret Manager s
 
 ## Task 11: `observe.rs` — systemd state and marker state, separately
 
-Resolves the observation half of review **P1-5**.
+Resolves the observation half of review **P1-5**, and round 2's **P1-4** (each artifact is observed against its own marker) and the observation half of **P1-6** (the content-hash tamper check is deleted).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/observe.rs`
@@ -4341,18 +5366,21 @@ Resolves the observation half of review **P1-5**.
 **Interfaces:**
 - Produces:
   - `observe::SystemdState { load_state, active_state, sub_state, unit_file_state, main_pid }` with `instance_known(&self) -> bool` and `running(&self) -> bool`
-  - `observe::SharedFileState { path: String, present: bool, computed_hash: String, declared_hash: String }` with `marked(&self) -> bool`
-  - `observe::MarkerState { env_file_present: bool, agent_marker: Option<AgentMarker>, trail_present: bool, shared: Vec<SharedFileState> }`
+  - `observe::AgentFileState { path: String, present: bool, marker: Option<AgentMarker> }`
+  - `observe::SharedFileState { path: String, present: bool, marked: bool, sha256: String }`
+  - `observe::MarkerState { env: AgentFileState, siblings: Vec<AgentFileState>, shared: Vec<SharedFileState> }` with `agent_files(&self) -> impl Iterator<Item = &AgentFileState>`
   - `observe::Observation { systemd, markers, harness_installed: bool, reserved_bytes: u64, available_bytes: u64 }`
-  - `observe::SHARED_PATHS: [&str; 3]`
+  - `observe::SHARED_PATHS: [&str; 3]` and `observe::agent_paths(names: &Names) -> [String; 4]`
   - `observe::look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation, String>`
   - `observe::parse_observation(stdout: &str, own_dropin: &str) -> Observation`
-  - `observe::section(body: &str, name: &str) -> &str` and `observe::property(block: &str, key: &str) -> &str` — `pub(crate)`, reused by `reconcile`'s startup poll, which drives a script of the same sectioned shape
-- Consumes: `crate::capacity::parse_reported_bytes`, `crate::config::parse_memory_max`, `crate::naming::{AgentMarker, Names, MANAGED_BY}`, `crate::remote::{sq, Remote}`.
+  - `observe::section(body: &str, name: &str) -> &str` and `observe::property(block: &str, key: &str) -> &str` — `pub(crate)`, reused by `reconcile`'s startup poll and its start round trip, which drive scripts of the same sectioned shape
+- Consumes: `crate::capacity::parse_reported_bytes`, `crate::config::parse_memory_max`, `crate::naming::{header_line, is_shared_marker, AgentMarker, Names}`, `crate::remote::{sq, Remote, MARKER_SCAN_LINES}`.
 
 **Why the two states are separate types.** The previous revision derived `unit_present` solely from the env file, so a real unit with no env file classified as `Create` and got provider files installed around it. They are independent facts and must be observed independently: systemd knows about install symlinks and running jobs; markers know about ownership. Note the trap the split makes visible — once the *template* `buzz-acp@.service` exists, `systemctl show buzz-acp@<anything>.service` reports `LoadState=loaded` for **every** instance name, so `LoadState` is not evidence that *this* instance exists. `UnitFileState=enabled` (an install symlink) or a non-`inactive` `ActiveState` is.
 
-**Content verification, not just a declared hash.** The observer recomputes each shared file's hash on the instance with the four marker lines stripped, and reports both the computed and the declared value. A file whose declared hash disagrees with its content has been edited underneath us and is a refusal, not a rewrite. The strip uses `sed '/^# managed-by: buzz-backend-gcp$/,+3d'`, which relies on GNU `sed`'s `addr,+N` form — correct on the Debian-family GCE image, and the reason `naming.rs` pins both markers to exactly four contiguous lines.
+**Four per-agent rows, not one.** A replace rewrites four files and a remove deletes four files, so an observation that records only the env file's marker cannot authorize either without authorizing them from a *sibling's* header. That is not the auto-repair fence, which says no destructive action may touch a file lacking the marker of its own tier (`docs/remote-agents.md:1460-1476`). The observer therefore reports one `AgentFileState` per artifact, and `classify` refuses on the first present-but-not-ours among them, naming that path. The env file keeps its own field rather than an index into a vector, because it is genuinely special: it is the only artifact that records what the deploy *was*, and so the only one anything classifies on.
+
+**Bytes, not claims.** A shared file is compared by hashing the whole file on the instance and comparing that to the digest of the exact bytes this provider would render. Nothing is stripped, nothing stored in the file is trusted, and there is no `sed` range to get wrong. Whether the file carries the provider marker is a separate, boolean question, and it is answered the same way the per-agent rows are: the script extracts the three header values with one `field` helper and ships them, and Rust reassembles the header and hands it to `naming::is_shared_marker`. That keeps "is this ours" in **one** function per tier for both the bytes this provider writes and the bytes it reads back — the alternative, a `grep -F -x` needle list built in the script, is a second implementation of the same predicate in a second language. The instance-side `grep -F -x` form survives only where the check must be atomic with the action it guards (`Remote::install`, `removal_script`), which an observation is not.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4362,35 +5390,54 @@ Resolves the observation half of review **P1-5**.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::naming::{BINDING_VERSION, MANAGED_BY, SHARED_SCOPE};
 
+    const INSTANCE: &str = "a1b2c3d4e5f6";
     const OWN_DROPIN: &str = "/etc/systemd/system/buzz-acp@a1b2c3d4e5f6.service.d/agent.conf";
+    /// A row body for a file that is not there. Both tiers carry four header
+    /// fields — `managed-by`, `binding-version`, then `agent-pubkey-full` and
+    /// `create-intent` for a per-agent row or `scope` and the digest for a
+    /// shared one — so one spelling serves both.
+    const ABSENT: &str = "absent||||";
 
-    fn sample(unit: &str, marker: &str, shared: &str, reserved: &str) -> String {
+    fn pubkey() -> String {
+        "ab".repeat(32)
+    }
+
+    /// A row body for a present file carrying our full per-agent marker.
+    fn marked() -> String {
+        format!("present|{MANAGED_BY}|{BINDING_VERSION}|{}|ci", pubkey())
+    }
+
+    /// The four per-agent rows the observer emits, in `agent_paths` order.
+    fn agent_rows(env: &str, dropin: &str, secret_dropin: &str, trail: &str) -> String {
+        format!(
+            "/etc/buzz/acp-{INSTANCE}.env|{env}\n\
+             {OWN_DROPIN}|{dropin}\n\
+             /etc/systemd/system/buzz-acp-secret@{INSTANCE}.service.d/agent.conf|{secret_dropin}\n\
+             /etc/buzz/acp-{INSTANCE}.trail|{trail}\n"
+        )
+    }
+
+    fn sample(unit: &str, agent_files: &str, shared: &str, reserved: &str) -> String {
         format!(
             "---UNIT---\n{unit}\
-             ---AGENTMARKER---\n{marker}\
+             ---AGENTFILES---\n{agent_files}\
              ---SHARED---\n{shared}\
              ---RESERVED---\n{reserved}\
              ---STANDING---\ninfinity\n\
              ---AVAILABLE---\n2831156\n\
              ---HARNESS---\nyes\n\
-             ---TRAIL---\nyes\n\
              ---END---\n"
-        )
-    }
-
-    fn our_marker() -> String {
-        format!(
-            "# managed-by: {MANAGED_BY}\n# binding-version: 1\n\
-             # agent-pubkey-full: {}\n# create-intent: ci\n",
-            "ab".repeat(32)
         )
     }
 
     fn all_shared_marked() -> String {
         SHARED_PATHS
             .iter()
-            .map(|p| format!("{p}|present|hash-{p}|hash-{p}\n"))
+            .map(|p| {
+                format!("{p}|present|{MANAGED_BY}|{BINDING_VERSION}|{SHARED_SCOPE}|hash-{p}\n")
+            })
             .collect()
     }
 
@@ -4399,21 +5446,21 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=active\nSubState=running\n\
              UnitFileState=enabled\nMainPID=4242\n",
-            &our_marker(),
+            &agent_rows(&marked(), &marked(), &marked(), &marked()),
             &all_shared_marked(),
             &format!("{OWN_DROPIN}=2G\n/etc/systemd/system/buzz-acp@ffffffffffff.service.d/agent.conf=1G\n"),
         );
         let o = parse_observation(&out, OWN_DROPIN);
         assert!(o.systemd.instance_known());
         assert!(o.systemd.running());
-        assert!(o.markers.env_file_present);
-        assert!(o.markers.trail_present);
-        assert!(o.markers.agent_marker.is_some());
+        assert!(o.markers.env.present);
+        assert!(o.markers.env.marker.is_some());
+        assert!(o.markers.agent_files().all(|f| f.marker.is_some()));
         assert!(o.harness_installed);
         // Our own drop-in is excluded, or a redeploy would double-count itself.
         assert_eq!(o.reserved_bytes, 1024 * 1024 * 1024);
         assert_eq!(o.available_bytes, 2_831_156 * 1024);
-        assert!(o.markers.shared.iter().all(|s| s.present && s.marked()));
+        assert!(o.markers.shared.iter().all(|s| s.present && s.marked));
     }
 
     /// A template unit makes `systemctl show` report `LoadState=loaded` for
@@ -4424,14 +5471,14 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
              UnitFileState=disabled\nMainPID=0\n",
-            "",
+            &agent_rows(ABSENT, ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         );
         let o = parse_observation(&out, OWN_DROPIN);
         assert!(!o.systemd.instance_known());
         assert!(!o.systemd.running());
-        assert!(!o.markers.env_file_present);
+        assert!(!o.markers.env.present);
     }
 
     /// A failed unit is very much this instance: it has to be observable, or
@@ -4441,7 +5488,7 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=failed\nSubState=failed\n\
              UnitFileState=enabled\nMainPID=0\n",
-            &our_marker(),
+            &agent_rows(&marked(), ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         );
@@ -4457,7 +5504,7 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=active\nSubState=running\n\
              UnitFileState=enabled\nMainPID=0\n",
-            &our_marker(),
+            &agent_rows(&marked(), ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         );
@@ -4469,18 +5516,17 @@ mod tests {
         let out = sample(
             "LoadState=not-found\nActiveState=inactive\nSubState=dead\n\
              UnitFileState=\nMainPID=0\n",
-            "",
+            &agent_rows(ABSENT, ABSENT, ABSENT, ABSENT),
             &SHARED_PATHS
                 .iter()
-                .map(|p| format!("{p}|absent||\n"))
+                .map(|p| format!("{p}|{ABSENT}\n"))
                 .collect::<String>(),
             "",
         );
         let o = parse_observation(&out, OWN_DROPIN);
         assert!(!o.systemd.instance_known());
-        assert!(!o.markers.env_file_present);
-        assert!(o.markers.agent_marker.is_none());
-        assert!(o.markers.shared.iter().all(|s| !s.present && !s.marked()));
+        assert!(o.markers.agent_files().all(|f| !f.present && f.marker.is_none()));
+        assert!(o.markers.shared.iter().all(|s| !s.present && !s.marked));
         assert_eq!(o.reserved_bytes, 0);
     }
 
@@ -4489,36 +5535,91 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
              UnitFileState=enabled\nMainPID=0\n",
-            "# hand-written by an operator\nBUZZ_RELAY_URL=\"wss://r\"\n",
+            &agent_rows("present||||", ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         );
         let o = parse_observation(&out, OWN_DROPIN);
-        assert!(o.markers.env_file_present);
-        assert!(o.markers.agent_marker.is_none());
+        assert!(o.markers.env.present);
+        assert!(o.markers.env.marker.is_none());
     }
 
-    /// A shared file whose declared hash disagrees with its content has been
-    /// edited underneath us.
+    /// P1-4's observation half: four artifacts, four independent verdicts. A
+    /// marked env file beside an unmarked drop-in has to read as exactly that,
+    /// or the fence downstream has nothing to refuse on.
     #[test]
-    fn a_tampered_shared_file_reports_mismatched_hashes() {
+    fn each_per_agent_artifact_reports_its_own_marker() {
+        let foreign = format!("present|{MANAGED_BY}|{BINDING_VERSION}|{}|ci", "ff".repeat(32));
+        let out = sample(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
+             UnitFileState=enabled\nMainPID=0\n",
+            &agent_rows(&marked(), "present||||", &foreign, ABSENT),
+            &all_shared_marked(),
+            "",
+        );
+        let o = parse_observation(&out, OWN_DROPIN);
+        assert_eq!(o.markers.agent_files().count(), 4);
+        assert!(o.markers.env.marker.is_some());
+        assert!(o.markers.siblings[0].present, "the drop-in is there");
+        assert!(
+            o.markers.siblings[0].marker.is_none(),
+            "…and carries no marker of ours, which must be visible on its own row"
+        );
+        assert_eq!(
+            o.markers.siblings[1].marker.as_ref().map(|m| m.pubkey_full.as_str()),
+            Some("ff".repeat(32).as_str()),
+            "a sibling belonging to another agent keeps its own identity"
+        );
+        assert!(!o.markers.siblings[2].present);
+    }
+
+    /// A binding version this build does not understand is not our marker, and
+    /// a present file that is not ours is never safe to overwrite.
+    #[test]
+    fn a_future_binding_version_reads_as_present_and_unowned() {
+        let out = sample(
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
+             UnitFileState=enabled\nMainPID=0\n",
+            &agent_rows(
+                &format!("present|{MANAGED_BY}|99|{}|ci", pubkey()),
+                ABSENT,
+                ABSENT,
+                ABSENT,
+            ),
+            &all_shared_marked(),
+            "",
+        );
+        let o = parse_observation(&out, OWN_DROPIN);
+        assert!(o.markers.env.present);
+        assert!(o.markers.env.marker.is_none());
+    }
+
+    /// A shared file with our name and no provider marker is somebody else's.
+    /// There is deliberately no third state: nothing in the file claims what
+    /// its own content should be, so "edited underneath us" is not a verdict
+    /// this observer can reach — or should try to.
+    #[test]
+    fn a_shared_file_without_the_provider_marker_is_reported_unmarked() {
         let shared = format!(
-            "{}|present|computed-a|declared-b\n{}|present|h|h\n{}|present|h|h\n",
+            "{}|present||||deadbeef\n\
+             {}|present|{MANAGED_BY}|{BINDING_VERSION}|{SHARED_SCOPE}|h\n\
+             {}|present|{MANAGED_BY}|{BINDING_VERSION}|{SHARED_SCOPE}|h\n",
             SHARED_PATHS[0], SHARED_PATHS[1], SHARED_PATHS[2]
         );
         let o = parse_observation(
             &sample(
                 "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
                  UnitFileState=disabled\nMainPID=0\n",
-                "",
+                &agent_rows(ABSENT, ABSENT, ABSENT, ABSENT),
                 &shared,
                 "",
             ),
             OWN_DROPIN,
         );
-        let first = &o.markers.shared[0];
-        assert!(first.marked());
-        assert_ne!(first.computed_hash, first.declared_hash);
+        assert!(o.markers.shared[0].present);
+        assert!(!o.markers.shared[0].marked);
+        assert_eq!(o.markers.shared[0].sha256, "deadbeef");
+        assert!(o.markers.shared[1].marked);
     }
 
     #[test]
@@ -4526,7 +5627,7 @@ mod tests {
         let out = sample(
             "LoadState=not-found\nActiveState=inactive\nSubState=dead\n\
              UnitFileState=\nMainPID=0\n",
-            "",
+            &agent_rows(ABSENT, ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         )
@@ -4541,7 +5642,7 @@ mod tests {
         let out = sample(
             "LoadState=loaded\nActiveState=inactive\nSubState=dead\n\
              UnitFileState=disabled\nMainPID=0\n",
-            "",
+            &agent_rows(ABSENT, ABSENT, ABSENT, ABSENT),
             &all_shared_marked(),
             "",
         )
@@ -4549,6 +5650,47 @@ mod tests {
         assert_eq!(
             parse_observation(&out, OWN_DROPIN).reserved_bytes,
             512 * 1024 * 1024
+        );
+    }
+
+    /// The script has to read all four per-agent artifacts and hash each shared
+    /// file **whole**. A script that read only the env file would leave the
+    /// per-artifact fence with nothing to fence on, and one that stripped a
+    /// header before hashing would be the deleted tamper check growing back.
+    #[test]
+    fn the_observer_reads_every_artifact_and_hashes_shared_files_whole() {
+        let names = Names::from_pubkey_hex(&format!("{INSTANCE}{}", "0".repeat(52))).unwrap();
+        let script = observe_script(&names, "codex-acp");
+        for path in agent_paths(&names) {
+            assert!(script.contains(&sq(&path)), "{path} is never read");
+        }
+        assert!(script.contains("sha256sum"), "{script}");
+        assert!(
+            !script.contains("content-hash"),
+            "nothing reads a digest back out of a file any more"
+        );
+        assert!(
+            !script.contains(",+3d"),
+            "the GNU-sed marker strip went with it"
+        );
+    }
+
+    /// Both marker headers must fit inside the window this observer scans. The
+    /// worst case is the fetcher script, whose shebang pushes its three-line
+    /// provider header down to lines 2-4. If a header ever grows, this fails
+    /// here rather than as a deploy refusing a file it wrote itself.
+    #[test]
+    fn every_marker_header_fits_the_scan_window() {
+        let agent = AgentMarker {
+            pubkey_full: "ab".repeat(32),
+            create_intent: "ci".to_string(),
+        }
+        .render();
+        assert!(agent.lines().count() <= MARKER_SCAN_LINES, "{agent}");
+        let shared = crate::naming::shared_marker();
+        assert!(
+            shared.lines().count() + 1 <= MARKER_SCAN_LINES,
+            "a shebang sits above this header: {shared}"
         );
     }
 }
@@ -4570,11 +5712,15 @@ Prepend to `crates/buzz-backend-gcp/src/observe.rs`:
 //! about the units, and what our **markers** say about ownership. Deriving one
 //! from the other is how a real unit with no env file classifies as "absent"
 //! and gets provider files installed around it.
+//!
+//! Ownership is recorded per artifact, not per agent. Four files are written by
+//! a replace and deleted by a remove, so one shared verdict would authorize
+//! destroying three files nothing ever looked at.
 
 use crate::capacity::parse_reported_bytes;
 use crate::config::parse_memory_max;
-use crate::naming::{AgentMarker, Names, MANAGED_BY};
-use crate::remote::{sq, Remote};
+use crate::naming::{header_line, is_shared_marker, AgentMarker, Names};
+use crate::remote::{sq, Remote, MARKER_SCAN_LINES};
 
 /// The three artifacts every instance shares. Order is fixed so the observer's
 /// output and the renderer's plan line up by index as well as by path.
@@ -4583,6 +5729,22 @@ pub const SHARED_PATHS: [&str; 3] = [
     "/etc/systemd/system/buzz-acp-secret@.service",
     "/usr/local/sbin/buzz-acp-fetch-key",
 ];
+
+/// The four artifacts belonging to exactly one agent, in one fixed order shared
+/// by the observer script, its parser, and `remove`.
+///
+/// The env file is first, and [`MarkerState`] keeps it in its own field: it is
+/// the only artifact that records what the deploy *was*, so it is the only one
+/// anything classifies on. The other three are checked, written and deleted,
+/// never interrogated for intent.
+pub fn agent_paths(names: &Names) -> [String; 4] {
+    [
+        names.env_path(),
+        names.dropin_path(),
+        names.secret_dropin_path(),
+        names.trail_path(),
+    ]
+}
 
 /// What systemd reports about this agent's unit — independent of any file this
 /// provider wrote.
@@ -4614,38 +5776,49 @@ impl SystemdState {
     }
 }
 
+/// One per-agent artifact as it exists on the instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentFileState {
+    pub path: String,
+    pub present: bool,
+    /// The marker **this file's own** header carries, at this binding version.
+    /// `None` on a present file means "not ours" — which is a refusal to act,
+    /// never a licence to overwrite.
+    pub marker: Option<AgentMarker>,
+}
+
 /// One shared artifact as it exists on the instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SharedFileState {
     pub path: String,
     pub present: bool,
-    /// SHA-256 recomputed on the instance with the marker header stripped.
-    pub computed_hash: String,
-    /// The hash the file's own marker declares. Empty when unmarked.
-    pub declared_hash: String,
-}
-
-impl SharedFileState {
-    /// Does the file carry a provider-level marker at all?
-    pub fn marked(&self) -> bool {
-        !self.declared_hash.is_empty()
-    }
-
-    /// Has the content been edited underneath us?
-    pub fn tampered(&self) -> bool {
-        self.present && self.marked() && self.computed_hash != self.declared_hash
-    }
+    /// Does the file carry this provider's three-line provider-level marker?
+    pub marked: bool,
+    /// SHA-256 of the file's **whole** contents, header included.
+    ///
+    /// Compared against the digest of the exact bytes this provider would
+    /// render ([`crate::render::SharedArtifact::sha256`]). Both sides are
+    /// hashes of real bytes, so there is nothing here for a file to claim about
+    /// itself and nothing to strip before hashing.
+    pub sha256: String,
 }
 
 /// What our markers say — independent of systemd.
 #[derive(Debug, Clone, Default)]
 pub struct MarkerState {
-    pub env_file_present: bool,
-    /// `Some` only when the env file carries a per-agent marker at this
-    /// binding version.
-    pub agent_marker: Option<AgentMarker>,
-    pub trail_present: bool,
+    /// The env file.
+    pub env: AgentFileState,
+    /// The agent drop-in, the fetcher drop-in, and the deploy trail, in
+    /// [`agent_paths`] order after the env file.
+    pub siblings: Vec<AgentFileState>,
     pub shared: Vec<SharedFileState>,
+}
+
+impl MarkerState {
+    /// Every per-agent artifact, env file first.
+    pub fn agent_files(&self) -> impl Iterator<Item = &AgentFileState> {
+        std::iter::once(&self.env).chain(self.siblings.iter())
+    }
 }
 
 /// Everything one reconciliation pass needs, read in a single round trip.
@@ -4664,8 +5837,7 @@ pub struct Observation {
 
 /// One round trip that collects everything the reconciler needs.
 pub fn look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation, String> {
-    let script = observe_script(names, harness);
-    let out = remote.run(&script)?;
+    let out = remote.run(&observe_script(names, harness))?;
     if !out.ok() {
         return Err(format!(
             "observing {} failed (exit {}): {}",
@@ -4674,26 +5846,58 @@ pub fn look(remote: &Remote, names: &Names, harness: &str) -> Result<Observation
             out.stderr.trim()
         ));
     }
-    Ok(parse_observation(&out.stdout, &names.dropin_path()))
+    let observation = parse_observation(&out.stdout, &names.dropin_path());
+    // A short observation is a malformed one, and a malformed observation reads
+    // as "nothing of ours is here" — which classifies as `Create` and installs
+    // over a live agent. Four rows, or nothing happens.
+    let expected = agent_paths(names).len();
+    let seen = observation.markers.agent_files().count();
+    if seen != expected {
+        return Err(format!(
+            "the observer reported {seen} of {expected} per-agent artifacts for \
+             {}. Refusing to act on a partial observation.",
+            names.unit()
+        ));
+    }
+    Ok(observation)
 }
 
 /// The observer script. Sectioned so the parser is a pure function of text.
+///
+/// `field` is defined once and reads from `$h`, the first few lines of whatever
+/// file the loop is currently on — the same helper serves both tiers. Emitting
+/// the header *values* as one `|`-separated row keeps each section
+/// line-oriented, and a value that itself contains a `|` is truncated at it,
+/// which makes the reassembled header fail to match — the fail-closed
+/// direction. Nothing here decides ownership; that is `AgentMarker::parse` and
+/// `is_shared_marker`, in Rust, for both tiers.
 fn observe_script(names: &Names, harness: &str) -> String {
     format!(
         "set -uo pipefail\n\
+         field() {{ printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }}\n\
          echo '---UNIT---'\n\
          systemctl show {unit} -p LoadState -p ActiveState -p SubState \
              -p UnitFileState -p MainPID 2>/dev/null || true\n\
-         echo '---AGENTMARKER---'\n\
-         sudo -n sed -n '1,4p' {env} 2>/dev/null || true\n\
+         echo '---AGENTFILES---'\n\
+         for p in {agent_files}; do \
+           if sudo -n test -e \"$p\"; then \
+             h=$(sudo -n head -n {scan} \"$p\"); \
+             printf '%s|present|%s|%s|%s|%s\\n' \"$p\" \"$(field managed-by)\" \
+               \"$(field binding-version)\" \"$(field agent-pubkey-full)\" \
+               \"$(field create-intent)\"; \
+           else \
+             printf '%s|absent||||\\n' \"$p\"; \
+           fi; \
+         done\n\
          echo '---SHARED---'\n\
          for p in {shared}; do \
            if sudo -n test -e \"$p\"; then \
-             h=$(sudo -n sed '/^# managed-by: {managed_by}$/,+3d' \"$p\" | sha256sum | cut -d' ' -f1); \
-             d=$(sudo -n sed -n 's/^# content-hash: //p' \"$p\" | head -n 1); \
-             printf '%s|present|%s|%s\\n' \"$p\" \"$h\" \"$d\"; \
+             s=$(sudo -n sha256sum \"$p\" | cut -d' ' -f1); \
+             h=$(sudo -n head -n {scan} \"$p\"); \
+             printf '%s|present|%s|%s|%s|%s\\n' \"$p\" \"$(field managed-by)\" \
+               \"$(field binding-version)\" \"$(field scope)\" \"$s\"; \
            else \
-             printf '%s|absent||\\n' \"$p\"; \
+             printf '%s|absent||||\\n' \"$p\"; \
            fi; \
          done\n\
          echo '---RESERVED---'\n\
@@ -4708,27 +5912,28 @@ fn observe_script(names: &Names, harness: &str) -> String {
          awk '/^MemAvailable:/ {{print $2}}' /proc/meminfo\n\
          echo '---HARNESS---'\n\
          test -x {harness_path} && echo yes || echo no\n\
-         echo '---TRAIL---'\n\
-         sudo -n test -e {trail} && echo yes || echo no\n\
          echo '---END---'\n",
         unit = sq(&names.unit()),
-        env = sq(&names.env_path()),
+        agent_files = agent_paths(names)
+            .iter()
+            .map(|p| sq(p))
+            .collect::<Vec<_>>()
+            .join(" "),
         shared = SHARED_PATHS
             .iter()
             .map(|p| sq(p))
             .collect::<Vec<_>>()
             .join(" "),
-        managed_by = MANAGED_BY,
+        scan = MARKER_SCAN_LINES,
         harness_path = sq(&format!("/usr/local/bin/{harness}")),
-        trail = sq(&names.trail_path()),
     )
 }
 
 /// Extract one `---NAME---` section body.
 ///
-/// `pub(crate)` because `reconcile`'s startup poll uses the same sectioned
-/// script shape; two copies of a text splitter would be two places to get the
-/// terminator wrong.
+/// `pub(crate)` because `reconcile` drives scripts of the same sectioned shape;
+/// two copies of a text splitter would be two places to get the terminator
+/// wrong.
 pub(crate) fn section<'a>(body: &'a str, name: &str) -> &'a str {
     let opener = format!("---{name}---\n");
     let Some(rest) = body.split(opener.as_str()).nth(1) else {
@@ -4747,6 +5952,55 @@ pub(crate) fn property<'a>(block: &'a str, key: &str) -> &'a str {
         .trim()
 }
 
+/// Decode one `path|present|managed-by|binding-version|pubkey|intent` row.
+///
+/// The four header values are reassembled into the lines they came from and
+/// handed to [`AgentMarker::parse`], so "is this ours" is decided by exactly one
+/// function for the bytes this provider renders and the bytes it reads back.
+fn parse_agent_file_row(line: &str) -> AgentFileState {
+    let mut parts = line.split('|');
+    let path = parts.next().unwrap_or("").to_string();
+    let present = parts.next().unwrap_or("") == "present";
+    let header = format!(
+        "{}\n{}\n{}\n{}\n",
+        header_line("managed-by", parts.next().unwrap_or("").trim()),
+        header_line("binding-version", parts.next().unwrap_or("").trim()),
+        header_line("agent-pubkey-full", parts.next().unwrap_or("").trim()),
+        header_line("create-intent", parts.next().unwrap_or("").trim()),
+    );
+    AgentFileState {
+        path,
+        present,
+        // An absent file carries no marker, whatever the rest of the row says.
+        marker: present.then(|| AgentMarker::parse(&header)).flatten(),
+    }
+}
+
+/// Decode one `path|present|managed-by|binding-version|scope|sha256` row.
+///
+/// Same shape as [`parse_agent_file_row`] and the same discipline: the header
+/// values are reassembled and handed to the one predicate that also judges the
+/// bytes this provider renders, so "is this ours" has a single definition per
+/// tier rather than one in Rust and one in shell.
+fn parse_shared_file_row(line: &str) -> SharedFileState {
+    let mut parts = line.split('|');
+    let path = parts.next().unwrap_or("").to_string();
+    let present = parts.next().unwrap_or("") == "present";
+    let header = format!(
+        "{}\n{}\n{}\n",
+        header_line("managed-by", parts.next().unwrap_or("").trim()),
+        header_line("binding-version", parts.next().unwrap_or("").trim()),
+        header_line("scope", parts.next().unwrap_or("").trim()),
+    );
+    SharedFileState {
+        path,
+        present,
+        // An absent file carries no marker, whatever the rest of the row says.
+        marked: present && is_shared_marker(&header),
+        sha256: parts.next().unwrap_or("").trim().to_string(),
+    }
+}
+
 /// Decode the observer script's output.
 ///
 /// `own_dropin` is this agent's own drop-in path, excluded from the reserved
@@ -4761,19 +6015,23 @@ pub fn parse_observation(stdout: &str, own_dropin: &str) -> Observation {
         main_pid: property(unit, "MainPID").parse().unwrap_or(0),
     };
 
-    let marker_body = section(stdout, "AGENTMARKER");
+    let mut agent_files: Vec<AgentFileState> = section(stdout, "AGENTFILES")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_agent_file_row)
+        .collect();
+    // `agent_paths` puts the env file first. An empty section yields a default
+    // absent env file rather than a panic; `look` refuses on the row count.
+    let env = if agent_files.is_empty() {
+        AgentFileState::default()
+    } else {
+        agent_files.remove(0)
+    };
+
     let shared = section(stdout, "SHARED")
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut parts = line.split('|');
-            SharedFileState {
-                path: parts.next().unwrap_or("").to_string(),
-                present: parts.next().unwrap_or("") == "present",
-                computed_hash: parts.next().unwrap_or("").trim().to_string(),
-                declared_hash: parts.next().unwrap_or("").trim().to_string(),
-            }
-        })
+        .map(parse_shared_file_row)
         .collect();
 
     let reserved_from_agents: u64 = section(stdout, "RESERVED")
@@ -4791,9 +6049,8 @@ pub fn parse_observation(stdout: &str, own_dropin: &str) -> Observation {
     Observation {
         systemd,
         markers: MarkerState {
-            env_file_present: !marker_body.trim().is_empty(),
-            agent_marker: AgentMarker::parse(marker_body),
-            trail_present: section(stdout, "TRAIL").trim() == "yes",
+            env,
+            siblings: agent_files,
             shared,
         },
         harness_installed: section(stdout, "HARNESS").trim() == "yes",
@@ -4808,7 +6065,7 @@ Add `mod observe;` to `main.rs`.
 - [ ] **Step 4: Run to verify passing**
 
 Run: `cargo test -p buzz-backend-gcp observe`
-Expected: PASS — 9 tests.
+Expected: PASS — 13 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -4820,7 +6077,7 @@ git add -A && git commit -s -m "feat(backend-gcp): observe systemd state and mar
 
 ## Task 12: `reconcile.rs` — the I4 state machine, the fence, and the startup poll
 
-Resolves the classification half of review **P1-5**, and **P2-3**.
+Resolves the classification half of review **P1-5**, and round 2's **P1-2** (startup confirmation), **P1-4** (the per-artifact fence), the classification half of **P1-6** (the tamper verdict is gone), **P1-7** (credential rotation), **P1-8** (serialization and the narrowed fence), and **P2-3** (shared repair on `RestartSame`).
 
 **Files:**
 - Modify: `crates/buzz-backend-gcp/src/reconcile.rs` (replaces the Task 5 skeleton wholesale)
@@ -4833,11 +6090,17 @@ Resolves the classification half of review **P1-5**, and **P2-3**.
   - `reconcile::Startup` — `Confirmed | Failed(String) | Pending`
   - `reconcile::parse_startup(stdout: &str) -> Startup`
   - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, String>` (signature unchanged from Task 5, so `main.rs` needs no edit)
-- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{sq, Remote}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::naming::AgentMarker` and `crate::observe::{MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` — the parent module never names those types, so importing them there would be an unused import under `-D warnings`.
+- Consumes: `crate::capacity`, `crate::config::ProviderConfig`, `crate::naming::{Names, BINDING_VERSION, MANAGED_BY}`, `crate::observe::{self, property, section, Observation}`, `crate::remote::{sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES}`, `crate::render::{self, Plan, RemoteFile}`, `crate::secrets`, `buzz_backend_core::identity::{new_generation, AgentIdentity}`, `buzz_backend_core::wire::AgentPayload`. The test module additionally imports `crate::observe::{AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS}` and `crate::naming::AgentMarker` — the parent module never names those types, so importing them there would be an unused import under `-D warnings`.
 
-**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes roughly a dozen `gcloud` round trips (observe, three secret calls, up to six installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 40-90 s of the budget is gone before the first poll. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is roughly 8× the observed warm start while still leaving ≥ 250 s of slack under the desktop's own timeout — so a genuinely stuck agent produces this provider's actionable error naming the journal command, not the desktop's opaque one. The old 30 s was picked against nothing.
+**Why the startup budget is 240 s.** The desktop gives a deploy 600 s (`backend.rs:528`) and kills the child at that mark with `provider timed out after 600s` — an error that tells the operator nothing. Before polling begins this provider makes roughly a dozen `gcloud` round trips (observe, the lease, three secret calls, up to seven installs, the trail append, `daemon-reload` + `enable --now`), each of which pays IAP tunnel setup and lands in the 3-5 s range, so 40-90 s of the budget is gone before the first poll. On the other side, a `codex-acp` cold start on an `e2-medium` has to run the fetcher unit (a Secret Manager round trip from the VM), then load Node and the harness, then complete a relay TLS handshake and nostr auth. **240 s**, polled every 5 s, is roughly 8× that and still leaves ≥ 250 s of slack, so a stuck agent produces this provider's actionable error rather than the desktop's opaque one.
 
-**Why the fence re-reads the whole tuple.** [L2] item 4 requires destructive writes fenced to the exact observation that authorized them. Comparing only `create_intent` misses the two changes that matter most: the file becoming someone else's between the read and the write, and the agent *starting* between them. Both are re-checked.
+**Why the startup poll is scoped to one attempt.** The harness's startup line carries no generation and no start nonce (`crates/buzz-acp/src/config.rs:1119-1146`), and `enable --now` on a `Type=simple` unit returns before the new process logs anything. A poll that counts any `buzz-acp starting:` line in a fixed lookback window is therefore *confirmed by the previous run* whenever an agent is restarted soon after a success — the deploy reports a healthy start it never observed. Two independent bounds close it: `_SYSTEMD_INVOCATION_ID`, which systemd re-mints on every start, and `--since @<epoch>` taken **on the instance** immediately before `enable --now`. The first pins the query to this invocation; the second covers the case the first cannot see, where the unit was already running and `enable --now` was a no-op, so the "current" invocation id is the *old* run's.
+
+**Why the fence and the stop share one shell.** [L2] item 4 requires a destructive write fenced to the exact observation that authorized it. The previous shape read the observation in one `gcloud` round trip and performed the stop in the next, with the installs four to six round trips after that; a competing `enable --now` anywhere in that window starts a unit over a half-rewritten file set. A fence that wide is a TOCTOU with more steps. The re-read and the stop now execute in a single remote shell, and every write after it carries its **own** marker guard inside its own install script — so no later step leans on a check that ran earlier.
+
+**Why the mutating window takes a lease.** `flock` cannot span the window on its own: every round trip is a separate SSH session, so the descriptor holding the lock closes when the session ends. What `flock` *can* do is make the read-modify-write of a lease record atomic, which is exactly what a lease needs. The lock file under `/run/lock` is the mutex; a sibling owner file holds `<token> <epoch>` and expires after `DEPLOY_LEASE_SECONDS`, so a provider killed mid-window blocks the next deploy for minutes rather than forever. The lease is taken after classification (a read-only refusal must not block anyone) and released before the startup poll (which mutates nothing and may run for four minutes).
+
+**Why `RestartSame` is safe to skip the secret with.** Secret *values* are excluded from the create-intent's readable content, but a **digest** of the secret payload is folded into it (`render::plan`). A rotated `auth_tag` or API key therefore diverges the intent, `classify` returns `FencedReplace`, and the secret is re-stored before the unit starts. Without that digest `RestartSame` would restart an agent against the previous secret version while reporting success — the operator sees a healthy restart and the relay sees the old identity.
 
 - [ ] **Step 1: Write the failing classification tests**
 
@@ -4848,10 +6111,21 @@ Replace the test module of `crates/buzz-backend-gcp/src/reconcile.rs` (the Task 
 mod tests {
     use super::*;
     use crate::naming::AgentMarker;
-    use crate::observe::{MarkerState, SharedFileState, SystemdState, SHARED_PATHS};
+    use crate::observe::{
+        AgentFileState, MarkerState, SharedFileState, SystemdState, SHARED_PATHS,
+    };
 
     const NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
     const INTENT: &str = "c0ffee";
+
+    const ENV_PATH: &str = "/etc/buzz/acp-a1b2c3d4e5f6.env";
+    /// The env file's three siblings, in the order `observe::agent_paths`
+    /// reports them after it: agent drop-in, fetcher drop-in, trail.
+    const SIBLING_PATHS: [&str; 3] = [
+        "/etc/systemd/system/buzz-acp@a1b2c3d4e5f6.service.d/agent.conf",
+        "/etc/systemd/system/buzz-acp-secret@a1b2c3d4e5f6.service.d/agent.conf",
+        "/etc/buzz/acp-a1b2c3d4e5f6.trail",
+    ];
 
     fn pubkey() -> String {
         AgentIdentity::from_nsec(NSEC)
@@ -4866,8 +6140,8 @@ mod tests {
             .map(|path| SharedFileState {
                 path: (*path).to_string(),
                 present: true,
-                computed_hash: format!("hash-{path}"),
-                declared_hash: format!("hash-{path}"),
+                marked: true,
+                sha256: format!("hash-{path}"),
             })
             .collect()
     }
@@ -4890,13 +6164,29 @@ mod tests {
         }
     }
 
-    fn obs(systemd: SystemdState, env_file_present: bool, marker: Option<AgentMarker>) -> Observation {
+    /// Siblings default to absent; the tests that exercise the per-artifact
+    /// fence make one present and say what is wrong with it.
+    fn obs(
+        systemd: SystemdState,
+        env_present: bool,
+        marker: Option<AgentMarker>,
+    ) -> Observation {
         Observation {
             systemd,
             markers: MarkerState {
-                env_file_present,
-                agent_marker: marker,
-                trail_present: false,
+                env: AgentFileState {
+                    path: ENV_PATH.to_string(),
+                    present: env_present,
+                    marker,
+                },
+                siblings: SIBLING_PATHS
+                    .iter()
+                    .map(|path| AgentFileState {
+                        path: (*path).to_string(),
+                        present: false,
+                        marker: None,
+                    })
+                    .collect(),
                 shared: healthy_shared(),
             },
             harness_installed: true,
@@ -4939,7 +6229,7 @@ mod tests {
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
     }
 
-    /// P1-5's exact case: a real unit with no env file must never classify as
+    /// Round 1's P1-5 case: a real unit with no env file must never classify as
     /// `Create`, or the provider installs its files around somebody else's unit.
     #[test]
     fn a_known_instance_with_no_marker_is_refused_never_created() {
@@ -4953,7 +6243,10 @@ mod tests {
     #[test]
     fn an_unmarked_env_file_is_refused_never_overwritten() {
         let o = obs(systemd("disabled", "inactive", 0), true, None);
-        assert!(matches!(classify(&o, &pubkey(), INTENT), Action::Refuse(_)));
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("a present, unmarked env file must never be overwritten")
+        };
+        assert!(why.contains(ENV_PATH), "the refusal must name the file: {why}");
     }
 
     /// The 12-hex name is collision-resistant, not collision-free.
@@ -4964,26 +6257,83 @@ mod tests {
             create_intent: INTENT.to_string(),
         });
         let o = obs(systemd("enabled", "inactive", 0), true, foreign);
-        let action = classify(&o, &pubkey(), INTENT);
-        assert!(matches!(action, Action::Refuse(_)), "got {action:?}");
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("a foreign pubkey must not be adopted")
+        };
+        assert!(why.contains("collision"), "{why}");
+        assert!(why.contains(ENV_PATH), "{why}");
     }
 
-    /// A shared file with our name but no marker is somebody else's file.
+    /// P1-4's exact case. `FencedReplace` rewrites all four per-agent files and
+    /// `remove` deletes all four, so authorizing that from the env file's
+    /// header alone destroys a hand-written drop-in no fence ever looked at.
+    #[test]
+    fn a_marked_env_file_does_not_authorize_writing_an_unmarked_sibling() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
+        o.markers.siblings[0].present = true;
+        o.markers.siblings[0].marker = None;
+        let action = classify(&o, &pubkey(), INTENT);
+        let Action::Refuse(why) = action else {
+            panic!("an unmarked sibling must stop the deploy, got {action:?}")
+        };
+        assert!(
+            why.contains(SIBLING_PATHS[0]),
+            "the refusal must name the offending file: {why}"
+        );
+        assert!(
+            !why.contains(ENV_PATH),
+            "the env file is fine; naming it sends the operator to the wrong \
+             place: {why}"
+        );
+    }
+
+    /// …and a sibling belonging to a *different* agent is a refusal for a
+    /// different reason, so the two messages must not be interchangeable.
+    #[test]
+    fn a_sibling_belonging_to_another_agent_is_refused_by_name() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
+        o.markers.siblings[2].present = true;
+        o.markers.siblings[2].marker = Some(AgentMarker {
+            pubkey_full: "ff".repeat(32),
+            create_intent: "stale".to_string(),
+        });
+        let Action::Refuse(why) = classify(&o, &pubkey(), INTENT) else {
+            panic!("a foreign sibling must stop the deploy")
+        };
+        assert!(why.contains(SIBLING_PATHS[2]), "{why}");
+        assert!(why.contains("collision"), "{why}");
+    }
+
+    /// All four present and all four ours is the ordinary replace — the fence
+    /// must not be so strict that a legitimate reconfiguration cannot proceed.
+    #[test]
+    fn every_per_agent_file_marked_for_this_agent_is_a_fenced_replace() {
+        let mut o = obs(systemd("enabled", "inactive", 0), true, ours("stale"));
+        for sibling in &mut o.markers.siblings {
+            sibling.present = true;
+            sibling.marker = ours("stale");
+        }
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::FencedReplace);
+    }
+
+    /// A shared file with our name but no provider marker is somebody else's.
     #[test]
     fn an_unmarked_shared_file_is_refused() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
-        o.markers.shared[0].declared_hash = String::new();
+        o.markers.shared[0].marked = false;
         let action = classify(&o, &pubkey(), INTENT);
         assert!(matches!(action, Action::Refuse(_)), "got {action:?}");
     }
 
-    /// A shared file whose content no longer matches its own declared hash was
-    /// edited underneath us; rewriting it would erase the evidence.
+    /// A *marked* shared file whose bytes differ from ours is an older
+    /// rendering of ours and is upgraded in place. There is deliberately no
+    /// third verdict: nothing in the file claims what its own content should
+    /// be, so there is nothing for the content to disagree with (`naming.rs`).
     #[test]
-    fn a_tampered_shared_file_is_refused() {
+    fn a_marked_shared_file_with_different_bytes_is_not_a_refusal() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
-        o.markers.shared[1].computed_hash = "something-else".to_string();
-        assert!(matches!(classify(&o, &pubkey(), INTENT), Action::Refuse(_)));
+        o.markers.shared[1].sha256 = "an-older-rendering".to_string();
+        assert_eq!(classify(&o, &pubkey(), INTENT), Action::Create);
     }
 
     /// A missing shared file is normal on a first deploy, not a refusal.
@@ -4992,37 +6342,47 @@ mod tests {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
         for shared in &mut o.markers.shared {
             shared.present = false;
-            shared.computed_hash = String::new();
-            shared.declared_hash = String::new();
+            shared.marked = false;
+            shared.sha256 = String::new();
         }
         assert_eq!(classify(&o, &pubkey(), INTENT), Action::Create);
     }
 }
 ```
 
-- [ ] **Step 2: Write the failing shared-write and startup tests**
+- [ ] **Step 2: Write the failing shared-write, startup, lease and fence tests**
 
 Append to the same test module:
 
 ```rust
+    fn shared_artifact(path: &str, sha256: &str) -> crate::render::SharedArtifact {
+        crate::render::SharedArtifact {
+            file: RemoteFile {
+                path: path.to_string(),
+                mode: "0644",
+                body: String::new(),
+                owner_marker: Vec::new(),
+            },
+            sha256: sha256.to_string(),
+        }
+    }
+
     fn plan_with_shared(hashes: [&str; 3]) -> Plan {
         Plan {
             per_agent: Vec::new(),
             shared: SHARED_PATHS
                 .iter()
                 .zip(hashes)
-                .map(|(path, hash)| crate::render::SharedArtifact {
-                    file: RemoteFile {
-                        path: (*path).to_string(),
-                        mode: "0644",
-                        body: String::new(),
-                    },
-                    content_hash: hash.to_string(),
-                })
+                .map(|(path, sha256)| shared_artifact(path, sha256))
                 .collect(),
             secret_env: std::collections::BTreeMap::new(),
             create_intent: INTENT.to_string(),
-            trail_header: String::new(),
+            trail: RemoteFile {
+                path: SIBLING_PATHS[2].to_string(),
+                mode: "0644",
+                body: String::new(),
+                owner_marker: Vec::new(),
+            },
         }
     }
 
@@ -5043,8 +6403,8 @@ Append to the same test module:
     fn an_absent_shared_file_is_written() {
         let mut o = obs(systemd("disabled", "inactive", 0), false, None);
         o.markers.shared[2].present = false;
-        o.markers.shared[2].computed_hash = String::new();
-        o.markers.shared[2].declared_hash = String::new();
+        o.markers.shared[2].marked = false;
+        o.markers.shared[2].sha256 = String::new();
         let plan = plan_with_shared([
             "hash-/etc/systemd/system/buzz-acp@.service",
             "hash-/etc/systemd/system/buzz-acp-secret@.service",
@@ -5055,8 +6415,8 @@ Append to the same test module:
         assert_eq!(writes[0].path, SHARED_PATHS[2]);
     }
 
-    /// A shared file present with a *different* content hash is an older
-    /// rendering of ours and is upgraded in place.
+    /// A shared file present with different bytes is an older rendering of
+    /// ours and is upgraded in place.
     #[test]
     fn a_stale_shared_file_is_rewritten() {
         let o = obs(systemd("disabled", "inactive", 0), false, None);
@@ -5070,24 +6430,36 @@ Append to the same test module:
         assert_eq!(writes[0].path, SHARED_PATHS[0]);
     }
 
+    /// One startup poll's stdout. `journal` is the count of matching harness
+    /// lines the *scoped* query returned.
+    fn poll(active: &str, main_pid: u32, result: &str, journal: u32) -> String {
+        format!(
+            "---UNIT---\nActiveState={active}\nMainPID={main_pid}\nResult={result}\n\
+             InvocationID=1c1b0c1b0c1b0c1b0c1b0c1b0c1b0c1b\n\
+             ---JOURNAL---\n{journal}\n---END---\n"
+        )
+    }
+
     #[test]
     fn a_confirmed_start_needs_a_live_pid_and_the_harness_line() {
-        let confirmed = "---UNIT---\nActiveState=active\nMainPID=4242\nResult=success\n\
-                         ---JOURNAL---\n1\n---END---\n";
-        assert_eq!(parse_startup(confirmed), Startup::Confirmed);
+        assert_eq!(
+            parse_startup(&poll("active", 4242, "success", 1)),
+            Startup::Confirmed
+        );
     }
 
     /// systemd calling the unit `active` is not the harness having started —
     /// I4's "live" means the process is confirmed running.
     #[test]
     fn an_active_unit_without_the_harness_line_is_still_pending() {
-        let pending = "---UNIT---\nActiveState=active\nMainPID=4242\nResult=success\n\
-                       ---JOURNAL---\n0\n---END---\n";
-        assert_eq!(parse_startup(pending), Startup::Pending);
-
-        let no_pid = "---UNIT---\nActiveState=activating\nMainPID=0\nResult=success\n\
-                      ---JOURNAL---\n0\n---END---\n";
-        assert_eq!(parse_startup(no_pid), Startup::Pending);
+        assert_eq!(
+            parse_startup(&poll("active", 4242, "success", 0)),
+            Startup::Pending
+        );
+        assert_eq!(
+            parse_startup(&poll("activating", 0, "success", 0)),
+            Startup::Pending
+        );
     }
 
     /// A failed unit must end the poll immediately: burning the whole budget
@@ -5095,12 +6467,74 @@ Append to the same test module:
     /// produces a worse error.
     #[test]
     fn a_failed_unit_ends_the_poll_immediately() {
-        let failed = "---UNIT---\nActiveState=failed\nMainPID=0\nResult=exit-code\n\
-                      ---JOURNAL---\n0\n---END---\n";
-        let Startup::Failed(why) = parse_startup(failed) else {
+        let Startup::Failed(why) = parse_startup(&poll("failed", 0, "exit-code", 0)) else {
             panic!("a failed unit must not read as pending")
         };
         assert!(why.contains("exit-code"), "{why}");
+    }
+
+    /// P1-2, both halves. The scoping has to live in the **query**: a poll that
+    /// grepped a fixed lookback window would be satisfied by the previous run's
+    /// `buzz-acp starting:` line, and `parse_startup` could never tell the
+    /// difference. With the query scoped, a unit that is up with a live PID
+    /// from an earlier run returns zero matches and stays `Pending`.
+    #[test]
+    fn a_prior_runs_startup_line_cannot_confirm_this_attempt() {
+        let script = startup_script("buzz-acp@a1b2c3d4e5f6.service", 1_754_384_042);
+        assert!(script.contains("_SYSTEMD_INVOCATION_ID="), "{script}");
+        assert!(script.contains("@1754384042"), "{script}");
+        assert!(
+            !script.contains("-30 min"),
+            "a fixed lookback window admits the previous run's line: {script}"
+        );
+        assert_eq!(
+            parse_startup(&poll("active", 4242, "success", 0)),
+            Startup::Pending
+        );
+    }
+
+    /// P1-8: the mutating window is serialized per agent, the holder is
+    /// identifiable, and an abandoned lease expires rather than wedging the
+    /// instance.
+    #[test]
+    fn the_deploy_lease_is_per_agent_identifiable_and_bounded() {
+        let script = acquire_lease_script("a1b2c3d4e5f6", "tok3n");
+        assert!(script.contains("a1b2c3d4e5f6"), "the lease is per agent: {script}");
+        assert!(script.contains("flock"), "{script}");
+        assert!(script.contains("tok3n"), "the holder is identifiable: {script}");
+        assert!(
+            script.contains(&LOCK_UNAVAILABLE.to_string()),
+            "a loser must exit with the code the caller can explain: {script}"
+        );
+        assert!(
+            script.contains(&DEPLOY_LEASE_SECONDS.to_string()),
+            "an abandoned lease must expire: {script}"
+        );
+        // Release must never steal: it clears the record only if we hold it.
+        let release = release_lease_script("a1b2c3d4e5f6", "tok3n");
+        assert!(release.contains("tok3n"), "{release}");
+        assert!(release.contains("rm -f"), "{release}");
+    }
+
+    /// P1-8's other half: the re-read that authorizes the stop runs in the same
+    /// shell as the stop. A fence in one round trip and a `disable --now` in
+    /// the next is a TOCTOU with more steps.
+    #[test]
+    fn the_destructive_fence_and_the_stop_share_one_shell() {
+        let names = Names::from_pubkey_hex(&pubkey()).unwrap();
+        let script = fenced_stop_script(&names, &pubkey(), INTENT);
+        assert!(script.contains(&sq(&names.env_path())), "{script}");
+        assert!(script.contains(INTENT), "the intent is re-compared: {script}");
+        assert!(
+            script.contains("is-active"),
+            "the running state is re-checked: {script}"
+        );
+        let reread = script.find("agent-pubkey-full").expect("the marker re-read");
+        let stop = script.find("disable --now").expect("the stop");
+        assert!(
+            reread < stop,
+            "the re-read must precede the stop it authorizes: {script}"
+        );
     }
 ```
 
@@ -5118,14 +6552,17 @@ Replace `crates/buzz-backend-gcp/src/reconcile.rs`'s non-test content in full:
 //!
 //! `deploy` is not "create": the desktop issues it on every Start and tracks
 //! no substrate state. The only way that is safe is for a live instance to be
-//! a strict no-op and for every destructive write to be fenced to the exact
-//! observation that authorized it.
+//! a strict no-op, and for every destructive write to be fenced to the exact
+//! observation that authorized it — in the same remote shell, not four round
+//! trips later.
 
 use crate::capacity;
 use crate::config::ProviderConfig;
-use crate::naming::{Names, MANAGED_BY};
+use crate::naming::{Names, BINDING_VERSION, MANAGED_BY};
 use crate::observe::{self, property, section, Observation};
-use crate::remote::{sq, Remote};
+use crate::remote::{
+    sq, Remote, AGENT_STARTED, LOCK_UNAVAILABLE, MARKER_CHANGED, MARKER_SCAN_LINES,
+};
 use crate::render::{self, Plan, RemoteFile};
 use crate::secrets;
 use buzz_backend_core::identity::{new_generation, AgentIdentity};
@@ -5146,6 +6583,19 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(240);
 /// One `gcloud compute ssh` round trip costs 3-5 s on its own, so polling
 /// faster than this buys nothing but load.
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a deploy lease on the instance stays valid.
+///
+/// It covers the mutating window only — the installs, the trail append and
+/// `enable --now`, roughly seven to eleven `gcloud` round trips at 3-5 s each —
+/// not the startup poll that follows. Generous enough that a slow link cannot
+/// lose the lease mid-write; short enough that a provider killed between
+/// acquire and release blocks the next deploy for minutes rather than forever.
+const DEPLOY_LEASE_SECONDS: u64 = 300;
+
+/// How long to wait for the lease's `flock` itself. The critical section under
+/// it is three file operations, so anything longer means a wedged holder.
+const LEASE_FLOCK_WAIT_SECONDS: u64 = 5;
 
 /// The harness's own first log line. Its presence is what distinguishes
 /// "systemd accepted the unit" from "the agent started".
@@ -5175,9 +6625,11 @@ pub enum Action {
 /// taken on somebody else's file cannot be undone by a later check.
 pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
     // Shared artifacts first: they are installed once and depended on by every
-    // instance, so one unowned file poisons every deploy on the box.
+    // instance, so one unowned file poisons every deploy on the box. A marked
+    // shared file whose bytes differ is an older rendering of ours, not a
+    // finding — nothing in the file claims what its own content should be.
     for shared in &obs.markers.shared {
-        if shared.present && !shared.marked() {
+        if shared.present && !shared.marked {
             return Action::Refuse(format!(
                 "{} exists but carries no {MANAGED_BY} provider marker. It is \
                  somebody else's file that happens to share our name; refusing \
@@ -5186,48 +6638,54 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
                 shared.path
             ));
         }
-        if shared.tampered() {
+    }
+
+    // Then **every** per-agent artifact against its own header, not the env
+    // file's. `FencedReplace` rewrites all four and `remove` deletes all four,
+    // so authorizing that from one sibling is "delete enumerated paths if one
+    // of them is marked" — the opposite of the auto-repair fence
+    // (`docs/remote-agents.md:1460-1476`). A file that fails is reported and
+    // left exactly where it is.
+    for file in obs.markers.agent_files() {
+        if !file.present {
+            continue;
+        }
+        let Some(marker) = file.marker.as_ref() else {
             return Action::Refuse(format!(
-                "{} carries our marker but its content no longer matches the \
-                 hash that marker declares — it was edited outside this \
-                 provider. Refusing to overwrite the change silently; restore \
-                 or delete the file.",
-                shared.path
+                "{} exists but carries no {MANAGED_BY} marker at binding \
+                 version {BINDING_VERSION}. Refusing to overwrite or delete a \
+                 file this provider did not write; it is untouched. Move it \
+                 aside to let this deploy proceed.",
+                file.path
+            ));
+        };
+        if marker.pubkey_full != pubkey_full {
+            return Action::Refuse(format!(
+                "short-name collision: {} belongs to pubkey {}, not \
+                 {pubkey_full}. The 12-hex instance name is \
+                 collision-resistant, not collision-free; refusing rather than \
+                 destroying another agent's deployment.",
+                file.path, marker.pubkey_full
             ));
         }
     }
 
     // Per-agent state. Systemd knowledge and marker ownership are separate
     // facts: a real unit with no env file must not read as "absent".
-    let known = obs.systemd.instance_known();
-    let Some(marker) = obs.markers.agent_marker.as_ref() else {
-        if known {
+    let Some(marker) = obs.markers.env.marker.as_ref() else {
+        // A *present* env file that is not ours was refused above, so reaching
+        // here means there is none — nothing of this agent's is recorded.
+        if obs.systemd.instance_known() {
             return Action::Refuse(format!(
-                "a unit for this agent exists on the instance but carries no \
-                 {MANAGED_BY} marker at this binding version. Refusing to \
-                 adopt, restart, or replace a unit this provider did not \
-                 create."
-            ));
-        }
-        if obs.markers.env_file_present {
-            return Action::Refuse(format!(
-                "an environment file for this agent exists but carries no \
-                 {MANAGED_BY} marker at this binding version. Refusing to \
-                 overwrite a file this provider did not create."
+                "a unit for this agent exists on the instance (LoadState={}, \
+                 SubState={}), but no {MANAGED_BY} marker at binding version \
+                 {BINDING_VERSION} records it. Refusing to adopt, restart, or \
+                 replace a unit this provider did not create.",
+                obs.systemd.load_state, obs.systemd.sub_state
             ));
         }
         return Action::Create;
     };
-
-    if marker.pubkey_full != pubkey_full {
-        return Action::Refuse(format!(
-            "short-name collision: the existing unit belongs to pubkey {}, not \
-             {pubkey_full}. The 12-hex instance name is collision-resistant, \
-             not collision-free; refusing rather than destroying another \
-             agent's deployment.",
-            marker.pubkey_full
-        ));
-    }
 
     // Live is a strict no-op regardless of intent: reconfiguring a running
     // agent would mean killing it, and I4 puts at-most-one-live-instance above
@@ -5245,10 +6703,13 @@ pub fn classify(obs: &Observation, pubkey_full: &str, intent: &str) -> Action {
 
 /// Which shared artifacts this deploy must write.
 ///
-/// A shared file that matches by content is skipped, which is what makes the
-/// strict no-op on a live instance actually strict rather than "no-op except
-/// for three files rewritten identically". Refusals for unmarked or tampered
-/// shared files are `classify`'s job and have already run.
+/// A shared file whose installed bytes already hash to what this provider
+/// would render is skipped, which is what makes the strict no-op on a live
+/// instance actually strict rather than "no-op except for three files
+/// rewritten identically". Both sides of the comparison are hashes of real
+/// bytes: one computed here from the rendered body, one computed on the
+/// instance from the file. Refusals for unmarked shared files are `classify`'s
+/// job and have already run.
 pub fn shared_writes<'a>(plan: &'a Plan, obs: &Observation) -> Vec<&'a RemoteFile> {
     plan.shared
         .iter()
@@ -5259,7 +6720,7 @@ pub fn shared_writes<'a>(plan: &'a Plan, obs: &Observation) -> Vec<&'a RemoteFil
                 .iter()
                 .find(|state| state.path == artifact.file.path)
             {
-                Some(state) => !state.present || state.computed_hash != artifact.content_hash,
+                Some(state) => !state.present || state.sha256 != artifact.sha256,
                 // Never observed: write it rather than assume it is there.
                 None => true,
             }
@@ -5271,7 +6732,8 @@ pub fn shared_writes<'a>(plan: &'a Plan, obs: &Observation) -> Vec<&'a RemoteFil
 /// What one startup poll saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Startup {
-    /// Active, with a live main PID, and the harness logged its own start.
+    /// Active, with a live main PID, and the harness logged its own start
+    /// **during this attempt**.
     Confirmed,
     /// systemd gave up. Polling further would only waste the budget.
     Failed(String),
@@ -5279,16 +6741,42 @@ pub enum Startup {
 }
 
 /// The remote script one startup poll runs.
-fn startup_script(unit: &str) -> String {
+///
+/// The journal query carries two independent bounds, because the harness's
+/// startup line carries no generation and no start nonce
+/// (`crates/buzz-acp/src/config.rs:1119-1146`) and `enable --now` on a
+/// `Type=simple` unit returns before the new process logs anything:
+///
+/// * `_SYSTEMD_INVOCATION_ID` pins the query to the unit's **current**
+///   invocation. systemd mints a fresh one on every start, so a line the
+///   previous run wrote is not in this set at all.
+/// * `--since @<epoch>` pins it to a timestamp read **on the instance**
+///   immediately before `enable --now`. This is the bound that covers what the
+///   invocation id cannot see: a unit already running from an earlier start,
+///   where `enable --now` is a no-op and the "current" invocation is the old
+///   run's. Its startup line predates the timestamp, the count is zero, and
+///   the poll stays `Pending` until this attempt speaks for itself.
+///
+/// The epoch comes from the instance rather than from the operator's Mac: the
+/// two clocks are unrelated, and a Mac a few seconds fast would silently
+/// exclude the very line the poll is waiting for.
+fn startup_script(unit: &str, since_epoch: u64) -> String {
     format!(
         "set -uo pipefail\n\
          echo '---UNIT---'\n\
-         systemctl show {unit} -p ActiveState -p MainPID -p Result 2>/dev/null || true\n\
+         systemctl show {unit} -p ActiveState -p MainPID -p Result -p InvocationID \
+           2>/dev/null || true\n\
          echo '---JOURNAL---'\n\
-         sudo -n journalctl -u {unit} --since '-30 min' --no-pager 2>/dev/null \
-           | grep -c {needle} || true\n\
+         inv=$(systemctl show {unit} -p InvocationID --value 2>/dev/null || true)\n\
+         if [ -n \"$inv\" ]; then\n\
+           sudo -n journalctl -u {unit} \"_SYSTEMD_INVOCATION_ID=$inv\" \
+             --since '@{since}' --no-pager 2>/dev/null | grep -c {needle} || true\n\
+         else\n\
+           echo 0\n\
+         fi\n\
          echo '---END---'\n",
         unit = sq(unit),
+        since = since_epoch,
         needle = sq(HARNESS_STARTUP_LINE),
     )
 }
@@ -5314,48 +6802,212 @@ pub fn parse_startup(stdout: &str) -> Startup {
     Startup::Pending
 }
 
-/// Re-read the authorizing observation immediately before destroying anything.
+/// Where a deploy lease lives.
+///
+/// `/run/lock` is a tmpfs systemd creates on every boot, so a lease can never
+/// outlive the reboot that made its holder irrelevant. `instance` is the
+/// 12-lowercase-hex name derived from the pubkey (`naming.rs`), which is what
+/// makes it safe to interpolate into a path.
+fn lease_paths(instance: &str) -> (String, String) {
+    (
+        format!("/run/lock/buzz-backend-gcp-{instance}.lock"),
+        format!("/run/lock/buzz-backend-gcp-{instance}.owner"),
+    )
+}
+
+/// Take the per-agent deploy lease, or exit [`LOCK_UNAVAILABLE`].
+///
+/// `flock` cannot span the mutating window on its own: every round trip is a
+/// separate SSH session, so the descriptor holding the lock closes when the
+/// session ends. What `flock` *can* do is make the read-modify-write of a lease
+/// record atomic, which is exactly what a lease needs. The lock file is the
+/// mutex; the owner file is the lease, and it carries a timestamp so an
+/// abandoned one expires instead of wedging the instance.
+///
+/// The whole critical section runs under one `sudo -n sh -c` because
+/// `/run/lock` is root-owned and `exec 9>` cannot be elevated on its own. The
+/// stored epoch is filtered to digits before the arithmetic: a corrupted record
+/// must not make `$(( ))` fail in a direction that hands out the lease.
+fn acquire_lease_script(instance: &str, token: &str) -> String {
+    let (lock, owner) = lease_paths(instance);
+    let inner = format!(
+        "set -u\n\
+         exec 9>{lock}\n\
+         flock -w {wait} 9 || exit {busy}\n\
+         now=$(date +%s)\n\
+         if [ -s {owner} ]; then\n\
+           held=$(cut -d' ' -f1 {owner})\n\
+           at=$(cut -d' ' -f2 {owner} | tr -cd '0-9')\n\
+           if [ \"$held\" != {token} ] && [ $(( now - ${{at:-0}} )) -lt {ttl} ]; then\n\
+             exit {busy}\n\
+           fi\n\
+         fi\n\
+         printf '%s %s\\n' {token} \"$now\" > {owner}\n",
+        lock = sq(&lock),
+        owner = sq(&owner),
+        token = sq(token),
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+        ttl = DEPLOY_LEASE_SECONDS,
+        busy = LOCK_UNAVAILABLE,
+    );
+    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+}
+
+/// Release the lease — but only if we still hold it. A release that stole
+/// somebody else's would be worse than having no lease at all.
+fn release_lease_script(instance: &str, token: &str) -> String {
+    let (lock, owner) = lease_paths(instance);
+    let inner = format!(
+        "set -u\n\
+         exec 9>{lock}\n\
+         flock -w {wait} 9 || exit 0\n\
+         if [ \"$(cut -d' ' -f1 {owner} 2>/dev/null || true)\" = {token} ]; then\n\
+           rm -f {owner}\n\
+         fi\n",
+        lock = sq(&lock),
+        owner = sq(&owner),
+        token = sq(token),
+        wait = LEASE_FLOCK_WAIT_SECONDS,
+    );
+    format!("set -uo pipefail\nsudo -n sh -c {}\n", sq(&inner))
+}
+
+/// The lease, released when it leaves scope.
+///
+/// The guard exists so that every `?` in the mutating window releases on the
+/// way out — including the ones added after it was written.
+struct DeployLease<'a> {
+    remote: &'a Remote,
+    instance: String,
+}
+
+impl Drop for DeployLease<'_> {
+    /// Best effort. A release that does not land is not a leak: the record
+    /// expires after `DEPLOY_LEASE_SECONDS`, which is the reason it carries a
+    /// timestamp. There is nothing useful to report from a destructor — the
+    /// operation that mattered has already returned its own result.
+    fn drop(&mut self) {
+        let _ = self
+            .remote
+            .run(&release_lease_script(&self.instance, self.remote.token()));
+    }
+}
+
+/// Serialize the mutating window, or fail cleanly.
+///
+/// Losing is not an error to work around — it is the correct outcome: the loser
+/// mutates nothing and says so, which is what makes "deploys are unserialised"
+/// acceptable in the first place.
+fn acquire_lease<'a>(remote: &'a Remote, names: &Names) -> Result<DeployLease<'a>, String> {
+    let out = remote.run(&acquire_lease_script(names.instance(), remote.token()))?;
+    if out.code == LOCK_UNAVAILABLE {
+        return Err(format!(
+            "another deploy of {} is already in progress on this instance. \
+             Nothing was modified; wait for it to finish and start again. A \
+             lease left behind by a provider that died is reclaimed after \
+             {DEPLOY_LEASE_SECONDS}s.",
+            names.unit()
+        ));
+    }
+    if !out.ok() {
+        return Err(format!(
+            "could not take the deploy lease for {} (exit {}): {}",
+            names.unit(),
+            out.code,
+            out.stderr.trim()
+        ));
+    }
+    Ok(DeployLease {
+        remote,
+        instance: names.instance().to_string(),
+    })
+}
+
+/// Re-read the authorizing observation **and** perform the stop it authorizes,
+/// in one remote shell.
 ///
 /// [L2] item 4 requires a destructive write fenced to the exact observation
-/// that authorized it. Comparing only the create-intent misses the two changes
-/// that matter most: the marker becoming somebody else's, and the agent having
-/// *started* since we classified.
-fn fence(
+/// that authorized it. Reading in one round trip and stopping in the next
+/// leaves a window a competing `enable --now` can start a unit in; here the
+/// window is the microseconds between two `systemctl` calls on the instance.
+/// Everything written afterwards carries its own marker guard inside its own
+/// install script, so nothing downstream leans on this check.
+///
+/// [`MARKER_CHANGED`] means the marker moved, [`AGENT_STARTED`] means the agent
+/// started. Both are clean refusals that changed nothing, and each earns its
+/// own message.
+fn fenced_stop_script(names: &Names, pubkey_full: &str, intent: &str) -> String {
+    format!(
+        "set -uo pipefail\n\
+         h=$(sudo -n sed -n '1,{scan}p' {env} 2>/dev/null || true)\n\
+         field() {{ printf '%s\\n' \"$h\" | sed -n \"s/^# $1: //p\" | head -n 1; }}\n\
+         if [ \"$(field managed-by)\" != {managed_by} ] \
+            || [ \"$(field binding-version)\" != {version} ] \
+            || [ \"$(field agent-pubkey-full)\" != {pubkey} ] \
+            || [ \"$(field create-intent)\" != {intent} ]; then\n\
+           exit {changed}\n\
+         fi\n\
+         if [ \"$(systemctl is-active {unit} 2>/dev/null || true)\" = active ]; then\n\
+           exit {started}\n\
+         fi\n\
+         sudo -n systemctl disable --now {unit} 2>/dev/null || true\n\
+         sudo -n systemctl stop {secret_unit} 2>/dev/null || true\n",
+        scan = MARKER_SCAN_LINES,
+        env = sq(&names.env_path()),
+        managed_by = sq(MANAGED_BY),
+        version = sq(BINDING_VERSION),
+        pubkey = sq(pubkey_full),
+        intent = sq(intent),
+        unit = sq(&names.unit()),
+        secret_unit = sq(&names.secret_unit()),
+        changed = MARKER_CHANGED,
+        started = AGENT_STARTED,
+    )
+}
+
+/// Run the fenced stop and translate its exit code into the operator's terms.
+fn fenced_stop(
     remote: &Remote,
     names: &Names,
-    harness: &str,
-    authorized: &Observation,
+    pubkey_full: &str,
+    intent: &str,
 ) -> Result<(), String> {
-    let now = observe::look(remote, names, harness)?;
-    if now.markers.agent_marker != authorized.markers.agent_marker {
-        return Err(format!(
+    let out = remote.run(&fenced_stop_script(names, pubkey_full, intent))?;
+    match out.code {
+        MARKER_CHANGED => Err(format!(
             "{} changed while this deploy was preparing: its management marker \
              no longer matches the one that authorized the replacement. \
              Nothing was modified; run the deploy again.",
             names.env_path()
-        ));
-    }
-    if now.systemd.running() {
-        return Err(format!(
+        )),
+        AGENT_STARTED => Err(format!(
             "{} started while this deploy was preparing. Refusing to stop a \
              running agent (I4); nothing was modified.",
             names.unit()
-        ));
+        )),
+        _ if out.ok() => Ok(()),
+        code => Err(format!(
+            "stopping the stale {} failed (exit {code}): {}",
+            names.unit(),
+            out.stderr.trim()
+        )),
     }
-    Ok(())
 }
 
 /// Poll until the harness confirms it started, or the budget runs out.
 ///
-/// Takes `cfg` only so both failure messages can print the exact `gcloud`
-/// command the operator needs; a message that says "check the journal" without
-/// saying how is a message nobody acts on.
+/// `since_epoch` is the instance's own clock, read immediately before
+/// `enable --now`, and it is what keeps a previous run's startup line from
+/// confirming this attempt. Takes `cfg` only so both failure messages can print
+/// the exact `gcloud` command the operator needs; a message that says "check
+/// the journal" without saying how is a message nobody acts on.
 fn confirm_started(
     remote: &Remote,
     names: &Names,
     cfg: &ProviderConfig,
+    since_epoch: u64,
 ) -> Result<String, String> {
-    let script = startup_script(&names.unit());
+    let script = startup_script(&names.unit(), since_epoch);
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let inspect = format!(
         "gcloud compute ssh {instance} --zone {zone} --tunnel-through-iap \
@@ -5406,6 +7058,9 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     let names = Names::new(&identity);
     let generation = new_generation();
     let plan = render::plan(agent, cfg, &names, &identity, &generation)?;
+    // Taken from the original payload, and identical either way: the renderer
+    // rewrites `launch.command` to `/usr/local/bin/<basename>`, whose basename
+    // is this same string.
     let harness = render::harness_basename(agent);
 
     // ---- Transport phase. -------------------------------------------------
@@ -5424,7 +7079,7 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
     }
 
     // Matched by reference so `action` survives for the two comparisons below.
-    // Taking it by value here would move it — the defect this revision fixes.
+    // Taking it by value here would move it.
     let action = classify(&obs, identity.pubkey_hex(), &plan.create_intent);
     match &action {
         Action::Refuse(why) => return Err(why.clone()),
@@ -5445,83 +7100,106 @@ pub fn deploy(cfg: &ProviderConfig, agent: &AgentPayload) -> Result<String, Stri
         eprintln!("{warning}");
     }
 
-    if action == Action::FencedReplace {
-        fence(&remote, &names, &harness, &obs)?;
+    // ---- Mutating window, serialized per agent. ---------------------------
+    // The lease is taken here rather than before `observe`, so a read-only
+    // refusal never blocks a concurrent deploy; and it is released at the end
+    // of this block rather than after `confirm_started`, because the poll
+    // mutates nothing and may run for four minutes.
+    let started_at = {
+        let _lease = acquire_lease(&remote, &names)?;
+
+        if action == Action::FencedReplace {
+            fenced_stop(&remote, &names, identity.pubkey_hex(), &plan.create_intent)?;
+        }
+
+        // Shared artifacts are repaired on every acting path, `RestartSame`
+        // included. Zero mutation is I4's requirement for a *live* instance,
+        // not for a stopped one — and the agent unit `Requires=` the fetcher
+        // unit, so a shared template deleted out of band is a start failure
+        // that re-entry would otherwise never converge on. Written before the
+        // per-agent files because the agent unit depends on them.
+        for file in shared_writes(&plan, &obs) {
+            remote.install(file)?;
+        }
+
+        if action != Action::RestartSame {
+            let service_account = secrets::instance_service_account(
+                &remote,
+                &cfg.project,
+                &cfg.zone,
+                &cfg.instance,
+            )?;
+            secrets::store(
+                &remote,
+                &cfg.project,
+                &names.secret_name(),
+                identity.pubkey_hex(),
+                &plan.secret_body(),
+                &service_account,
+            )?;
+            for file in &plan.per_agent {
+                remote.install(file)?;
+            }
+        }
+        // `RestartSame` skipping the secret is sound only because the intent
+        // covers a digest of the secret payload (`render::plan`): a rotated
+        // credential diverges the intent, so this branch is unreachable for one
+        // and no agent is ever restarted against a stale secret version.
+
+        // The durable record, written before the start attempt so a deploy that
+        // then fails to start still leaves its capacity warning behind.
+        remote.append(
+            &plan.trail,
+            &capacity::trail_record(
+                &capacity::now_rfc3339(),
+                &generation,
+                &plan.create_intent,
+                &warnings,
+            ),
+        )?;
+
+        // The instance's own clock, printed after the reload and before the
+        // start, is what bounds the startup query. It cannot be read on this
+        // machine: the two clocks are unrelated.
         let out = remote.run(&format!(
-            "set -uo pipefail; \
-             sudo -n systemctl disable --now {unit} 2>/dev/null || true; \
-             sudo -n systemctl stop {secret_unit} 2>/dev/null || true",
+            "set -euo pipefail\n\
+             sudo -n systemctl daemon-reload\n\
+             echo '---STARTEDAT---'\n\
+             date +%s\n\
+             echo '---START---'\n\
+             sudo -n systemctl enable --now {unit}\n",
             unit = sq(&names.unit()),
-            secret_unit = sq(&names.secret_unit()),
         ))?;
         if !out.ok() {
             return Err(format!(
-                "stopping the stale {} failed (exit {}): {}",
+                "starting {} failed (exit {}): {}",
                 names.unit(),
                 out.code,
                 out.stderr.trim()
             ));
         }
-    }
+        section(&out.stdout, "STARTEDAT")
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| {
+                format!(
+                    "{} was started, but the instance's clock could not be read \
+                     alongside it, so this deploy cannot bound the journal to \
+                     its own attempt. Check the unit with `systemctl status {}`.",
+                    names.unit(),
+                    names.unit()
+                )
+            })?
+    };
 
-    if action != Action::RestartSame {
-        let service_account =
-            secrets::instance_service_account(&remote, &cfg.project, &cfg.zone, &cfg.instance)?;
-        secrets::store(
-            &remote,
-            &cfg.project,
-            &names.secret_name(),
-            identity.pubkey_hex(),
-            &plan.secret_body(),
-            &service_account,
-        )?;
-        // Shared first: the agent unit `Requires=` the fetcher unit, so the
-        // fetcher must exist before the agent unit is enabled.
-        for file in shared_writes(&plan, &obs) {
-            remote.install(file)?;
-        }
-        for file in &plan.per_agent {
-            remote.install(file)?;
-        }
-    }
-
-    // The durable record, written before the start attempt so a deploy that
-    // then fails to start still leaves its capacity warning behind.
-    remote.append(
-        &names.trail_path(),
-        "0644",
-        &plan.trail_header,
-        &capacity::trail_record(
-            &capacity::now_rfc3339(),
-            &generation,
-            &plan.create_intent,
-            &warnings,
-        ),
-    )?;
-
-    let out = remote.run(&format!(
-        "set -euo pipefail; \
-         sudo -n systemctl daemon-reload; \
-         sudo -n systemctl enable --now {unit}",
-        unit = sq(&names.unit()),
-    ))?;
-    if !out.ok() {
-        return Err(format!(
-            "starting {} failed (exit {}): {}",
-            names.unit(),
-            out.code,
-            out.stderr.trim()
-        ));
-    }
-
-    confirm_started(&remote, &names, cfg)
+    confirm_started(&remote, &names, cfg, started_at)
 }
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 17 new `reconcile` tests plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
+Expected: PASS — 23 new `reconcile` tests plus everything from Tasks 1-11. The four wire goldens still pass: `deploy` reaches `Remote::new` only after the pure phase, so `deploy-no-owner` and `deploy-ordinary-provider` still stop offline.
 
 - [ ] **Step 6: Commit**
 
@@ -5533,23 +7211,23 @@ git add -A && git commit -s -m "feat(backend-gcp): I4 reconciler with a full-tup
 
 ## Task 13: Operator subcommands — `list`, `remove`, `dry-run`
 
-Resolves review **P2-4**, **P2-6**, and P3's "`dry-run` is exercised by no acceptance criterion".
+Resolves review **P2-4**, **P2-6**, P3's "`dry-run` is exercised by no acceptance criterion", and round 2's **P1-4** (`remove`'s fence must read each file it deletes) and **P2-2** (an agent whose env file is gone must still be visible and still be removable).
 
 **Files:**
 - Create: `crates/buzz-backend-gcp/src/operator.rs`
 - Modify: `crates/buzz-backend-gcp/src/main.rs` (add `mod operator;` and the argv branch)
 
 **Interfaces:**
-- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`
-- Consumes: `crate::config::{self, ProviderConfig}`, `crate::naming::{self, Names, MANAGED_BY}`, `crate::remote::{sq, Remote}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`.
+- Produces: `operator::Cli` (clap `Parser`), `operator::Cmd`, `operator::run(cli: Cli) -> Result<(), String>`, `operator::render_listing(stdout: &str) -> String`, and the private `instance_of`, `resolve_target`, `listing_script`, `verify_removable`, `removal_script`
+- Consumes: `crate::capacity`, `crate::config::{self, ProviderConfig}`, `crate::naming::{self, AgentMarker, Names, MANAGED_BY}`, `crate::observe::SHARED_PATHS` (tests only), `crate::remote::{sq, Remote, MARKER_SCAN_LINES}`, `crate::render`, `crate::secrets`, `buzz_backend_core::identity::AgentIdentity`, `buzz_backend_core::wire::DeployRequest`, `clap`.
 
 The desktop passes no argv, so argv presence unambiguously selects operator mode. With empty argv the binary behaves exactly as the protocol requires.
 
 **`remove` requires `--pubkey`, and that is the point.** `managed-by` proves only that this provider wrote a file; it says nothing about *which* agent. Since the 12-hex name is collision-resistant rather than collision-free, a `managed-by`-only fence would let `remove buzz-acp@a1b2c3d4e5f6` destroy a different agent that truncated to the same 12 hex. The full pubkey has to come from somewhere, and the operator is the only party who can supply it — which is exactly why `list` prints it.
 
-**`remove` deletes enumerated paths, never a directory.** `rm -rf /etc/systemd/system/buzz-acp@<short12>.service.d/` is not a fence, it is a fence-shaped hole: a drop-in directory is precisely where an operator puts `override.conf` or `team.conf`, and the live host already has such an out-of-band drop-in. `remove` deletes the marker-verified files it knows it wrote, then `rmdir`s each drop-in directory **only if empty**. A non-empty directory is reported, not emptied. Shared artifacts are never touched: they carry the provider-level marker and other agents depend on them.
+**`remove` deletes enumerated paths, never a directory — and fences each path on its own header.** `rm -rf /etc/systemd/system/buzz-acp@<short12>.service.d/` is not a fence, it is a fence-shaped hole: a drop-in directory is precisely where an operator puts `override.conf` or `team.conf`, and the live host already has such an out-of-band drop-in. Nor is "verify the env file, then delete four paths" a fence: that authorizes destroying a hand-written drop-in from a *sibling's* header, which is exactly what [L2]'s auto-repair rule forbids (`docs/remote-agents.md:1460-1476`). Each of the four paths carries its own veto, evaluated in the same remote shell as its own `rm`; a file that fails it is reported and left exactly where it is. `remove` then `rmdir`s each drop-in directory **only if empty**. Shared artifacts are never touched: they carry the provider-level marker and other agents depend on them.
 
-**`remove` destroys the secret before deleting local markers.** The reverse order fails in a specific way — markers gone, secret still holding a live key, no local evidence left to identify or retry it.
+**A missing env file is not "nothing to remove".** Both `list` and `remove` used to key off `/etc/buzz/acp-*.env`. Delete that one file — by hand, by a half-finished cleanup, by an interrupted `remove` — and a running, secret-bearing agent becomes invisible to `list` while `remove` answers "there is nothing here to remove". That is the operator's only reclamation path lying to them in a reachable state. `list` now unions three enumerations (the env glob, `systemctl list-units`/`list-unit-files`, and the drop-in directories) and recovers the pubkey from whichever per-agent artifact still carries a marker; `remove` proceeds without the env file, because authorization comes from `--pubkey` plus each file's own header, neither of which lives there exclusively.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5596,9 +7274,9 @@ mod tests {
     /// trail is the only place a success-path capacity warning survives.
     #[test]
     fn the_listing_shows_units_and_their_capacity_warnings() {
-        let raw = "unit\tbuzz-acp@a1b2c3d4e5f6.service\tactive\tdeadbeef\n\
+        let raw = "unit\tbuzz-acp@a1b2c3d4e5f6.service\tactive\tdeadbeef\tok\n\
                    warning\twarning capacity: adding buzz-acp@a1b2c3d4e5f6.service (2G) may cause OOM kills.\n\
-                   unit\tbuzz-acp@ffffffffffff.service\tinactive\tcafebabe\n";
+                   unit\tbuzz-acp@ffffffffffff.service\tinactive\tcafebabe\tok\n";
         let rendered = render_listing(raw);
         assert!(rendered.contains("buzz-acp@a1b2c3d4e5f6.service"));
         assert!(rendered.contains("active"));
@@ -5612,12 +7290,93 @@ mod tests {
         assert!(render_listing("").contains("no agents"));
     }
 
+    /// P2-2: an agent whose env file was deleted out of band is still running
+    /// and still holds a secret. Keying `list` off `/etc/buzz/acp-*.env` alone
+    /// made it invisible here and un-removable there — the operator's only
+    /// reclamation path lying to them in a reachable state.
+    #[test]
+    fn an_agent_whose_env_file_is_gone_is_still_listed_and_still_actionable() {
+        let rendered =
+            render_listing("unit\tbuzz-acp@a1b2c3d4e5f6.service\tactive\tdeadbeef\tno-env\n");
+        assert!(rendered.contains("buzz-acp@a1b2c3d4e5f6.service"));
+        assert!(
+            rendered.contains("deadbeef"),
+            "the pubkey survives on a sibling file: {rendered}"
+        );
+        assert!(rendered.contains("no environment file"), "{rendered}");
+        assert!(rendered.contains("`remove` still works"), "{rendered}");
+    }
+
+    /// …and when *no* per-agent file carries a marker, the row still appears
+    /// rather than being silently skipped.
+    #[test]
+    fn an_unmarked_instance_is_reported_not_hidden() {
+        let rendered =
+            render_listing("unit\tbuzz-acp@a1b2c3d4e5f6.service\tactive\t\tunmarked\n");
+        assert!(rendered.contains("buzz-acp@a1b2c3d4e5f6.service"));
+        assert!(rendered.contains("<pubkey unknown>"), "{rendered}");
+        assert!(rendered.contains(MANAGED_BY), "{rendered}");
+    }
+
+    /// P2-1: the writer and the reader, wired together. Both were previously
+    /// tested against hand-typed fixtures that happened to agree on the
+    /// `warning ` prefix, so a rename on either side would have left every test
+    /// green and the operator with no way to see an over-capacity deploy. This
+    /// feeds `capacity::trail_record`'s **real** output through the shape
+    /// `listing_script` emits and into the real reader.
+    #[test]
+    fn a_real_capacity_warning_survives_the_writer_reader_round_trip() {
+        let unit = "buzz-acp@a1b2c3d4e5f6.service";
+        let warnings = crate::capacity::warning_lines(
+            crate::capacity::GIB,
+            crate::capacity::GIB,
+            unit,
+            crate::capacity::GIB,
+        );
+        assert!(!warnings.is_empty(), "this fixture must overcommit");
+        let record = crate::capacity::trail_record(
+            "2026-08-05T09:14:02Z",
+            "3f9c1a04",
+            &"a".repeat(64),
+            &warnings,
+        );
+
+        // Exactly what `listing_script` produces from that trail: the unit row,
+        // then every line the remote `grep '^warning '` matched, tab-prefixed.
+        let mut raw = format!("unit\t{unit}\tactive\t{}\tok\n", "ab".repeat(32));
+        for line in record.lines().filter(|l| l.starts_with("warning ")) {
+            raw.push_str(&format!("warning\t{line}\n"));
+        }
+
+        let rendered = render_listing(&raw);
+        for warning in &warnings {
+            assert!(
+                rendered.contains(warning.as_str()),
+                "the reader dropped {warning:?}:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("may cause OOM kills"), "{rendered}");
+        assert!(rendered.contains("e2-standard-4"), "{rendered}");
+    }
+
+    /// The enumeration must not be the env glob alone, or the ghost above is
+    /// unreachable no matter how well `render_listing` renders it.
+    #[test]
+    fn the_listing_script_enumerates_units_as_well_as_env_files() {
+        let script = listing_script();
+        assert!(script.contains("/etc/buzz/acp-*.env"), "{script}");
+        assert!(script.contains("systemctl list-units"), "{script}");
+        assert!(script.contains("systemctl list-unit-files"), "{script}");
+        assert!(script.contains("buzz-acp@*.service.d"), "{script}");
+    }
+
     /// Enumerated paths only. A drop-in directory is where an operator keeps
     /// `override.conf`; deleting the directory is a fence-shaped hole.
     #[test]
     fn the_removal_script_deletes_named_files_and_never_a_directory_tree() {
-        let names = Names::from_pubkey_hex(&format!("a1b2c3d4e5f6{}", "0".repeat(52))).unwrap();
-        let script = removal_script(&names);
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let script = removal_script(&names, &pubkey);
         for path in [
             names.env_path(),
             names.trail_path(),
@@ -5632,6 +7391,35 @@ mod tests {
         for shared in crate::observe::SHARED_PATHS {
             assert!(!script.contains(shared), "{shared} must survive a remove");
         }
+    }
+
+    /// P1-4: each deletion is vetoed by the header of the file *it* deletes,
+    /// in the same shell as the deletion. Authorizing four `rm`s from one
+    /// sibling's header is "delete these paths if one of them is marked".
+    #[test]
+    fn every_deletion_is_fenced_on_the_file_it_deletes() {
+        let pubkey = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        let names = Names::from_pubkey_hex(&pubkey).unwrap();
+        let script = removal_script(&names, &pubkey);
+        for required in [
+            naming::header_line("managed-by", MANAGED_BY),
+            naming::header_line("binding-version", naming::BINDING_VERSION),
+            naming::header_line("agent-pubkey-full", &pubkey),
+        ] {
+            assert!(script.contains(&sq(&required)), "the fence omits {required:?}");
+        }
+        assert!(
+            script.contains(r#"head -n 4 "$p""#),
+            "the fence must read the file being deleted: {script}"
+        );
+        assert!(script.contains(r#"rm -f "$p""#), "{script}");
+        assert!(
+            script.contains("kept $p"),
+            "a file that fails the fence must be reported, not silently skipped"
+        );
+        // `create-intent` changes on every legitimate reconfiguration, so a
+        // fence that required it would refuse a file this agent wrote itself.
+        assert!(!script.contains("create-intent"), "{script}");
     }
 
     /// The marker check runs against the file's own header, and must require
@@ -5678,7 +7466,7 @@ Prepend to `crates/buzz-backend-gcp/src/operator.rs`:
 
 use crate::config::{self, ProviderConfig};
 use crate::naming::{self, AgentMarker, Names, MANAGED_BY};
-use crate::remote::{sq, Remote};
+use crate::remote::{sq, Remote, MARKER_SCAN_LINES};
 use crate::secrets;
 use clap::{Parser, Subcommand};
 
@@ -5784,28 +7572,85 @@ fn resolve_target(agent_id: &str, pubkey: &str) -> Result<(Names, String), Strin
 }
 
 /// The remote script `list` runs.
+///
+/// Three independent enumerations, unioned: the env-file glob, the units
+/// systemd knows about, and the drop-in directories. Keying off
+/// `/etc/buzz/acp-*.env` alone is what turned a deleted env file into a ghost
+/// — a running, secret-bearing agent that `list` could not see and `remove`
+/// declared absent.
+///
+/// The pubkey is read from whichever per-agent artifact still carries a marker.
+/// All four carry the same tuple, so losing one costs nothing; losing all four
+/// flags the row and sends the operator to Secret Manager, which holds the same
+/// value as an annotation (Task 10).
+///
+/// The instance-name `case` is not decoration: these ids come from a filesystem
+/// glob and from `systemctl` output, and every one of them is about to be
+/// interpolated into a path. Anything that is not exactly 12 lowercase hex is
+/// not one of ours.
 fn listing_script() -> String {
     format!(
         "set -uo pipefail\n\
-         for f in /etc/buzz/acp-*.env; do\n\
-           [ -e \"$f\" ] || continue\n\
-           i=$(basename \"$f\" .env); i=${{i#acp-}}\n\
-           mb=$(sudo -n sed -n 's/^# managed-by: //p' \"$f\" | head -n 1)\n\
-           [ \"$mb\" = '{MANAGED_BY}' ] || continue\n\
-           pk=$(sudo -n sed -n 's/^# agent-pubkey-full: //p' \"$f\" | head -n 1)\n\
+         ids=$(\n\
+           {{\n\
+             for f in /etc/buzz/acp-*.env; do\n\
+               [ -e \"$f\" ] || continue\n\
+               b=$(basename \"$f\" .env); printf '%s\\n' \"${{b#acp-}}\"\n\
+             done\n\
+             systemctl list-units --all --no-legend --plain 'buzz-acp@*.service' \
+               2>/dev/null | awk '{{print $1}}'\n\
+             systemctl list-unit-files --no-legend --plain 'buzz-acp@*.service' \
+               2>/dev/null | awk '{{print $1}}'\n\
+             for d in /etc/systemd/system/buzz-acp@*.service.d; do\n\
+               [ -d \"$d\" ] || continue\n\
+               basename \"$d\" .service.d\n\
+             done\n\
+           }} | sed -n 's/^buzz-acp@//; s/\\.service$//; p' | sort -u\n\
+         )\n\
+         for i in $ids; do\n\
+           case \"$i\" in\n\
+             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;\n\
+             *) continue ;;\n\
+           esac\n\
+           env=\"/etc/buzz/acp-$i.env\"\n\
+           trail=\"/etc/buzz/acp-$i.trail\"\n\
+           pk=''\n\
+           for c in \"$env\" \"$trail\" \
+             \"/etc/systemd/system/buzz-acp@$i.service.d/agent.conf\" \
+             \"/etc/systemd/system/buzz-acp-secret@$i.service.d/agent.conf\"; do\n\
+             sudo -n test -e \"$c\" || continue\n\
+             h=$(sudo -n head -n {scan} \"$c\")\n\
+             printf '%s\\n' \"$h\" | grep -Fxq {managed_by} || continue\n\
+             printf '%s\\n' \"$h\" | grep -Fxq {binding_version} || continue\n\
+             pk=$(printf '%s\\n' \"$h\" | sed -n 's/^# agent-pubkey-full: //p' | head -n 1)\n\
+             if [ -n \"$pk\" ]; then break; fi\n\
+           done\n\
+           flags=ok\n\
+           if [ -z \"$pk\" ]; then flags=unmarked; fi\n\
+           if ! sudo -n test -e \"$env\"; then flags=no-env; fi\n\
            st=$(systemctl is-active \"buzz-acp@$i.service\" 2>/dev/null || echo unknown)\n\
-           printf 'unit\\tbuzz-acp@%s.service\\t%s\\t%s\\n' \"$i\" \"$st\" \"$pk\"\n\
-           t=\"/etc/buzz/acp-$i.trail\"\n\
-           if sudo -n test -e \"$t\"; then\n\
-             sudo -n sed -n 's/^\\(warning .*\\)$/warning\\t\\1/p' \"$t\"\n\
+           printf 'unit\\tbuzz-acp@%s.service\\t%s\\t%s\\t%s\\n' \"$i\" \"$st\" \"$pk\" \"$flags\"\n\
+           if sudo -n test -e \"$trail\"; then\n\
+             sudo -n grep '^warning ' \"$trail\" 2>/dev/null | while IFS= read -r w; do\n\
+               printf 'warning\\t%s\\n' \"$w\"\n\
+             done\n\
            fi\n\
-         done\n"
+         done\n",
+        scan = MARKER_SCAN_LINES,
+        managed_by = sq(&naming::header_line("managed-by", MANAGED_BY)),
+        binding_version = sq(&naming::header_line(
+            "binding-version",
+            naming::BINDING_VERSION
+        )),
     )
 }
 
 /// Turn the listing script's tab-separated output into operator-readable text.
 ///
-/// Pure, so the rendering is tested without an instance.
+/// Pure, so the rendering is tested without an instance — and the *writer* of
+/// the `warning ` lines it reads is exercised against this function directly
+/// (Task 8 Step 1), because two sides agreeing with two hand-typed fixtures is
+/// not the same as two sides agreeing with each other.
 pub fn render_listing(stdout: &str) -> String {
     let mut out = String::new();
     let mut units = 0usize;
@@ -5816,8 +7661,28 @@ pub fn render_listing(stdout: &str) -> String {
                 units += 1;
                 let unit = fields.next().unwrap_or("<unknown>");
                 let state = fields.next().unwrap_or("unknown");
-                let pubkey = fields.next().unwrap_or("<unmarked>");
+                let pubkey = fields.next().unwrap_or("");
+                let flags = fields.next().unwrap_or("");
+                let pubkey = if pubkey.is_empty() {
+                    "<pubkey unknown>"
+                } else {
+                    pubkey
+                };
                 out.push_str(&format!("{unit}\t{state}\t{pubkey}\n"));
+                match flags {
+                    "no-env" => out.push_str(
+                        "    no environment file — the unit, its drop-ins and its Secret \
+                         Manager secret outlived it. It is still running and `remove` still \
+                         works.\n",
+                    ),
+                    "unmarked" => out.push_str(&format!(
+                        "    no {MANAGED_BY} marker on any of this agent's files. Recover the \
+                         pubkey with `gcloud secrets list \
+                         --filter=\"labels.managed_by={MANAGED_BY}\" \
+                         --format=\"value(name,annotations)\"`.\n"
+                    )),
+                    _ => {}
+                }
             }
             Some("warning") => {
                 out.push_str(&format!("    {}\n", fields.next().unwrap_or_default()));
@@ -5866,14 +7731,41 @@ fn verify_removable(body: &str, pubkey_full: &str, path: &str) -> Result<(), Str
 }
 
 /// The remote script that deletes this agent's own files — by name, never a
-/// directory tree — and tidies each drop-in directory only when it is empty.
-fn removal_script(names: &Names) -> String {
+/// directory tree, and each one only if **its own** header says it is ours.
+///
+/// The previous shape verified the env file in Rust and then `rm -f`'d four
+/// enumerated paths. That is "delete these paths if one of them is marked", not
+/// "delete only marked paths": a hand-written drop-in beside a marked env file
+/// was destroyed by a fence that never looked at it. Each path now carries its
+/// own veto, evaluated in the same shell as its own `rm`, and a file that fails
+/// it is reported and left exactly where it is.
+///
+/// `create-intent` is deliberately **not** among the required lines: it changes
+/// on every legitimate reconfiguration, so requiring it would refuse a file
+/// this very agent wrote yesterday.
+fn removal_script(names: &Names, pubkey_full: &str) -> String {
+    let required = [
+        naming::header_line("managed-by", MANAGED_BY),
+        naming::header_line("binding-version", naming::BINDING_VERSION),
+        naming::header_line("agent-pubkey-full", pubkey_full),
+    ];
+    let needles: String = required
+        .iter()
+        .map(|line| format!(" -e {}", sq(line)))
+        .collect();
     format!(
         "set -uo pipefail\n\
          sudo -n systemctl disable --now {unit} 2>/dev/null || true\n\
          sudo -n systemctl stop {secret_unit} 2>/dev/null || true\n\
          for p in {env} {trail} {dropin} {secret_dropin}; do\n\
-           sudo -n rm -f \"$p\"\n\
+           sudo -n test -e \"$p\" || continue\n\
+           n=$(sudo -n head -n {scan} \"$p\" | grep -c -F -x{needles} || true)\n\
+           if [ \"$n\" -eq {count} ]; then\n\
+             sudo -n rm -f \"$p\"\n\
+           else\n\
+             echo \"kept $p: it carries no {managed_by} marker for this agent at \
+binding version {version}\"\n\
+           fi\n\
          done\n\
          for d in {dropin_dir} {secret_dropin_dir}; do\n\
            if sudo -n test -d \"$d\"; then\n\
@@ -5889,6 +7781,11 @@ fn removal_script(names: &Names) -> String {
         trail = sq(&names.trail_path()),
         dropin = sq(&names.dropin_path()),
         secret_dropin = sq(&names.secret_dropin_path()),
+        scan = MARKER_SCAN_LINES,
+        needles = needles,
+        count = required.len(),
+        managed_by = MANAGED_BY,
+        version = naming::BINDING_VERSION,
         dropin_dir = sq(&names.dropin_dir()),
         secret_dropin_dir = sq(&names.secret_dropin_dir()),
     )
@@ -5897,11 +7794,17 @@ fn removal_script(names: &Names) -> String {
 fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Result<(), String> {
     let (names, pubkey) = resolve_target(agent_id, pubkey)?;
 
-    // Re-read the authorizing evidence immediately before acting on it. Every
-    // per-agent file carries the same tuple, so one read fences them all — and
-    // it is read here, not earlier, so nothing stale can authorize a deletion.
+    // Read the env file's header immediately before acting on it — but a
+    // *missing* env file is not "nothing to remove". The unit, both drop-ins,
+    // the trail and the Secret Manager secret all outlive it, and an operator
+    // whose only reclamation path answers "nothing here" for a running,
+    // secret-bearing agent has no reclamation path at all. Authorization comes
+    // from `--pubkey` and from each file's own header, checked inside
+    // `removal_script` in the same shell as that file's own `rm`, so a missing
+    // env file withholds nothing this operation needs.
     let out = remote.run(&format!(
-        "sudo -n sed -n '1,4p' {env} 2>/dev/null || true",
+        "sudo -n sed -n '1,{scan}p' {env} 2>/dev/null || true",
+        scan = MARKER_SCAN_LINES,
         env = sq(&names.env_path()),
     ))?;
     if !out.ok() {
@@ -5913,13 +7816,16 @@ fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Resul
         ));
     }
     if out.stdout.trim().is_empty() {
-        return Err(format!(
-            "{} does not exist on the instance; there is nothing here to \
-             remove under that identity.",
-            names.env_path()
-        ));
+        eprintln!(
+            "note: {} is absent. Removing {} by pubkey anyway — the unit, its \
+             drop-ins, the trail and the secret can all outlive the env file, \
+             and each deletion is still fenced on that file's own marker.",
+            names.env_path(),
+            names.unit()
+        );
+    } else {
+        verify_removable(&out.stdout, &pubkey, &names.env_path())?;
     }
-    verify_removable(&out.stdout, &pubkey, &names.env_path())?;
 
     // Secret first. The reverse order leaves markers gone, the secret still
     // holding a live key, and no local evidence left to identify or retry it.
@@ -5928,7 +7834,7 @@ fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Resul
     // delete-of-absent as success ([L2] item 4).
     secrets::destroy(remote, project, &names.secret_name(), &pubkey)?;
 
-    let out = remote.run(&removal_script(&names))?;
+    let out = remote.run(&removal_script(&names, &pubkey))?;
     if !out.ok() {
         return Err(format!(
             "removing {agent_id} failed (exit {}): {}",
@@ -5936,6 +7842,8 @@ fn remove(remote: &Remote, project: &str, agent_id: &str, pubkey: &str) -> Resul
             out.stderr.trim()
         ));
     }
+    // Any `kept …` line is a file this provider declined to delete. Printing it
+    // is the whole point: silence would read as a clean sweep.
     print!("{}", out.stdout);
     println!("removed {agent_id}");
     Ok(())
@@ -5999,7 +7907,7 @@ fn main() {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p buzz-backend-gcp`
-Expected: PASS — 7 new `operator` tests, and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
+Expected: PASS — 12 `operator` tests, and every wire test still green (they spawn the binary with **no** argv, so they must still see protocol behavior).
 
 - [ ] **Step 6: Exercise `dry-run` as the acceptance criterion the design asks for**
 
@@ -6102,17 +8010,19 @@ selector.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `project` | string | `zoop-innovation` | |
-| `zone` | string | `asia-south1-a` | |
-| `instance` | string | `buzz-agent` | |
+| `project` | string | `zoop-innovation` | `^[a-z][a-z0-9-]{0,61}[a-z0-9]$`. Reaches `Environment=BUZZ_GCP_PROJECT=` in a root-installed drop-in. |
+| `zone` | string | `asia-south1-a` | Same grammar. |
+| `instance` | string | `buzz-agent` | Same grammar. |
 | `memory_max` | string | `2G` | systemd `MemoryMax`. `^[0-9]{1,6}(\.[0-9]{1,3})?[KMGT]?$`, uppercase suffix, `> 0`. |
 | `cpu_quota` | string | `150%` | systemd `CPUQuota`. `^[0-9]{1,3}%$`, `1`–`200` (the instance has 2 vCPU). |
 | `inactivity_seconds` | integer | `7200` | Feeds `BUZZ_ACP_EXIT_AFTER_INACTIVITY`. `0` parses but is refused — see below. |
 
-Both interpolated values are parsed against closed grammars and **rejected**,
-never sanitized: they land in a root-installed systemd drop-in, where a
-newline becomes an additional unit directive. Every `provider_config` string
-value is additionally scanned for CR, LF, and NUL.
+All five interpolated values — `project`, `zone`, `instance`, `memory_max` and
+`cpu_quota` — are parsed against closed grammars and **rejected**, never
+sanitized: they land in root-installed systemd drop-ins, where a newline becomes
+an additional unit directive and a space or `%` inside an `Environment=` value
+becomes a second assignment. Every `provider_config` string value is
+additionally scanned for CR, LF, and NUL *before* it is trimmed.
 
 No field names a credential (I2), and none may carry one.
 
@@ -6123,23 +8033,39 @@ The desktop passes no argv, so argv selects operator mode.
 | Command | Effect |
 |---|---|
 | `buzz-backend-gcp list` | Every marked unit with its state, full pubkey, and every `warning` line from its deploy trail. |
-| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Stop, disable, destroy the secret, then delete this agent's enumerated files. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. |
+| `buzz-backend-gcp remove <agent_id> --pubkey <64 hex>` | Stop, disable, destroy the secret, then delete this agent's enumerated files — each one only if its **own** header carries this pubkey; anything else is reported and left in place. `--pubkey` is required: the 12-hex name is collision-resistant, not collision-free. Copy it from `list`. |
 | `buzz-backend-gcp dry-run < request.json` | Print every rendered artifact with all secret-classified values redacted. Touches nothing. |
 
-`list` is where a capacity warning is readable: the desktop drops provider
-stderr on the success path, so an over-capacity deploy is recorded durably in
-`/etc/buzz/acp-<id>.trail` instead.
+`list` is the only place a capacity warning is readable. **Buzz Desktop will not
+show it**: `invoke_provider` keeps provider stderr only for a failed deploy
+(`backend.rs:252-280`) and drops it on success, and the response envelope has no
+`warning` field for a provider to fill. An over-capacity deploy therefore
+succeeds silently in the UI and is recorded durably in
+`/etc/buzz/acp-<id>.trail`, which `list` reads back. If an agent is OOM-killed
+later, `list` is where the connection is.
+
+`list` also enumerates `buzz-acp@*` **units**, not only `/etc/buzz/acp-*.env`.
+An agent whose env file was deleted out of band is still running and still
+holds a secret, so it is still listed — with `no environment file` on its row —
+and is still removable. Its pubkey is recovered from whichever of its four
+per-agent files still carries a marker; if none do,
+`gcloud secrets list --project <project> --filter="labels.managed_by=buzz-backend-gcp" --format="value(name,annotations)"`
+has it.
 
 ## What lands on the instance
 
-Three shared artifacts, written only when absent or when their content hash
-differs, each carrying a provider-level marker with no agent identity in it:
+Three shared artifacts, written only when absent or when their bytes differ from
+what this provider would render, each carrying a provider-level marker that
+records provenance and nothing else — no agent identity, no digest:
 
 - `/etc/systemd/system/buzz-acp@.service`
 - `/etc/systemd/system/buzz-acp-secret@.service`
 - `/usr/local/sbin/buzz-acp-fetch-key`
 
-Four per-agent artifacts, each carrying the full-pubkey marker:
+Four per-agent artifacts, each carrying the full-pubkey marker. Every install
+writes `<path>.<token>.tmp` first and `mv`s it into place, so a dropped
+connection never leaves a half-written file at a real path; and every install
+refuses if the target already exists carrying somebody else's marker:
 
 - `/etc/buzz/acp-<id>.env` (0600, allowlisted non-secret values only)
 - `/etc/systemd/system/buzz-acp@<id>.service.d/agent.conf`
@@ -6171,24 +8097,38 @@ The second binding's realization of the two lists above, in its own vocabulary:
 
 1. **L2 item 4's terms.** Identity evidence is the `agent-pubkey-full` line of
    the four-line marker header this provider writes into every per-agent file,
-   compared in full — the 12-hex instance name is collision-resistant only.
-   "Started" is `ActiveState=active` **and** a non-zero `MainPID` **and** the
-   harness's own `buzz-acp starting:` line in the journal; systemd accepting
-   the unit is not a start. Most-recent semantics come from re-reading the
-   whole marker tuple immediately before any stop, disable, or delete, and
-   from re-confirming the unit is still not running: those two comparisons are
-   the compare-and-delete this substrate has. The auto-repair fence is the
+   compared in full — the 12-hex instance name is collision-resistant only —
+   and it is read from **each artifact's own header**, not from one sibling's:
+   an unmarked drop-in beside a marked env file stops the deploy and survives
+   it. "Started" is `ActiveState=active` **and** a non-zero `MainPID` **and**
+   the harness's own `buzz-acp starting:` line in the journal, scoped to the
+   unit's *current* `InvocationID` and to a timestamp taken on the instance
+   immediately before `enable --now`; systemd accepting the unit is not a
+   start, and neither is a line the previous run left behind. Most-recent
+   semantics come from re-reading the whole marker tuple and the running state
+   **in the same remote shell** as the stop that depends on them, so the
+   compare and the act are not separated by a round trip. Every write is
+   staged to `<path>.<token>.tmp` and `mv`d into place, so no target path is
+   ever observed half-written and the fence never has a truncated fragment to
+   refuse forever. The mutating window is serialized by a per-agent lease on
+   the instance (`flock` over a lease record under `/run/lock`), and a deploy
+   that loses it mutates nothing and says so. The auto-repair fence is the
    marker itself — no destructive action touches a file lacking the marker of
    its own tier.
 2. **Two marker tiers.** Per-agent artifacts carry `managed-by`,
    `binding-version`, `agent-pubkey-full`, and `create-intent`. Shared
    artifacts — the two template units and the fetcher script — carry
-   `managed-by`, `binding-version`, `scope: provider-shared`, and a
-   `content-hash`, and **no agent identity at all**, because a file used by
-   every instance belongs to none of them. Shared artifacts are written only
-   when absent or when their content differs, which is what makes the
+   `managed-by`, `binding-version`, and `scope: provider-shared`, and **no
+   agent identity at all**, because a file used by every instance belongs to
+   none of them. The provider-level marker records provenance and nothing
+   else: it makes no claim about the file's content, because a claim a file
+   makes about itself is worth exactly what its writer is worth. Shared
+   artifacts are written only when absent or when the bytes on the instance
+   differ from the bytes this provider would render — compared by hashing both,
+   not by trusting a digest stored in the file — which is what makes the
    live-instance no-op zero-mutation rather than "no-op except three files
-   rewritten identically".
+   rewritten identically". A shared file present with no provider marker is a
+   refusal, not an overwrite.
 3. **Lifetime policy.** Bounded (`inactivity_seconds > 0`) is `Restart=no`.
    Indefinite (`inactivity_seconds: 0`) parses — it is the blessed opt-in and
    must not be rejected as invalid — and is then **refused by deploy** with a
@@ -6209,7 +8149,18 @@ The second binding's realization of the two lists above, in its own vocabulary:
 6. **The fetcher unit.** The agent unit's `IPAddressDeny=169.254.169.254/32`
    is a cgroup-wide filter, so a metadata-authenticated fetch cannot live
    inside it; `buzz-acp-secret@%i.service` exists solely to run outside that
-   cgroup, and carries every other sandbox directive the agent unit does.
+   cgroup. It carries `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`,
+   `ProtectSystem=strict`, `ProtectHome`, `ProtectKernelTunables`,
+   `ProtectKernelModules`, `ProtectControlGroups`, `RestrictSUIDSGID`,
+   `RestrictRealtime`, `LockPersonality`,
+   `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, `AmbientCapabilities=`,
+   `TasksMax=128`, and `ReadWritePaths=` scoped to its own runtime directory.
+   It differs from the agent unit in exactly three places, each deliberate:
+   no `IPAddressDeny` (its reason to exist); `CapabilityBoundingSet=CAP_CHOWN`
+   rather than empty, because the fetched file is `chown`ed to `buzzacp` so the
+   agent unit's manager can hand it over as an `EnvironmentFile=` while the
+   agent *process* cannot reach it; and `ReadWritePaths=-/run/buzz-acp-%i`
+   rather than `/var/lib/buzzacp`.
 ```
 
 Add to the `## Implementation Correspondence` table (`:1680`):
@@ -6314,7 +8265,28 @@ the allowlist is not holding.
 Expected: a non-zero count for `REDACTED` and `0` for `nsec1` (the second
 `grep -c` exits 1 with no matches, which is the pass condition).
 
-- [ ] **Step 7: Verify the I4 no-op, shared files included**
+- [ ] **Step 7: Verify the fetcher unit carries the hardening the docs claim**
+
+Task 14's `[L3]` section and the README both enumerate this unit's sandbox
+directives. A directive that is documented but not present is worse than one
+that is neither, so read them back from the loaded unit rather than from the
+file:
+
+```bash
+gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
+  --project zoop-innovation --command \
+  'systemctl show buzz-acp-secret@<id>.service \
+     -p PrivateDevices -p ProtectKernelTunables -p ProtectKernelModules \
+     -p ProtectControlGroups -p RestrictRealtime -p CapabilityBoundingSet \
+     -p AmbientCapabilities -p TasksMax -p ReadWritePaths -p IPAddressDeny'
+```
+Expected: the five `Protect*`/`Restrict*`/`Private*` booleans are `yes`;
+`CapabilityBoundingSet=cap_chown` and nothing else; `AmbientCapabilities` empty;
+`TasksMax=128`; `ReadWritePaths=/run/buzz-acp-<id>`; and `IPAddressDeny` empty —
+its absence is the whole reason this unit exists. Any mismatch means
+`FETCHER_UNIT` and Task 14's documentation have drifted apart.
+
+- [ ] **Step 8: Verify the I4 no-op, shared files included**
 
 Record the state, click Start again in the desktop, then re-read it.
 
@@ -6329,16 +8301,62 @@ gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
 ```
 Expected: **every** value identical before and after. A changed
 `ActiveEnterTimestamp` means the live instance was restarted, violating I4. A
-changed mtime on any shared file means the write-only-when-changed rule
+changed mtime on any shared file means the write-only-when-the-bytes-differ rule
 regressed and the no-op is not strict.
 
-- [ ] **Step 8: Exercise the agent end to end**
+- [ ] **Step 9: Verify the over-capacity warning reaches the operator**
+
+Writer and reader are wired together in a unit test (Task 8 Step 1), but only a
+live deploy proves the warning survives the round trip to a root-owned file and
+back. Deploy a second throwaway agent that cannot fit: the instance has ~2.7 GB
+available and the first agent already reserves 2G.
+
+Create an agent named `smoke-big`, harness `codex-acp`, Run on `gcp`, leave
+`memory_max` at its `2G` default, and submit. Then:
+
+```bash
+~/.local/bin/buzz-backend-gcp list
+```
+Expected: the deploy **succeeds** — overcommit is reported, never vetoed — and
+`list` prints three indented `warning capacity:` lines under the new unit's row,
+including `may cause OOM kills` and `e2-standard-4`. Rows without their warnings
+mean the trail's `warning ` prefix and `listing_script`'s extractor have drifted
+apart and the round-1 blind spot is back. The desktop shows none of this: it
+drops provider stderr on the success path, which is why the trail exists (Task
+8's preamble — and the README says so to the operator).
+
+Tear this second agent down before continuing:
+
+```bash
+~/.local/bin/buzz-backend-gcp remove buzz-acp@<big-id> --pubkey <big-pk>
+```
+
+- [ ] **Step 10: Verify two concurrent deploys do not interleave**
+
+The mutating window is serialized by a per-agent lease on the instance, and a
+loser must fail cleanly rather than half-write. Run the same request twice at
+once, straight at the binary — the desktop passes no argv, so this is exactly
+the invocation it makes:
+
+```bash
+jq '.provider_config = {}' /tmp/audit.json > /tmp/race.json
+~/.local/bin/buzz-backend-gcp < /tmp/race.json > /tmp/race-a.json &
+~/.local/bin/buzz-backend-gcp < /tmp/race.json > /tmp/race-b.json &
+wait
+jq -r '.ok, (.error // .agent_id)' /tmp/race-a.json /tmp/race-b.json
+```
+Expected: at most one `true`, and any `false` carries
+`another deploy of buzz-acp@<id> is already in progress`. A second failure with
+any *other* message — a half-installed file, a marker refusal, a `systemctl`
+error — means the lease is not covering the window it must.
+
+- [ ] **Step 11: Exercise the agent end to end**
 
 Add the agent to a channel from the desktop and mention it.
 Expected: it replies — proving identity assembly, owner resolution, the
 respond-to gate, and the tmpfs secret path all survived the remote route.
 
-- [ ] **Step 9: Verify the marker fence actually refuses**
+- [ ] **Step 12: Verify the marker fence actually refuses**
 
 ```bash
 ~/.local/bin/buzz-backend-gcp remove buzz-acp@<id> --pubkey $(printf 'f%.0s' {1..64})
@@ -6346,7 +8364,34 @@ respond-to gate, and the tmpfs secret path all survived the remote route.
 Expected: a refusal naming the mismatch, and **no** change on the instance.
 Confirm with `~/.local/bin/buzz-backend-gcp list` that the unit is still there.
 
-- [ ] **Step 10: Tear down and verify the ordering**
+- [ ] **Step 13: Verify a per-agent file this provider did not write is left alone**
+
+The auto-repair fence is per artifact, not per agent: an unmarked sibling must
+stop the write and survive it. Replace one drop-in with an unmarked file, then
+redeploy from the desktop.
+
+```bash
+gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
+  --project zoop-innovation --command \
+  'sudo systemctl stop buzz-acp@<id>.service; \
+   sudo cp /etc/systemd/system/buzz-acp@<id>.service.d/agent.conf /tmp/agent.conf.bak; \
+   printf "[Service]\nMemoryMax=1G\n" | \
+     sudo install -m 0644 /dev/stdin /etc/systemd/system/buzz-acp@<id>.service.d/agent.conf'
+```
+
+Click Start in the desktop.
+Expected: a refusal naming that exact path — not the env file — and the
+hand-written `MemoryMax=1G` still present afterwards. Restore it, then confirm
+the next Start succeeds:
+
+```bash
+gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
+  --project zoop-innovation --command \
+  'sudo install -m 0644 /tmp/agent.conf.bak \
+     /etc/systemd/system/buzz-acp@<id>.service.d/agent.conf; sudo rm -f /tmp/agent.conf.bak'
+```
+
+- [ ] **Step 14: Tear down and verify the ordering**
 
 ```bash
 ~/.local/bin/buzz-backend-gcp list          # copy the full pubkey for <pk>
@@ -6361,17 +8406,17 @@ gcloud compute ssh buzz-agent --zone asia-south1-a --tunnel-through-iap \
    ls /etc/systemd/system/buzz-acp@<id>.service.d 2>/dev/null || echo "drop-in dir gone"'
 ```
 Expected: `removed buzz-acp@<id>`; the unit absent from `list`; no secret rows
-for `<id>`; the **three shared artifacts still present** (other agents depend
-on them, and they are re-verified by content hash on the next deploy); and the
+for `<id>`; the **three shared artifacts still present** (other agents depend on
+them, and the next deploy re-checks them by comparing their bytes); and the
 drop-in directory gone because it was empty.
 
-- [ ] **Step 11: Full gate**
+- [ ] **Step 15: Full gate**
 
 Run: `just ci`
 Expected: PASS. This is the only run of the full gate; the per-task steps used
 `cargo test -p …` plus `cargo clippy -p buzz-backend-gcp`.
 
-- [ ] **Step 12: Commit any fixes and open the PR**
+- [ ] **Step 16: Commit any fixes and open the PR**
 
 ```bash
 git add -A && git commit -s -m "test(backend-gcp): live smoke fixes"
@@ -6381,7 +8426,7 @@ git add -A && git commit -s -m "test(backend-gcp): live smoke fixes"
 
 ## Self-Review
 
-Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-backend-gcp-design.md`), not the revision that preceded it.
+Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-backend-gcp-design.md`), not the revision that preceded it, and against both review rounds.
 
 ### Spec coverage
 
@@ -6392,11 +8437,11 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | §`crates/buzz-backend-core` | Tasks 1-3 |
 | §`crates/buzz-backend-gcp` module table | Tasks 4-13, one module per task or per half-task |
 | §`info` | Task 4 |
-| §`provider_config` v1 fields, §Value grammars | Task 4 (`parse_memory_max`, `parse_cpu_quota`, `reject_control_characters`, the named injection payloads) |
-| §Refusals that precede deserialization | Task 5 (raw-JSON, trimmed, exact + padded + control fixtures) |
+| §`provider_config` v1 fields, §Value grammars | Task 4 (`parse_memory_max`, `parse_cpu_quota`, `parse_resource_name`, `reject_control_characters`, the named injection payloads) |
+| §Refusals that precede deserialization | Task 5 (raw-JSON, trimmed, exact + padded + control fixtures, and an ordering test) |
 | §Environment Construction | Task 2 (shared `build_env`) |
 | §Binding-specific split: a non-secret allowlist | Task 7 (`NON_SECRET_KEYS`, the four-value leak test) |
-| §Host-resolved values | Task 7 (`harness_basename`) + Task 12 (the `harness_installed` refusal) |
+| §Host-resolved values | Task 7 (`with_instance_harness`, `harness_basename`) + Task 12 (the `harness_installed` refusal) |
 | §Lifetime and Supervision | Task 7 (`Restart=no`, `TimeoutStopSec=120`, the indefinite refusal and its golden) |
 | §Naming, §Two marker tiers | Task 6 |
 | §Secret Manager ownership, destroy-before-forget | Task 10 + Task 13 (`remove` ordering) |
@@ -6409,59 +8454,83 @@ Run against the **approved** design (`docs/superpowers/specs/2026-08-05-buzz-bac
 | §Testing (every row) | Tasks 4-13 unit/integration + Task 15 live |
 | [L2] item 6 documentation | Task 14 |
 
-### The eight P1 defects, and where each is answered
+### Round 1's eight P1s — still answered, not regressed
 
 | Finding | Answer |
 |---|---|
-| P1-1 capacity warning invisible on success | Task 8 records it durably in the trail; Task 13's `list` reads it back; the design's stderr rationale is corrected in Task 8's preamble. |
+| P1-1 capacity warning invisible on success | Task 8 records it durably in the trail; Task 13's `list` reads it back; Task 14's README tells the operator the desktop will not show it. |
 | P1-2 `gcloud` not on a GUI `PATH` | Task 9 prepends the three directories and refuses with a named remedy. |
-| P1-3 two snippets do not compile | Task 12 matches `&action` so `action` survives the two later comparisons; Task 13 destructures `Cli` before matching `command`. Every other block was re-checked — see below. |
-| P1-4 no `relay-mesh` refusal | Task 5, raw JSON before `from_value`, trimmed, with exact/padded/control fixtures. |
-| P1-5 `FencedReplace` TOCTOU, observation too weak | Task 11 splits `SystemdState` from `MarkerState`; Task 12 refuses present-but-unmarked and pubkey mismatch, and `fence` re-reads the whole tuple *and* re-confirms not-running. |
-| P1-6 `memory_max`/`cpu_quota` injection | Task 4's closed grammars, the CR/LF/NUL scan before trimming, and the named injection payloads. |
+| P1-3 two snippets do not compile | Task 12 matches `&action`; Task 13 destructures `Cli` before matching `command`. Every block re-walked again this round — see below. |
+| P1-4 no `relay-mesh` refusal | Task 5, raw JSON before `from_value`, trimmed, now asserted against the exact sentence plus an ordering test. |
+| P1-5 `FencedReplace` TOCTOU, observation too weak | Task 11 splits `SystemdState` from `MarkerState`; Task 12 refuses present-but-unmarked and pubkey mismatch. Round 2 narrowed the fence further — see P1-8 below. |
+| P1-6 `memory_max`/`cpu_quota` injection | Task 4's closed grammars and the CR/LF/NUL scan before trimming. Round 2 added the third interpolation, `project`. |
 | P1-7 non-nsec secrets on disk and in `dry-run` | Task 7's allowlist, `redacted_secret_body`, and the leak test over all four values; Task 13 Step 6 exercises it. |
-| P1-8 extraction breaks unmentioned tests | Task 2 Step 4 updates both `AuthoritativeInputs` struct literals (the shared `build` helper and `inactivity_omitted_when_unset`) and adds a case covering `max_env_bytes: None`; Step 2 makes `AUTHORITATIVE_KEYS` `pub`; Step 9 runs `cargo test -p buzz-backend-core` **before** the k8s regression run. Verified while writing this revision: no test asserts the size-cap message, so rewording it changes no expectation — the extraction needs **zero** assertion edits. |
+| P1-8 extraction breaks unmentioned tests | Task 2 Step 4 updates both `AuthoritativeInputs` struct literals and adds a `max_env_bytes: None` case; Step 2 makes `AUTHORITATIVE_KEYS` `pub`; Step 9 runs `cargo test -p buzz-backend-core` before the k8s regression run. Task 1 now also adds `Clone` to `AgentPayload`/`LaunchBlock` — additive, no assertion edits. |
 
-P2-1, P2-2, P2-3, P2-4, P2-5, P2-6, P2-8 are answered by Tasks 10, 6, 12, 13, 3, 13, and 7 respectively. P2-9 (same-UID exposure) is documented as accepted residual risk in Task 14's README, matching the design. P3's `dry-run` criterion is Task 13 Step 6.
+### Round 2's nine P1s, and where each is answered
+
+| Finding | Answer |
+|---|---|
+| P1-1 `launch.command` checked as a basename, written verbatim | Task 7 `with_instance_harness` rewrites it to `/usr/local/bin/<basename>` on a **copy of the payload before `build_env` reads it**, so no consumer — present or future — can see the host path. `the_env_carries_the_instance_path_never_the_desktop_one` asserts the rendered env carries the instance path and that `/opt/homebrew` reaches no surface at all. The no-command default is corrected from `buzz-acp` (the supervisor) to `goose` (`crates/buzz-acp/src/config.rs:190-192`, the child `buzz-acp` actually execs). |
+| P1-2 startup confirmation accepts a stale journal line | Task 12's `startup_script` bounds the journal query to the unit's current `_SYSTEMD_INVOCATION_ID` **and** to `--since @<epoch>` read on the instance immediately before `enable --now` (printed by the start round trip, parsed from a `---STARTEDAT---` section). `a_prior_runs_startup_line_cannot_confirm_this_attempt` asserts both the query scoping and that a live, active unit with zero matching lines stays `Pending`. |
+| P1-3 `project` reaches a root drop-in unvalidated | Task 4 `parse_resource_name` — a closed `^[a-z][a-z0-9-]{0,61}[a-z0-9]$` grammar applied to `project`, `zone` and `instance`, before the CR/LF/NUL scan's own pass. Tests cover `zoop BUZZ_GCP_SECRET=evil`, embedded quotes, `%` specifiers, both length bounds, and CR/LF/NUL before trimming. Task 7 additionally asserts the rendered `Environment=` values contain nothing systemd's parser treats specially, so the grammar and its consumer cannot drift apart. |
+| P1-4 per-agent destruction authorized by one sibling | Task 11 reports an `AgentFileState` per artifact; Task 12's `classify` refuses on the first present-but-not-ours among all four, naming that path; Task 9's `install_script` carries the target's own marker guard in the same shell as the write; Task 13's `removal_script` vetoes each `rm` with the header of the file it deletes and reports the ones it kept. Tests: marked env + unmarked drop-in, and a sibling belonging to another agent. |
+| P1-5 Secret Manager verified once, mutated twice | Task 10 `describe_owned` immediately precedes each mutation with nothing between; `ALREADY_EXISTS` on create is a re-read-and-verify rather than a failure; a `Recorder` implementing the new `remote::Gcloud` trait asserts the exact command sequences, including that a secret swapped before the IAM grant never receives it. |
+| P1-6 the shared-artifact tamper check | **Deleted.** No `content-hash` line, no `SharedMarker` type, no `sed` strip, no `tampered()`, no tamper classification arm, no tamper tests. Shared artifacts are write-if-absent-or-content-differs, comparing `sha256sum` of the installed file against `sha256_hex` of the rendered body — both hashes of real bytes. The rationale is recorded in Global Constraints, in Task 6's preamble, in `naming.rs`'s module doc, and in the spec §Two marker tiers. |
+| P1-7 credential rotation silently fails on `RestartSame` | Task 7 folds `sha256` of the rendered secret body — hash, never value — into the create-intent, so a rotated `auth_tag` or API key diverges the intent and classifies as `FencedReplace`, which does re-store the secret. `a_rotated_credential_diverges_the_intent_without_exposing_it` asserts both halves. |
+| P1-8 concurrent deploys interleave | Task 12 takes a per-agent lease on the instance for the mutating window (`flock` making a `/run/lock` lease record's read-modify-write atomic, TTL 300 s, released by a `Drop` guard), and a loser fails cleanly with `another deploy … is already in progress`. The destructive fence is narrowed from "re-read, then stop four to six round trips before the writes" to a single remote shell that re-reads the marker tuple and the running state and performs the stop; every later write carries its own guard. Task 15 Step 10 races two real deploys. |
+| P1-9 partial writes are unmarked and unrecoverable | Task 9's `install_script` stages to `<path>.<token>.tmp` with the final mode and `mv`s into place, so no target path is ever observed half-written; `an_install_stages_and_renames_rather_than_writing_in_place` asserts the ordering, and the `trap` removes the staging file on every exit path including the ownership refusal. |
+
+**Round 2's P2s.** Folded in: P2-1 (writer→reader loop closed in Task 13 Step 1 against `capacity`'s real output, prefix contract asserted at the source in Task 8, over-capacity smoke at Task 15 Step 9, README says the desktop will not show it), P2-2 (`list` unions three enumerations and `remove` proceeds without the env file), P2-3 (`shared_writes` runs on `RestartSame`), P2-4 (`FETCHER_UNIT` carries the full set, with three documented deviations, asserted offline in Task 7 and against the loaded unit in Task 15 Step 7), P2-7 (the relay-mesh golden asserts the exact sentence). Not folded in, and recorded as residual risk below: P2-5 (capacity computed once, acted on later) and P2-6 (the standing `buzz-acp.service` is counted but not fenced).
 
 ### The three rejected findings
 
-Each is recorded in Global Constraints with its evidence, and repeated at the code that would tempt a future reader to "fix" it: stdin forwarding in `remote.rs`'s module doc, `RuntimeDirectoryMode=0750` in `render.rs`'s `FETCHER_UNIT` doc comment, and `StrictHostKeyChecking` in both `ssh_argv`'s doc comment and its test.
+Each is recorded in Global Constraints with its evidence, and repeated at the code that would tempt a future reader to "fix" it: stdin forwarding in `remote.rs`'s module doc, `RuntimeDirectoryMode=0750` in `render.rs`'s `FETCHER_UNIT` doc comment, and `StrictHostKeyChecking` in both `ssh_argv`'s doc comment and its test. Global Constraints now also carries a fourth entry — the *deleted* tamper check — for the same reason: the next reader will otherwise "restore" it.
 
 ### Type consistency across tasks
 
 - `buzz_backend_core::identity::AgentIdentity::{from_nsec, pubkey_hex, short12, short32}` — defined Task 2, used in Tasks 5, 6, 7, 12, 13. The Kubernetes newtype (Task 2 Step 7) exposes the five k8s methods its existing call sites need, unchanged.
+- `AgentPayload` / `LaunchBlock` gain `Clone` in Task 1; Task 7's `with_instance_harness` is the only caller. Additive, so no k8s call site changes.
 - `AuthoritativeInputs { generation, inactivity_seconds, max_env_bytes }` — defined Task 2; both existing call sites updated there (k8s `Some(1024 * 1024)`), new call site Task 7 (`None`).
 - `Response::info(name, description, config_schema)` — defined Task 1; call sites Task 1 (kubernetes) and Task 4 (gcp).
 - `harness::{fixture, run, run_with_env}` — defined Task 3; used Tasks 3, 4, 5, 7.
-- `Names` — defined Task 6 with both constructors; `new(&AgentIdentity)` used in Tasks 7, 12, 13; `from_pubkey_hex(&str)` used only in Task 13's `remove`. Its eleven accessors are used in Tasks 7 (`env_path`, `dropin_path`, `secret_dropin_path`, `secret_name`), 11 (`unit`, `env_path`, `trail_path`, `dropin_path`), 12 (`unit`, `secret_unit`, `env_path`, `trail_path`), and 13 (all of them plus `dropin_dir`, `secret_dropin_dir`).
-- `AgentMarker { pubkey_full, create_intent }` / `SharedMarker { content_hash }` — defined Task 6; rendered Task 7, parsed Tasks 11 and 13, compared Task 12.
-- `RemoteFile { path, mode, body }` and `SharedArtifact { file, content_hash }` — defined Task 7; consumed Tasks 9 (`install`), 12 (`shared_writes`).
-- `Plan { per_agent, shared, secret_env, create_intent, trail_header }` with `secret_body()` / `redacted_secret_body()` — defined Task 7; consumed Tasks 12 and 13.
-- `Observation { systemd, markers, harness_installed, reserved_bytes, available_bytes }` — defined Task 11; consumed Task 12. `SHARED_PATHS` is the shared ordering between Tasks 11 and 12 and matches the three `shared_artifact` calls in Task 7.
+- `config::parse_resource_name(field, value)` — defined Task 4, called three times in `ProviderConfig::parse` and nowhere else; `parse_memory_max` is additionally read back by Task 11's reserved-memory sum.
+- `naming::header_line(name, value)` — defined Task 6; the single renderer of every marker line, used by Task 7 (`agent_owner_marker`, `shared_owner_marker`), Task 9's tests, Task 11 (`observe_script`, `parse_agent_file_row`), and Task 13 (`listing_script`, `removal_script`). Every reader matches strings this produces.
+- `Names` — defined Task 6 with both constructors; `new(&AgentIdentity)` used in Tasks 7 and 12; `from_pubkey_hex(&str)` in Task 13's `remove` and in Tasks 11 and 12's tests. Its eleven accessors are used in Tasks 7, 11 (via `agent_paths`), 12 (`unit`, `secret_unit`, `env_path`, `instance`), and 13 (all of them plus `dropin_dir`, `secret_dropin_dir`).
+- `AgentMarker { pubkey_full, create_intent }` — defined Task 6; rendered Task 7, parsed Tasks 11 and 13, compared Task 12. `shared_marker()` / `is_shared_marker()` replace the former `SharedMarker` type: rendered Task 7, matched line-wise by Tasks 11 and 9.
+- `RemoteFile { path, mode, body, owner_marker }` and `SharedArtifact { file, sha256 }` — defined Task 7; consumed Tasks 9 (`install`, `append`) and 12 (`shared_writes`, and both test constructors, which pass `owner_marker: Vec::new()` because those files are never installed).
+- `Plan { per_agent, shared, secret_env, create_intent, trail }` with `secret_body()` / `redacted_secret_body()` — defined Task 7; consumed Tasks 12 and 13. `trail` is a `RemoteFile` rather than the former `trail_header: String`, which is what lets `Remote::append` carry the same fence as `Remote::install` without a fifth parameter.
+- `Observation { systemd, markers, harness_installed, reserved_bytes, available_bytes }` and `MarkerState { env, siblings, shared }` with `agent_files()` — defined Task 11; consumed Task 12. `SHARED_PATHS` is the shared ordering between Tasks 11, 12 and 13, and matches the three `shared_artifact` calls in Task 7; `agent_paths` is the shared ordering between Task 11's script and its parser.
+- `remote::Gcloud` — defined Task 9, implemented for `Remote` there, consumed by Task 10 (`&dyn Gcloud`) and implemented again by Task 10's test `Recorder`. `&Remote` coerces at every call site (Tasks 12 and 13).
+- `remote::{OWNERSHIP_REFUSED, LOCK_UNAVAILABLE, MARKER_CHANGED, AGENT_STARTED, MARKER_SCAN_LINES}` — defined Task 9; `OWNERSHIP_REFUSED` mapped by `Remote::install`/`append` in the same task, the other three by Task 12, and `MARKER_SCAN_LINES` used by Tasks 11, 12 and 13.
 - `secrets::{verify_owned, store, destroy}` take `pubkey_full: &str` — defined Task 10; `deploy` passes `identity.pubkey_hex()` (Task 12), `remove` passes the operator's normalized value (Task 13). `naming::normalize_pubkey` (Task 6) is the single validation point.
-- `capacity::{warning_lines, trail_record, now_rfc3339, parse_reported_bytes}` — defined Task 8; used in Task 7's leak test, Task 11's parser, Tasks 12 and 13.
+- `capacity::{GIB, warning_lines, trail_record, now_rfc3339, parse_reported_bytes}` — defined Task 8; used in Task 7's leak test, Task 11's parser, Task 12, and Task 13 (both `dry_run` and the writer→reader test).
 - `reconcile::deploy(cfg: &ProviderConfig, agent: &AgentPayload)` — signature fixed in Task 5 and unchanged by Task 12, so `main.rs` is written once.
 
 ### Move and borrow re-check of every code block
 
-Both reported defects are fixed, and each remaining block was walked:
+Every block was walked again after this round's edits:
 
-- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile; `PartialEq::eq` borrows. `plan.per_agent` and `plan.create_intent` are disjoint field borrows. `identity` outlives every `identity.pubkey_hex()` use. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared borrows.
-- Task 13 `run`: `Cli` is destructured first, so `command` moves while `project`/`zone`/`instance` remain owned locals — no borrow of a partially moved value.
-- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String` and the parameter is not borrowed afterwards.
-- Task 7 `plan`: `for (key, value) in env` consumes the map **after** the newline scan that borrows it — the scan's borrow ends at the loop it lives in. `create_intent` is cloned once into the marker and once into `Plan`.
-- Task 7 `feed` is a `FnMut` closure capturing `hasher` mutably; it is dropped before `hasher.finalize()` because the last `feed` call is in a `for` loop that ends first. **If the borrow checker objects, replace the closure with a plain `fn feed(hasher: &mut Sha256, label: &str, value: &str)` and pass `&mut hasher` at each call** — same behavior, no capture.
-- Task 9 `run_with_stdin`: `argv` is a local `Vec<String>` and `borrowed` a `Vec<&str>` derived from it; both live to the end of the call.
-- Task 11 `parse_observation`: every `section(...)` returns a `&str` borrowed from `stdout`, and each is converted to `String` before the `Observation` is built.
+- Task 12 `deploy`: `action` is matched **by reference**, so the later `action == Action::FencedReplace` and `action != Action::RestartSame` still compile. The mutating window is a block expression whose value is `started_at: u64`; `_lease` is dropped at its closing brace and on every `?` inside it. `plan.per_agent`, `plan.shared` and `plan.trail` are disjoint field borrows. `warnings` is borrowed by the `eprintln!` loop and then by `trail_record`, both shared.
+- Task 12 `DeployLease` holds `&'a Remote` and a `String`; `Drop` takes `&mut self` and calls `self.remote.run(…)`, which needs only `&Remote` — no aliasing conflict. `acquire_lease` returns the guard with the `remote` borrow it was given, so the lease cannot outlive the transport.
+- Task 12 `fenced_stop` matches `out.code` against three `const i32` patterns plus a guarded `_` and a binding arm; constants are legal patterns and the arms are exhaustive because the last binds.
+- Task 11 `parse_observation`: `agent_files.remove(0)` moves the env row out of the `Vec` before the remainder becomes `siblings`; every `section(...)` borrow of `stdout` ends at the `String` conversion. `MarkerState::agent_files` returns `impl Iterator<Item = &AgentFileState>` borrowing `&self`, which every caller consumes inside one expression.
+- Task 10 `store` takes `&dyn Gcloud`; `labels`/`annotations`/`member` are locals whose `&str` views live to the end of their `gcloud` call. The `match describe(...)?` arms both end before the first mutation, so no borrow of the described value survives into it.
+- Task 9 `Gcloud for Remote`: `pipe` is a named binding so the `BrokenPipe` branch can inspect the error, and it is `drop`ped explicitly before `wait_with_output` — without that the child would never see EOF.
+- Task 9 `install_script`/`append_script`/`marker_guard` are pure `String` builders over `&RemoteFile`; `staged` is computed before the `format!` that consumes it by value.
+- Task 7 `plan`: `agent` is shadowed by the owned `with_instance_harness(agent)` copy and then borrowed as `&agent` for `build_env` — the parameter is not used after the shadow. `for (key, value) in env` consumes the map **after** the newline scan that borrows it. `secret_body` is computed before the hasher and read once. `owner_marker` is cloned into each of the three `per_agent` files and moved into `trail` last.
+- Task 7 `feed` is a `FnMut` closure capturing `hasher` mutably; it is dropped before `hasher.finalize()` because its last call is in a `for` loop that ends first. **If the borrow checker objects, replace the closure with a plain `fn feed(hasher: &mut Sha256, label: &str, value: &str)` and pass `&mut hasher` at each call** — same behavior, no capture.
+- Task 13 `run`: `Cli` is destructured first, so `command` moves while `project`/`zone`/`instance` remain owned locals.
+- Task 13 `remove`: `resolve_target` returns owned `(Names, String)`, so the shadowed `pubkey` is a fresh `String`; `removal_script(&names, &pubkey)` borrows both after `secrets::destroy` has finished with them.
 - Task 5 `respond`: `raw` is borrowed by `refuse_relay_mesh(&raw)` and then **moved** into `serde_json::from_value(raw)` — the borrow has ended. Same shape as `crates/buzz-backend-kubernetes/src/main.rs:65-77`, which compiles.
-- Task 5 `deploy_agent(&deploy)` where `deploy: Box<DeployRequest>` — `&Box<T>` derefs to `&T`; identical to the k8s call at `main.rs:89`.
 
 ### Remaining risk, stated honestly
 
-1. **The shared-artifact tamper check depends on GNU `sed`.** Task 11's observer strips the marker with `sed '/^# managed-by: buzz-backend-gcp$/,+3d'`, and `addr,+N` is a GNU extension. The GCE image is Debian-family, so this holds today; on a BusyBox-`sed` image the strip silently removes nothing, every computed hash mismatches, and *every* deploy refuses with "edited outside this provider" — loud, not silent, but wrong. Task 15 Step 7 would catch it on the first live run.
-2. **Concurrent deploys of the same agent are not serialized.** Two providers can observe the same state and both proceed. The fence catches the destructive half (the second one's marker or running-state re-read disagrees) and `secrets::store` re-verifies after a create race, but two simultaneous `Create`s can still each install the same files. The outcome is convergent because the content is identical, so this is untidy rather than unsafe — and the desktop issues one deploy per Start click.
-3. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups. Correct but wasteful; a future revision should hold one SSH master connection open.
-4. **`list` enumerates by globbing `/etc/buzz/acp-*.env` rather than by Secret Manager label.** An agent whose env file was deleted but whose secret survives will not appear. The labels are written and selectable (Task 10) precisely so a follow-up can cross-check both sides; this revision does not.
-5. **No test proves the fetcher script actually runs.** Its content is asserted byte-wise offline, but its behavior — arity refusal, shape refusal, atomic rename — is only exercised by Task 15's live deploy succeeding. A shellcheck step or a container-based script test would close this; neither is in scope here.
-6. **The desktop still cannot render a success-path warning.** Task 8 works around it durably, but closing it properly needs a `warning` field added to `docs/remote-agents.md:421` and rendered desktop-side. Recorded as design §Follow-ups item 4, deliberately not attempted here.
+1. **The deploy lease is advisory and TTL-bounded, not a mutex.** A provider killed between acquire and release blocks the next deploy of that agent for up to `DEPLOY_LEASE_SECONDS` (300 s), and a lease older than that is stolen rather than waited on — so a pathologically slow mutating window could be overtaken. The window is six to eleven round trips at 3-5 s, so the margin is roughly 5×, and the loser's failure is clean either way. A real mutex would need a long-lived SSH master connection, which is the same change residual risk 3 wants.
+2. **Capacity is computed once and acted on up to 240 s later** (round 2, P2-5). `warning_lines` runs against the observation taken before the mutating window; another agent started in between is not counted. The warning is advisory and never vetoes, so the failure mode is an under-reported warning rather than a wrong action.
+3. **The pre-existing non-instanced `buzz-acp.service` is counted in capacity but never fenced** (round 2, P2-6). It contributes its declared `MemoryMax` to `reserved_bytes` and is otherwise invisible to this provider — it carries no marker, is not named `buzz-acp@*`, and is itself non-conforming (`Restart=always`). Nothing this binding does can touch it; nothing it does protects it either.
+4. **The startup poll costs one `gcloud` round trip every 5 s.** For a 240 s worst case that is up to 48 IAP tunnel setups. Correct but wasteful; a future revision should hold one SSH master connection open, which would also let the lease be a real `flock`.
+5. **`list` enumerates from the instance, never from Secret Manager.** It now unions the env glob, `systemctl list-units`/`list-unit-files` and the drop-in directories, so a deleted env file no longer hides a running agent — but an agent whose *entire* on-instance footprint is gone while its secret survives is still invisible, and the operator has to run the `gcloud secrets list --filter="labels.managed_by=buzz-backend-gcp"` the README prints. The labels exist precisely so a follow-up can cross-check both sides; this revision does not.
+6. **No test proves the fetcher script actually runs.** Its content is asserted byte-wise offline, but its behavior — arity refusal, shape refusal, the chmod/chown ordering that keeps `CapabilityBoundingSet=CAP_CHOWN` sufficient, the atomic rename — is only exercised by Task 15's live deploy succeeding. Task 15 Step 7 reads the loaded unit's directives back, which catches a documentation/unit divergence but not a script defect. A shellcheck step or a container-based script test would close it; neither is in scope here.
+7. **The desktop still cannot render a success-path warning.** Task 8 works around it durably and Task 14's README tells the operator so, but closing it properly needs a `warning` field added to `docs/remote-agents.md:421` and rendered desktop-side. Recorded as design §Follow-ups item 4, deliberately not attempted here.
+8. **A stale `<path>.<token>.tmp` can survive a hard connection loss.** The install script's `trap` removes it on every shell exit, but a connection dropped mid-write leaves the remote shell killed by SIGHUP with the staging file behind. It is inert — never at a target path, never loaded by systemd, and reaped from `/run` on reboot for the fetcher's own temp — but a `/etc` one persists until an operator removes it. This is the cost of P1-9's fix, and it is the right side of the trade: a stray `.tmp` is visible and harmless, a truncated unit file is neither.

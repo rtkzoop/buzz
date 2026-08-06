@@ -454,7 +454,6 @@ agent identity in it at all**:
 # managed-by: buzz-backend-gcp
 # binding-version: 1
 # scope: provider-shared
-# content-hash: <sha256 of the rendered body below this header>
 ```
 
 The reason is mechanical. A template unit is installed once and used by every
@@ -466,16 +465,48 @@ than "whoever deployed most recently" — while the fence that reads it is askin
 wrong in both directions: it authorizes destroying a file three other agents
 depend on, and it refuses when the file is legitimately ours. The provider-level
 marker states exactly what is true — this provider wrote it, at this binding
-version, with this content — and nothing that is not.
+version, for every instance — and nothing that is not.
 
-Shared artifacts are also **written only when absent, or when their
-`content-hash` differs from the body this provider would render.** A deploy that
+Shared artifacts are also **written only when absent, or when the bytes on the
+instance differ from the bytes this provider would render.** A deploy that
 changes nothing shared performs zero writes there, which is what makes the
 strict no-op on a live instance (§Deploy Reconciliation) actually strict rather
-than "no-op except for three files rewritten identically". A shared file present
-with a *different* `content-hash` is rewritten; a shared file present with **no
-marker at all** is a refusal, not an overwrite — it is somebody else's file that
-happens to share our name.
+than "no-op except for three files rewritten identically". The comparison is
+between two independently computed digests — `sha256sum` over the whole file on
+the instance, and a SHA-256 of the rendered body in the provider — so neither
+side trusts anything the file says about itself. A shared file whose bytes
+differ is rewritten; a shared file present with **no marker at all** is a
+refusal, not an overwrite — it is somebody else's file that happens to share our
+name.
+
+> **Amendment (round-2 review, P1-6).** An earlier draft of this section put a
+> fourth line in the provider-level marker — `# content-hash: <sha256 of the
+> rendered body below this header>` — and gated the write on recomputing it with
+> that header stripped. **That is removed.** It was unsound as specified: a
+> digest a file declares about *itself* cannot detect an editor who can also
+> edit the digest, so it never provided the tamper detection its name implied.
+> It was also actively harmful in two ways the implementation made concrete. The
+> only portable-looking way to strip a variable-length header before hashing was
+> a GNU-`sed` address range, which deletes *every* matching block in the file —
+> so directives hidden inside a second such block were excluded from the hash
+> and executed by systemd anyway — and it introduced this binding's only
+> GNU-`sed` dependency. And a future `binding-version` hashes differently, which
+> the same rule reads as "tampered", turning every provider upgrade into an
+> unrecoverable lockout of files the provider itself wrote. Finally, nothing in
+> this document's threat model asks for it: §Security Properties claims marker
+> fencing and closed value grammars, never edit detection on root-owned units.
+>
+> **Follow-up.** Out-of-band edits to a shared unit are still *detected* — they
+> make the installed bytes differ from the rendered bytes — but the response is
+> now to converge (rewrite) rather than to refuse. That is the right answer for
+> an artifact that is byte-identical across agents, carries no identity, and is
+> idempotent: an operator's local edit to a shared template was never something
+> this provider promised to preserve, and a refusal there blocks every agent on
+> the box. An operator who needs a durable local change should use a systemd
+> drop-in, which this provider never touches. If edit *auditing* on these three
+> files is ever wanted, it belongs outside the file being audited — AIDE, a
+> `PathModified=` unit, or GCE OS Config — not in a comment the editor can
+> rewrite.
 
 So the invariant the tests enforce is *"every installed file carries the marker
 of its own tier"* — never *"every installed file carries the per-agent marker"*,
@@ -484,7 +515,11 @@ which is enforceable only by making the shared marker a lie.
 `agent-pubkey-full` is what makes the 12-hex name safe: truncation is
 collision-*resistant*, not collision-free, so a candidate whose full pubkey does
 not match fails closed to the operator. **No destructive action may touch a file
-lacking the marker of its own tier** — that is the auto-repair fence.
+lacking the marker of its own tier** — that is the auto-repair fence. For a
+per-agent artifact that fence is read from **that artifact's own header**, never
+from a sibling's: a replace rewrites four files and a remove deletes four, and
+authorizing all four from one of them is "act on these paths if one of them is
+marked", which is not what this rule says.
 
 ### Secret Manager ownership
 
@@ -570,8 +605,8 @@ or shell history. That path is sound because `gcloud compute ssh` execs a real
 empirically); no `scp` staging or remote temp file is involved.
 
 1. **`/etc/systemd/system/buzz-acp@.service`** — the template unit, shared by all
-   instances. Provider-level marker; written only when absent or when its
-   `content-hash` differs.
+   instances. Provider-level marker; written only when absent or when the bytes
+   on the instance differ from the bytes rendered here.
 
 ```ini
 [Unit]
@@ -774,7 +809,7 @@ Two rules, both from getting it wrong first:
 Shared artifacts are never touched by `remove`: they carry the provider-level
 marker and other agents depend on them. Removing the last agent therefore leaves
 the three shared files behind, which is correct — they are idempotent, contentless
-with respect to identity, and re-verified by content hash on the next deploy.
+with respect to identity, and re-checked byte for byte on the next deploy.
 
 ## Security Properties
 
