@@ -40,7 +40,7 @@ pub struct DeployRequest {
 /// (`:1150-1152`), the model/provider pair arrives already resolved inside
 /// `launch`, and the timeout is ignored upstream — typing any of them would
 /// invite a provider-side remap the spec forbids.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentPayload {
     pub relay_url: String,
     pub private_key_nsec: String,
@@ -63,9 +63,15 @@ pub struct AgentPayload {
 }
 
 /// Desktop-resolved launch data (spec §Launch data).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct LaunchBlock {
-    /// Command *name*, resolved against the image's PATH — never a host path.
+    /// The command the desktop resolved, **as the desktop resolved it** — which
+    /// may be a bare name or an absolute host path
+    /// (`desktop/src-tauri/src/managed_agents/discovery.rs:443-449`). A host
+    /// path is meaningless on any remote substrate, so each binding is
+    /// responsible for reducing this to something its own substrate can exec
+    /// before it reaches an environment (see `buzz-backend-gcp`'s
+    /// `render::with_instance_harness`).
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -125,17 +131,31 @@ impl Response {
         })
     }
 
-    /// The provider's self-description (spec §Info). Pure — no cluster
+    /// The provider's self-description (spec §Info). Pure — no substrate
     /// contact — because the desktop calls it to render the config form
-    /// before a kubeconfig is known to exist.
-    pub fn info() -> Self {
+    /// before any credentials are known to exist.
+    ///
+    /// Parameterized over the binding's identity: the six response fields are
+    /// fixed by the contract (`desktop/src-tauri/src/managed_agents/backend.rs:48-63`
+    /// rejects any seventh), but `name`, `description`, and the schema are
+    /// each binding's own.
+    ///
+    /// `version` resolves to **this** crate's `CARGO_PKG_VERSION`, not the
+    /// caller's. Every workspace crate sets `version.workspace = true`, so the
+    /// value is identical today; if a binding is ever versioned separately
+    /// this constructor must gain a `version` parameter.
+    pub fn info(
+        name: &'static str,
+        description: &'static str,
+        config_schema: serde_json::Value,
+    ) -> Self {
         Response::Info(InfoResponse {
             ok: true,
-            name: "kubernetes",
+            name,
             version: env!("CARGO_PKG_VERSION"),
             protocol_version: PROTOCOL_VERSION,
-            description: "Runs agents as pods in a Kubernetes cluster",
-            config_schema: crate::config::config_schema(),
+            description,
+            config_schema,
         })
     }
 

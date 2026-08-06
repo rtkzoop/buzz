@@ -20,10 +20,9 @@ mod naming;
 mod observe;
 mod pod;
 mod reconcile;
-mod wire;
 
+use buzz_backend_core::wire::{self, Request, Response};
 use std::io::Read;
-use wire::{Request, Response};
 
 /// The provider a shared-compute agent resolves to. Refused here as the
 /// spec's backstop: a mesh agent runs on the relay's compute, so deploying it
@@ -77,7 +76,11 @@ fn respond(input: &str) -> Response {
     };
 
     match request {
-        Request::Info => Response::info(),
+        Request::Info => Response::info(
+            "kubernetes",
+            "Runs agents as pods in a Kubernetes cluster",
+            config::config_schema(),
+        ),
         Request::Deploy(deploy) => {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()

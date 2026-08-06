@@ -5,7 +5,7 @@
 //! two tiers supplied the same key, whichever entry landed in the map would
 //! win silently. Resolving in-provider makes later-wins explicit and testable.
 
-use crate::wire::{AgentPayload, LaunchBlock};
+use buzz_backend_core::wire::{AgentPayload, LaunchBlock};
 use std::collections::BTreeMap;
 
 /// Keys the authoritative tier owns.
