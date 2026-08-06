@@ -17,7 +17,6 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// grammar for *operator input* and caps at six digits. Different jobs on
 /// different data: one guards a root-installed drop-in against injection, the
 /// other reads back a ten-digit number systemd printed.
-#[allow(dead_code)] // Called once observe reads systemd's reported MemoryMax back into bytes.
 pub fn parse_reported_bytes(value: &str) -> Option<u64> {
     let text = value.trim();
     if text.is_empty() || text.eq_ignore_ascii_case("infinity") {

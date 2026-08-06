@@ -11,6 +11,7 @@
 mod capacity;
 mod config;
 mod naming;
+mod observe;
 mod reconcile;
 mod remote;
 mod render;

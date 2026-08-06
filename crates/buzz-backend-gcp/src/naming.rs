@@ -263,7 +263,6 @@ pub fn agent_ownership(body: &str) -> Ownership {
 /// rewrite when the bytes differ, and the two refusing states each earn their
 /// own message. A per-agent header answers [`Ownership::NotOurs`] because it
 /// declares no scope.
-#[allow(dead_code)] // Called once observe::parse_shared_file_row classifies a shared artifact's own header.
 pub fn shared_ownership(body: &str) -> Ownership {
     if header_field(body, "scope").as_deref() != Some(SHARED_SCOPE) {
         return Ownership::NotOurs;
@@ -316,7 +315,6 @@ impl AgentMarker {
     /// and `# create-intent:` spelled exactly as they are, or this function
     /// stops recognising the previous release's artifacts and the lockout
     /// comes straight back.
-    #[allow(dead_code)] // Called once observe::parse_agent_file_row reads an installed file's marker back.
     pub fn parse(body: &str) -> Option<Self> {
         if !agent_ownership(body).actionable() {
             return None;
