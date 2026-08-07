@@ -1,0 +1,70 @@
+# Reaches a host-side OpenAI-compatible LLM proxy (e.g. CLIProxyAPI on
+# localhost:8317) from inside the cluster.
+#
+# Agent pods cannot reach the host proxy as `localhost:8317` — inside a pod that
+# is the pod itself. This mirrors the existing relay-host-proxy: socat resolves
+# `host.orb.internal` (OrbStack's host alias) and republishes it on a NodePort,
+# so an agent pod dials `http://<node-ip>:31317/v1` with a stable address that
+# does not depend on the agent image carrying any host-network knowledge.
+#
+# Local development only: it grants any pod in the cluster access to a host port
+# with no authentication. Do not apply to a shared or production cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: buzz-llm-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-host-proxy
+  namespace: buzz-llm-proxy
+  labels:
+    app.kubernetes.io/name: llm-host-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-host-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: llm-host-proxy
+    spec:
+      containers:
+        - name: socat
+          image: alpine/socat:1.8.0.3
+          args:
+            - "-d"
+            - "-d"
+            # `fork` is required: without it socat serves one connection and
+            # exits, and the agent opens a new connection per LLM request.
+            - "TCP-LISTEN:8317,fork,reuseaddr"
+            - "TCP:host.orb.internal:8317"
+          ports:
+            - name: llm
+              containerPort: 8317
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-host-proxy
+  namespace: buzz-llm-proxy
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: llm-host-proxy
+  ports:
+    - name: llm
+      port: 8317
+      targetPort: 8317
+      # Pinned so the agent's configured base URL stays stable across re-applies.
+      nodePort: 31317
+      protocol: TCP

@@ -19,6 +19,34 @@ COPY . .
 RUN cargo build --locked --profile sprig -p sprig \
     && strip target/sprig/sprig
 
+# Grok Build CLI — the ACP agent the harness spawns for `grok`-runtime agents.
+#
+# xAI publishes the binary as a per-platform npm package (`bin/grok.br`, a
+# Brotli-compressed static ELF). We fetch the tarball for the *target* platform
+# rather than the build host's, so a cross-built image gets the right binary;
+# `--platform=$BUILDPLATFORM` keeps this fetch stage native (nothing here is
+# executed for the target) while `$TARGETARCH` selects what we download.
+#
+# The binary is statically linked with no PT_INTERP, so it runs on musl/Alpine
+# without gcompat. `GROK_VERSION` is pinned rather than `latest`: this is a
+# ~130MB proprietary binary entering the agent image, and an unpinned fetch
+# would make the image non-reproducible.
+FROM --platform=$BUILDPLATFORM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS grok
+ARG TARGETARCH
+ARG GROK_VERSION=1.0.0
+RUN apk add --no-cache brotli curl \
+    && case "$TARGETARCH" in \
+         arm64) grok_arch=linux-arm64 ;; \
+         amd64) grok_arch=linux-x64 ;; \
+         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/grok.tgz \
+         "https://registry.npmjs.org/@xai-official/grok-${grok_arch}/-/grok-${grok_arch}-${GROK_VERSION}.tgz" \
+    && tar xzf /tmp/grok.tgz -C /tmp package/bin/grok.br \
+    && mkdir -p /out \
+    && brotli -d -o /out/grok /tmp/package/bin/grok.br \
+    && chmod 0755 /out/grok
+
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 RUN apk add --no-cache bash ca-certificates curl git \
@@ -36,6 +64,8 @@ RUN for name in \
       git-credential-nostr git-sign-nostr; do \
         ln -s sprig "/usr/local/bin/$name"; \
     done
+
+COPY --from=grok --chmod=0755 /out/grok /usr/local/bin/grok
 
 ENV HOME=/home/agent \
     PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
