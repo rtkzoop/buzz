@@ -29,6 +29,20 @@ export type ProfilePanelView =
 
 export type ProfilePanelTab = "info" | "runtime" | "channels" | "memories";
 
+export type ProfileAgentPrimaryActionKind = "primary" | "restart";
+
+export function resolveProfileAgentPrimaryActionKind(input: {
+  canRestart: boolean;
+  isActive: boolean;
+  needsRestart: boolean;
+}): ProfileAgentPrimaryActionKind {
+  if (input.canRestart && input.isActive && input.needsRestart) {
+    return "restart";
+  }
+
+  return "primary";
+}
+
 export const PROFILE_PANEL_VIEW_TITLES: Record<ProfilePanelView, string> = {
   summary: "Profile",
   instructions: "Instructions",

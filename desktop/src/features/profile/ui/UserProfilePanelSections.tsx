@@ -48,6 +48,7 @@ import type {
   ProfileChannelLink,
   ProfilePanelTab,
 } from "@/features/profile/ui/UserProfilePanelUtils";
+import { resolveProfileAgentPrimaryActionKind } from "@/features/profile/ui/UserProfilePanelUtils";
 import { cn } from "@/shared/lib/cn";
 import { Alert, AlertDescription, AlertTitle } from "@/shared/ui/alert";
 import { Badge } from "@/shared/ui/badge";
@@ -331,6 +332,22 @@ export function ProfileSummaryView({
   const activeTab = tabs.some((item) => item.id === tab)
     ? tab
     : (tabs[0]?.id ?? "info");
+  const agentIsActive =
+    managedAgent?.status === "running" || managedAgent?.status === "deployed";
+  const agentPrimaryActionKind = resolveProfileAgentPrimaryActionKind({
+    canRestart: managedAgent?.backend.type === "local",
+    isActive: agentIsActive,
+    needsRestart: managedAgent?.needsRestart ?? false,
+  });
+  const agentPrimaryActionLabel = managedAgent
+    ? agentPrimaryActionKind === "restart"
+      ? "Restart"
+      : getManagedAgentPrimaryActionLabel(managedAgent)
+    : undefined;
+  const handleResolvedAgentPrimaryAction =
+    agentPrimaryActionKind === "restart"
+      ? handleAgentRestart
+      : handleAgentPrimaryAction;
 
   return (
     <div className="flex flex-col gap-6 pt-4">
@@ -357,26 +374,14 @@ export function ProfileSummaryView({
           onCreateCard={onCreateCard}
           onEditAgent={handleEditAgent}
           agentActionDisabled={isAgentActionPending}
+          agentActionKind={agentPrimaryActionKind}
           agentActionLabel={
-            isOwner === true && managedAgent
-              ? getManagedAgentPrimaryActionLabel(managedAgent)
-              : undefined
+            isOwner === true ? agentPrimaryActionLabel : undefined
           }
-          agentActionLive={
-            managedAgent?.status === "running" ||
-            managedAgent?.status === "deployed"
-          }
+          agentActionLive={agentIsActive}
           onAgentPrimaryAction={
             isOwner === true && managedAgent
-              ? handleAgentPrimaryAction
-              : undefined
-          }
-          onAgentRestart={
-            isOwner === true &&
-            managedAgent?.backend.type === "local" &&
-            (managedAgent.status === "running" ||
-              managedAgent.status === "deployed")
-              ? handleAgentRestart
+              ? handleResolvedAgentPrimaryAction
               : undefined
           }
           isFollowing={isFollowing}

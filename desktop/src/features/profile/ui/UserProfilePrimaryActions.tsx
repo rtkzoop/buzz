@@ -24,6 +24,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 
 export function ProfilePrimaryActions({
   agentActionDisabled,
+  agentActionKind,
   agentActionLabel,
   agentActionLive,
   canEditAgent,
@@ -31,7 +32,6 @@ export function ProfilePrimaryActions({
   isFollowing,
   messagePending,
   onAgentPrimaryAction,
-  onAgentRestart,
   onCreateCard,
   onEditAgent,
   onMessage,
@@ -39,6 +39,7 @@ export function ProfilePrimaryActions({
   unfollowMutation,
 }: {
   agentActionDisabled?: boolean;
+  agentActionKind?: "primary" | "restart";
   agentActionLabel?: string;
   agentActionLive?: boolean;
   canEditAgent: boolean;
@@ -46,7 +47,6 @@ export function ProfilePrimaryActions({
   isFollowing: boolean;
   messagePending?: boolean;
   onAgentPrimaryAction?: () => void;
-  onAgentRestart?: () => void;
   onCreateCard?: () => void;
   onEditAgent: () => void;
   onMessage?: () => void;
@@ -98,19 +98,16 @@ export function ProfilePrimaryActions({
         <ProfileQuickAction
           active={agentActionLive}
           disabled={agentActionDisabled}
-          icon={agentActionLive ? Square : Play}
+          icon={
+            agentActionKind === "restart"
+              ? RefreshCw
+              : agentActionLive
+                ? Square
+                : Play
+          }
           label={agentActionLabel}
           onClick={onAgentPrimaryAction}
           testId="user-profile-agent-primary-action"
-        />
-      ) : null}
-      {onAgentRestart ? (
-        <ProfileQuickAction
-          disabled={agentActionDisabled}
-          icon={RefreshCw}
-          label="Restart"
-          onClick={onAgentRestart}
-          testId="user-profile-agent-restart"
         />
       ) : null}
       {onCreateCard ? (

@@ -7,6 +7,7 @@ import {
   personaManagedAgentUpdate,
   profilePanelTabFromSearch,
   profilePanelViewFromSearch,
+  resolveProfileAgentPrimaryActionKind,
 } from "./UserProfilePanelUtils.ts";
 
 function agent(overrides = {}) {
@@ -81,6 +82,25 @@ function runtime(overrides = {}) {
     ...overrides,
   };
 }
+
+test("pending config changes replace the active Stop action with Restart", () => {
+  assert.equal(
+    resolveProfileAgentPrimaryActionKind({
+      canRestart: true,
+      isActive: true,
+      needsRestart: true,
+    }),
+    "restart",
+  );
+
+  for (const input of [
+    { canRestart: true, isActive: true, needsRestart: false },
+    { canRestart: true, isActive: false, needsRestart: true },
+    { canRestart: false, isActive: true, needsRestart: true },
+  ]) {
+    assert.equal(resolveProfileAgentPrimaryActionKind(input), "primary");
+  }
+});
 
 test("personaManagedAgentUpdate syncs edited persona identity to linked agent", () => {
   assert.deepEqual(personaManagedAgentUpdate(agent(), persona()), {
