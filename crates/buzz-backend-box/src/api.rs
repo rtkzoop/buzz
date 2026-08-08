@@ -286,8 +286,21 @@ pub struct CommandRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// Command timeout, constrained by the API to 1 through 60 seconds.
-    #[serde(rename = "timeoutSeconds", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "timeoutSeconds",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_timeout_seconds"
+    )]
     pub timeout_seconds: Option<u64>,
+}
+
+fn serialize_timeout_seconds<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    value
+        .map(|seconds| seconds.clamp(1, 60))
+        .serialize(serializer)
 }
 
 /// The bounded result of a synchronous Box command.
@@ -427,9 +440,8 @@ pub enum BoxApiError {
 }
 
 impl BoxApiError {
-    /// Whether this error represents a 4xx/5xx response that may have lost a
-    /// subdomain claim. The API has not published atomic conflict semantics,
-    /// so reconciliation treats every HTTP error from PATCH as claim loss.
+    /// Whether this error represents a structured HTTP or rate-limit response.
+    /// Reconciliation applies operation-specific handling to these failures.
     pub fn is_http_failure(&self) -> bool {
         matches!(self, Self::Http { .. } | Self::RateLimited { .. })
     }
@@ -509,6 +521,11 @@ impl BoxApi {
     /// Return the configured base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Return the bearer credential to the provider-local redaction seam.
+    pub(crate) fn credential_for_redaction(&self) -> &str {
+        self.credential.token()
     }
 
     /// Create a no-env or explicitly configured Box.
@@ -888,6 +905,22 @@ mod tests {
         match error {
             BoxApiError::Http { message, .. } => assert_eq!(message, "secret\n"),
             _ => panic!("expected HTTP error"),
+        }
+    }
+
+    #[test]
+    fn command_timeout_is_clamped_to_documented_range() {
+        for (input, expected) in [(Some(0), 1), (Some(1), 1), (Some(60), 60), (Some(61), 60)] {
+            let request = CommandRequest {
+                command: "true".to_string(),
+                cwd: None,
+                timeout_seconds: input,
+            };
+            assert_eq!(
+                serde_json::to_value(request).expect("command request should serialize")
+                    ["timeoutSeconds"],
+                expected
+            );
         }
     }
 }

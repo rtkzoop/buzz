@@ -367,6 +367,118 @@ mod tests {
     }
 
     #[test]
+    fn live_harness_is_noop_even_when_service_probe_is_not_active() {
+        for service in [
+            ServiceState::Inactive,
+            ServiceState::Failed,
+            ServiceState::Unknown,
+        ] {
+            let observation = verified(BoxState::Ready, HarnessState::Live, service);
+            assert_eq!(
+                classify(Some(&observation), &Fingerprint::for_test("new")),
+                Action::NoOp {
+                    agent_id: "box-1".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn active_service_is_noop_even_when_harness_marker_is_ambiguous() {
+        for state in [BoxState::Ready, BoxState::Idle, BoxState::Running] {
+            let observation = verified(state, HarnessState::Unknown, ServiceState::Active);
+            assert_eq!(
+                classify(Some(&observation), &Fingerprint::for_test("new")),
+                Action::NoOp {
+                    agent_id: "box-1".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_ready_states_launch_after_intentional_stop() {
+        for state in [BoxState::Ready, BoxState::Idle, BoxState::Running] {
+            let mut observation = verified(
+                state,
+                HarnessState::ExitedIntentional,
+                ServiceState::Inactive,
+            );
+            observation.stop_intent = StopIntent::External;
+            assert!(matches!(
+                classify(Some(&observation), &Fingerprint::for_test("new")),
+                Action::Launch {
+                    prior_failure: Some(StopIntent::External),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn ready_state_matrix_covers_all_inactive_harness_rows() {
+        for state in [BoxState::Ready, BoxState::Idle, BoxState::Running] {
+            let same = verified(
+                state.clone(),
+                HarnessState::NeverStartedRecoverable,
+                ServiceState::Inactive,
+            );
+            assert!(matches!(
+                classify(Some(&same), &Fingerprint::for_test("same")),
+                Action::Observe { .. }
+            ));
+
+            let mut divergent = same.clone();
+            divergent.launch_intent = Some(Fingerprint::for_test("old"));
+            assert!(matches!(
+                classify(Some(&divergent), &Fingerprint::for_test("new")),
+                Action::FencedReplace { .. }
+            ));
+
+            let broken = verified(
+                state.clone(),
+                HarnessState::NeverStartedBroken,
+                ServiceState::Failed,
+            );
+            assert!(matches!(
+                classify(Some(&broken), &Fingerprint::for_test("new")),
+                Action::FencedReplace { .. }
+            ));
+
+            let abnormal = verified(
+                state.clone(),
+                HarnessState::ExitedAbnormal,
+                ServiceState::Failed,
+            );
+            assert!(matches!(
+                classify(Some(&abnormal), &Fingerprint::for_test("new")),
+                Action::Launch { .. }
+            ));
+
+            let ambiguous = verified(state, HarnessState::Unknown, ServiceState::Unknown);
+            assert!(matches!(
+                classify(Some(&ambiguous), &Fingerprint::for_test("new")),
+                Action::Report {
+                    error: ClassificationError::AmbiguousObservation,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn live_service_remains_noop_with_stale_presence() {
+        let mut observation = verified(BoxState::Ready, HarnessState::Live, ServiceState::Active);
+        observation.presence = PresenceState::Stale;
+        assert_eq!(
+            classify(Some(&observation), &Fingerprint::for_test("new")),
+            Action::NoOp {
+                agent_id: "box-1".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn intentional_and_abnormal_stops_launch() {
         let mut intentional = verified(
             BoxState::Ready,

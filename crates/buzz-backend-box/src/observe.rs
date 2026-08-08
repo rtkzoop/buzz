@@ -15,13 +15,16 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Root-owned marker describing provider ownership.
-pub const OWNERSHIP_MARKER_PATH: &str = "/var/lib/buzz-agent/ownership.json";
+///
+/// Box file API paths are relative to the Box work directory. Reads and the
+/// future provisioner writes intentionally use this same relative spelling.
+pub const OWNERSHIP_MARKER_PATH: &str = "var/lib/buzz-agent/ownership.json";
 /// Non-secret state written by the launcher.
-pub const STATE_MARKER_PATH: &str = "/var/lib/buzz-agent/state.json";
+pub const STATE_MARKER_PATH: &str = "var/lib/buzz-agent/state.json";
 /// Stop-intent marker consulted after resume.
-pub const STOP_INTENT_PATH: &str = "/var/lib/buzz-agent/stop-intent";
+pub const STOP_INTENT_PATH: &str = "var/lib/buzz-agent/stop-intent";
 /// Non-secret launch-intent fingerprint.
-pub const LAUNCH_INTENT_PATH: &str = "/var/lib/buzz-agent/launch-intent.sha256";
+pub const LAUNCH_INTENT_PATH: &str = "var/lib/buzz-agent/launch-intent.sha256";
 /// Fixed systemd unit supervised by the provider.
 pub const SERVICE_UNIT: &str = "buzz-agent.service";
 
@@ -129,6 +132,9 @@ async fn observe_service(api: &BoxApi, box_id: &str) -> Result<ServiceState, Obs
             },
         )
         .await?;
+    if !result.success || result.exit_code != Some(0) || result.timed_out {
+        return Ok(ServiceState::Unknown);
+    }
     let state = result.stdout.trim();
     Ok(match state {
         "active" => ServiceState::Active,
@@ -247,5 +253,17 @@ mod tests {
         let (harness, intent) = decode_harness(ServiceState::Inactive, None, Some("external"));
         assert_eq!(harness, HarnessState::ExitedIntentional);
         assert_eq!(intent, StopIntent::External);
+    }
+
+    #[test]
+    fn marker_paths_are_relative_to_the_box_work_directory() {
+        for path in [
+            OWNERSHIP_MARKER_PATH,
+            STATE_MARKER_PATH,
+            STOP_INTENT_PATH,
+            LAUNCH_INTENT_PATH,
+        ] {
+            assert!(!path.starts_with('/'), "absolute marker path: {path}");
+        }
     }
 }

@@ -25,6 +25,41 @@ pub const OPERATION_DEADLINE: Duration = Duration::from_secs(600);
 /// Poll interval required by the provider contract.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+const AUTHORITATIVE_ENV_KEYS: &[&str] = &[
+    "BUZZ_RELAY_URL",
+    "BUZZ_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_ACP_AGENT_OWNER",
+    "BUZZ_OWNER_PUBKEY",
+    "BUZZ_ACP_AGENT_COMMAND",
+    "BUZZ_AGENT_COMMAND",
+    "BUZZ_ACP_AGENT_ARGS",
+    "BUZZ_AGENT_ARGS",
+    "BUZZ_ACP_MCP_COMMAND",
+    "BUZZ_ACP_RESPOND_TO",
+    "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
+    "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+    "BUZZ_INACTIVITY_SECONDS",
+    "BUZZ_AGENT_PUBKEY",
+    "BUZZ_MANAGED_AGENT_START_NONCE",
+];
+const FORBIDDEN_ENV_KEY: &str = "BUZZ_ACP_NO_PRESENCE";
+
+fn is_posix_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(character) if character == '_' || character.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn nonempty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Provider-local bounded redaction seam. Task C will replace this with the
 /// complete shared secret redactor, but all Task B error paths already pass
 /// through this boundary.
@@ -129,7 +164,7 @@ pub fn prepare_deploy(request: &DeployRequest) -> Result<PreparedDeploy, Reconci
     let identity = AgentIdentity::from_nsec(&request.agent.private_key_nsec)
         .map_err(ReconcileError::InvalidRequest)?;
     let config = config::parse(&request.provider_config).map_err(ReconcileError::InvalidRequest)?;
-    let env = build_environment(&request.agent, &identity, &config)?;
+    let env = build_environment(&request.agent, &config)?;
     let redactor = Redactor::from_values(
         env.values()
             .cloned()
@@ -151,7 +186,6 @@ pub fn prepare_deploy(request: &DeployRequest) -> Result<PreparedDeploy, Reconci
 
 fn build_environment(
     agent: &AgentPayload,
-    identity: &AgentIdentity,
     config: &ProviderConfig,
 ) -> Result<BTreeMap<String, String>, ReconcileError> {
     let mut env = BTreeMap::new();
@@ -161,7 +195,37 @@ fn build_environment(
     } else {
         env.extend(agent.env_vars.clone());
     }
-    env.insert("BUZZ_RELAY_URL".to_string(), agent.relay_url.clone());
+
+    // Validate lower tiers before clearing authoritative keys. This keeps the
+    // provider deterministic across Box images and rejects the only forbidden
+    // liveness override instead of allowing it to be masked accidentally.
+    for key in env.keys() {
+        if !is_posix_env_key(key) {
+            return Err(ReconcileError::InvalidRequest(format!(
+                "env key {key:?} is not a POSIX environment variable name \
+                 ([A-Za-z_][A-Za-z0-9_]*)"
+            )));
+        }
+        if key.eq_ignore_ascii_case(FORBIDDEN_ENV_KEY) {
+            return Err(ReconcileError::InvalidRequest(format!(
+                "{FORBIDDEN_ENV_KEY} must not be set: presence is the only \
+                 remote liveness signal"
+            )));
+        }
+    }
+
+    // A missing authoritative value must clear a lower-tier spoof. Plain
+    // overwrite is insufficient for optional auth, command, and policy keys.
+    for key in AUTHORITATIVE_ENV_KEYS {
+        env.remove(*key);
+    }
+
+    let Some(relay_url) = nonempty_trimmed(&agent.relay_url) else {
+        return Err(ReconcileError::InvalidRequest(
+            "relay_url must not be empty".to_string(),
+        ));
+    };
+    env.insert("BUZZ_RELAY_URL".to_string(), relay_url.to_string());
     env.insert(
         "BUZZ_PRIVATE_KEY".to_string(),
         agent.private_key_nsec.clone(),
@@ -170,35 +234,75 @@ fn build_environment(
         "NOSTR_PRIVATE_KEY".to_string(),
         agent.private_key_nsec.clone(),
     );
-    if let Some(auth_tag) = &agent.auth_tag {
-        env.insert("BUZZ_AUTH_TAG".to_string(), auth_tag.clone());
-    }
-    if let Some(owner) = agent
+
+    let auth_tag = agent.auth_tag.as_deref().and_then(nonempty_trimmed);
+    let owner = agent
         .launch
         .as_ref()
-        .and_then(|launch| launch.owner_pubkey.clone())
-    {
-        env.insert("BUZZ_OWNER_PUBKEY".to_string(), owner);
+        .and_then(|launch| launch.owner_pubkey.as_deref())
+        .and_then(nonempty_trimmed);
+    if auth_tag.is_none() && owner.is_none() {
+        return Err(ReconcileError::InvalidRequest(
+            "neither auth_tag nor launch.owner_pubkey resolved: the agent \
+             could not honor !shutdown"
+                .to_string(),
+        ));
     }
-    env.insert(
-        "BUZZ_INACTIVITY_SECONDS".to_string(),
-        config.inactivity_seconds.to_string(),
-    );
-    env.insert(
-        "BUZZ_AGENT_PUBKEY".to_string(),
-        identity.pubkey_hex().to_string(),
-    );
+    if let Some(auth_tag) = auth_tag {
+        env.insert("BUZZ_AUTH_TAG".to_string(), auth_tag.to_string());
+    }
+    if let Some(owner) = owner {
+        env.insert("BUZZ_ACP_AGENT_OWNER".to_string(), owner.to_string());
+    }
+
     if let Some(launch) = &agent.launch {
-        if let Some(command) = &launch.command {
-            env.insert("BUZZ_AGENT_COMMAND".to_string(), command.clone());
+        if let Some(command) = launch.command.as_deref().filter(|value| !value.is_empty()) {
+            env.insert("BUZZ_ACP_AGENT_COMMAND".to_string(), command.to_string());
         }
         if !launch.args.is_empty() {
-            let args = serde_json::to_string(&launch.args).map_err(|_| {
-                ReconcileError::InvalidRequest("launch args are not serializable".to_string())
-            })?;
-            env.insert("BUZZ_AGENT_ARGS".to_string(), args);
+            env.insert("BUZZ_ACP_AGENT_ARGS".to_string(), launch.args.join(","));
         }
     }
+    env.insert(
+        "BUZZ_ACP_MCP_COMMAND".to_string(),
+        "buzz-dev-mcp".to_string(),
+    );
+    if let Some(respond_to) = agent
+        .respond_to
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if !matches!(respond_to, "owner-only" | "allowlist" | "anyone" | "nobody") {
+            return Err(ReconcileError::InvalidRequest(format!(
+                "respond_to {respond_to:?} is not a supported harness mode"
+            )));
+        }
+        if respond_to == "allowlist"
+            && agent
+                .respond_to_allowlist
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return Err(ReconcileError::InvalidRequest(
+                "respond_to allowlist requires at least one pubkey".to_string(),
+            ));
+        }
+        env.insert("BUZZ_ACP_RESPOND_TO".to_string(), respond_to.to_string());
+    }
+    if let Some(allowlist) = agent
+        .respond_to_allowlist
+        .as_ref()
+        .filter(|entries| !entries.is_empty())
+    {
+        env.insert(
+            "BUZZ_ACP_RESPOND_TO_ALLOWLIST".to_string(),
+            allowlist.join(","),
+        );
+    }
+    env.insert(
+        "BUZZ_ACP_EXIT_AFTER_INACTIVITY".to_string(),
+        config.inactivity_seconds.to_string(),
+    );
     Ok(env)
 }
 
@@ -351,7 +455,7 @@ pub async fn reconcile(
         let records = api
             .list_all(None)
             .await
-            .map_err(|error| api_error(prepared, error))?;
+            .map_err(|error| api_error(api, prepared, error))?;
         let record = records
             .into_iter()
             .find(|record| record.subdomain.as_deref() == Some(prepared.subdomain.as_str()));
@@ -363,7 +467,7 @@ pub async fn reconcile(
                 let id = record.id.clone();
                 match observe_box(api, record, &prepared.identity)
                     .await
-                    .map_err(|error| observe_error(prepared, error))?
+                    .map_err(|error| observe_error(api, prepared, error))?
                 {
                     Some(observed) => Some(observed),
                     None => {
@@ -382,16 +486,8 @@ pub async fn reconcile(
             Action::Create => {
                 let candidate = create_candidate(api, prepared).await?;
                 let ready = wait_for_ready(api, &candidate.id, prepared, options, started).await?;
-                match api
-                    .update(
-                        &ready.id,
-                        &UpdateBoxRequest {
-                            subdomain: prepared.subdomain.clone(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(claimed) => {
+                match claim_candidate(api, &ready, prepared, options, started).await? {
+                    ClaimOutcome::Claimed(claimed) => {
                         // The candidate is now claimed, but no secrets have
                         // crossed the API boundary. Task C owns this seam.
                         provisioner
@@ -410,11 +506,10 @@ pub async fn reconcile(
                         )
                         .await;
                     }
-                    Err(error) if is_claim_loss(&error) => {
+                    ClaimOutcome::Lost => {
                         stop_candidate(api, &ready.id, prepared, options, started).await?;
                         return await_claim_winner(api, prepared, options, started).await;
                     }
-                    Err(error) => return Err(api_error(prepared, error)),
                 }
             }
             Action::Observe { box_id } => {
@@ -432,7 +527,7 @@ pub async fn reconcile(
                         },
                     )
                     .await
-                    .map_err(|error| api_error(prepared, error))?;
+                    .map_err(|error| api_error(api, prepared, error))?;
                 let ready = wait_for_ready(api, &resumed.id, prepared, options, started).await?;
                 provisioner
                     .provision(ProvisionRequest {
@@ -457,7 +552,7 @@ pub async fn reconcile(
                 let record = api
                     .get(&box_id)
                     .await
-                    .map_err(|error| api_error(prepared, error))?;
+                    .map_err(|error| api_error(api, prepared, error))?;
                 provisioner
                     .provision(ProvisionRequest {
                         box_record: &record,
@@ -481,11 +576,11 @@ pub async fn reconcile(
                 // A Box created by this call is never re-entered through this
                 // action: successful claim immediately enters the provisioner
                 // seam, and claim loss exits to winner adoption.
-                let current = api
-                    .get(&box_id)
-                    .await
-                    .map_err(|error| api_error(prepared, error))?;
-                if !same_fence(&current, &observation.box_record) {
+                let current = match observe_for_fence(api, &box_id, prepared).await? {
+                    Some(current) => current,
+                    None => continue,
+                };
+                if !same_observation_fence(&current, &observation) {
                     continue;
                 }
                 stop_candidate(api, &box_id, prepared, options, started).await?;
@@ -512,7 +607,54 @@ async fn create_candidate(
         env: Map::new(),
     })
     .await
-    .map_err(|error| api_error(prepared, error))
+    .map_err(|error| api_error(api, prepared, error))
+}
+
+enum ClaimOutcome {
+    Claimed(BoxRecord),
+    Lost,
+}
+
+async fn claim_candidate(
+    api: &BoxApi,
+    ready: &BoxRecord,
+    prepared: &PreparedDeploy,
+    options: ReconcileOptions,
+    started: Instant,
+) -> Result<ClaimOutcome, ReconcileError> {
+    let request = UpdateBoxRequest {
+        subdomain: prepared.subdomain.clone(),
+    };
+    loop {
+        check_deadline(
+            started,
+            options,
+            &ready.id,
+            "claiming deterministic subdomain",
+        )?;
+        match api.update(&ready.id, &request).await {
+            Ok(claimed) => return Ok(ClaimOutcome::Claimed(claimed)),
+            Err(error) if is_gateway_retry(&error) || is_rate_limited(&error) => {
+                sleep_until_next(retry_delay(&error, options.poll_interval)).await;
+            }
+            Err(error) if is_claim_loss(&error) => return Ok(ClaimOutcome::Lost),
+            Err(error) if is_unknown_claim_4xx(&error) => {
+                let holder = api
+                    .list_all(None)
+                    .await
+                    .map_err(|verify_error| api_error(api, prepared, verify_error))?
+                    .into_iter()
+                    .find(|record| {
+                        record.subdomain.as_deref() == Some(prepared.subdomain.as_str())
+                    });
+                return Ok(match holder {
+                    Some(record) if record.id == ready.id => ClaimOutcome::Claimed(record),
+                    Some(_) | None => ClaimOutcome::Lost,
+                });
+            }
+            Err(error) => return Err(api_error(api, prepared, error)),
+        }
+    }
 }
 
 async fn wait_for_ready(
@@ -527,7 +669,7 @@ async fn wait_for_ready(
         let record = api
             .get(box_id)
             .await
-            .map_err(|error| api_error(prepared, error))?;
+            .map_err(|error| api_error(api, prepared, error))?;
         if record.state.is_ready() {
             return Ok(record);
         }
@@ -550,10 +692,10 @@ async fn stop_candidate(
     options: ReconcileOptions,
     started: Instant,
 ) -> Result<(), ReconcileError> {
-    let _ = api
-        .stop(box_id)
-        .await
-        .map_err(|error| api_error(prepared, error))?;
+    match api.stop(box_id).await {
+        Ok(_) | Err(BoxApiError::Http { status: 404, .. }) => {}
+        Err(error) => return Err(api_error(api, prepared, error)),
+    }
     wait_for_archived(api, box_id, prepared, options, started).await
 }
 
@@ -566,10 +708,11 @@ async fn wait_for_archived(
 ) -> Result<(), ReconcileError> {
     loop {
         check_deadline(started, options, box_id, "waiting for Box archive")?;
-        let record = api
-            .get(box_id)
-            .await
-            .map_err(|error| api_error(prepared, error))?;
+        let record = match api.get(box_id).await {
+            Ok(record) => record,
+            Err(BoxApiError::Http { status: 404, .. }) => return Ok(()),
+            Err(error) => return Err(api_error(api, prepared, error)),
+        };
         match record.state {
             BoxState::Archived => return Ok(()),
             BoxState::Error | BoxState::Unknown(_) => {
@@ -594,7 +737,7 @@ async fn await_claim_winner(
         let records = api
             .list_all(None)
             .await
-            .map_err(|error| api_error(prepared, error))?;
+            .map_err(|error| api_error(api, prepared, error))?;
         if let Some(record) = records
             .into_iter()
             .find(|record| record.subdomain.as_deref() == Some(prepared.subdomain.as_str()))
@@ -602,7 +745,7 @@ async fn await_claim_winner(
             let id = record.id.clone();
             let observed = observe_box(api, record, &prepared.identity)
                 .await
-                .map_err(|error| observe_error(prepared, error))?;
+                .map_err(|error| observe_error(api, prepared, error))?;
             let Some(observed) = observed else {
                 return Err(ReconcileError::UnverifiedBox);
             };
@@ -629,10 +772,10 @@ async fn reobserve_until_started(
         let record = api
             .get(box_id)
             .await
-            .map_err(|error| api_error(prepared, error))?;
+            .map_err(|error| api_error(api, prepared, error))?;
         let observed = observe_box(api, record, &prepared.identity)
             .await
-            .map_err(|error| observe_error(prepared, error))?;
+            .map_err(|error| observe_error(api, prepared, error))?;
         let Some(observed) = observed else {
             return Err(ReconcileError::UnverifiedBox);
         };
@@ -649,13 +792,82 @@ fn same_fence(current: &BoxRecord, observed: &BoxRecord) -> bool {
     current.id == observed.id
         && current.state == observed.state
         && current.subdomain == observed.subdomain
+        && current.name == observed.name
         && current.updated_at == observed.updated_at
 }
 
+async fn observe_for_fence(
+    api: &BoxApi,
+    box_id: &str,
+    prepared: &PreparedDeploy,
+) -> Result<Option<crate::classify::VerifiedBox>, ReconcileError> {
+    let record = match api.get(box_id).await {
+        Ok(record) => record,
+        Err(BoxApiError::Http { status: 404, .. }) => return Ok(None),
+        Err(error) => return Err(api_error(api, prepared, error)),
+    };
+    observe_box(api, record, &prepared.identity)
+        .await
+        .map_err(|error| observe_error(api, prepared, error))
+}
+
+fn same_observation_fence(
+    current: &crate::classify::VerifiedBox,
+    observed: &crate::classify::VerifiedBox,
+) -> bool {
+    same_fence(&current.box_record, &observed.box_record)
+        && current.service == observed.service
+        && current.harness == observed.harness
+        && current.stop_intent == observed.stop_intent
+        && current.launch_intent == observed.launch_intent
+        && current.ownership == observed.ownership
+}
+
+fn is_gateway_retry(error: &BoxApiError) -> bool {
+    matches!(
+        error,
+        BoxApiError::Http {
+            status: 502,
+            code,
+            ..
+        } if code == "gateway_error"
+    )
+}
+
+fn is_rate_limited(error: &BoxApiError) -> bool {
+    matches!(error, BoxApiError::RateLimited { .. })
+        || matches!(error, BoxApiError::Http { status: 429, .. })
+}
+
+fn retry_delay(error: &BoxApiError, poll_interval: Duration) -> Duration {
+    let retry_after = match error {
+        BoxApiError::RateLimited {
+            retry_after_seconds,
+            ..
+        } => retry_after_seconds.map(Duration::from_secs),
+        _ => None,
+    };
+    retry_after.unwrap_or(poll_interval).max(poll_interval)
+}
+
 fn is_claim_loss(error: &BoxApiError) -> bool {
-    error
-        .status()
-        .is_some_and(|status| (400..=599).contains(&status))
+    match error {
+        BoxApiError::Http { status: 409, .. } => true,
+        BoxApiError::Http {
+            status: 400, code, ..
+        } => {
+            let code = code.to_ascii_lowercase();
+            code.contains("conflict")
+                || code.contains("already_exists")
+                || code.contains("already-taken")
+                || code.contains("duplicate")
+        }
+        _ => false,
+    }
+}
+
+fn is_unknown_claim_4xx(error: &BoxApiError) -> bool {
+    matches!(error, BoxApiError::Http { status, .. } if (400..500).contains(status) && *status != 401 && *status != 402)
 }
 
 fn check_deadline(
@@ -677,12 +889,20 @@ async fn sleep_until_next(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
-fn api_error(prepared: &PreparedDeploy, error: BoxApiError) -> ReconcileError {
-    ReconcileError::Api(prepared.redactor.redact(&error.to_string()))
+fn api_error(api: &BoxApi, prepared: &PreparedDeploy, error: BoxApiError) -> ReconcileError {
+    let redactor = prepared
+        .redactor
+        .clone()
+        .with_value(api.credential_for_redaction().to_string());
+    ReconcileError::Api(redactor.redact(&error.to_string()))
 }
 
-fn observe_error(prepared: &PreparedDeploy, error: ObserveError) -> ReconcileError {
-    ReconcileError::Observation(prepared.redactor.redact(&error.to_string()))
+fn observe_error(api: &BoxApi, prepared: &PreparedDeploy, error: ObserveError) -> ReconcileError {
+    let redactor = prepared
+        .redactor
+        .clone()
+        .with_value(api.credential_for_redaction().to_string());
+    ReconcileError::Observation(redactor.redact(&error.to_string()))
 }
 
 #[cfg(test)]
@@ -730,5 +950,89 @@ mod tests {
         let redactor = Redactor::from_values(["secret-value".to_string()]);
         let text = redactor.redact("secret-value ghp_abcdefghijklmnopqrstuvwxyz");
         assert_eq!(text, "[redacted] [redacted]");
+    }
+
+    #[test]
+    fn authoritative_env_keys_clear_lower_tier_spoofs_when_values_are_absent() {
+        let mut request = request();
+        request.agent.auth_tag = None;
+        request.agent.launch = Some(crate::wire::LaunchBlock {
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::from([
+                ("BUZZ_AUTH_TAG".to_string(), "spoofed".to_string()),
+                ("BUZZ_ACP_AGENT_COMMAND".to_string(), "spoofed".to_string()),
+                ("BUZZ_ACP_RESPOND_TO".to_string(), "spoofed".to_string()),
+                ("BUZZ_ACP_NO_PRESENCE".to_string(), "1".to_string()),
+            ]),
+            policy_env: BTreeMap::new(),
+            owner_pubkey: Some("owner".to_string()),
+        });
+        let error = prepare_deploy(&request).expect_err("presence suppression must be rejected");
+        assert!(error.to_string().contains("BUZZ_ACP_NO_PRESENCE"));
+
+        request
+            .agent
+            .launch
+            .as_mut()
+            .expect("launch exists")
+            .env
+            .remove("BUZZ_ACP_NO_PRESENCE");
+        let prepared = prepare_deploy(&request).expect("remaining env should prepare");
+        assert!(!prepared.env.contains_key("BUZZ_AUTH_TAG"));
+        assert!(!prepared.env.contains_key("BUZZ_ACP_AGENT_COMMAND"));
+        assert_eq!(
+            prepared.env.get("BUZZ_ACP_AGENT_OWNER"),
+            Some(&"owner".to_string())
+        );
+    }
+
+    #[test]
+    fn env_keys_must_be_posix_names() {
+        let mut request = request();
+        request
+            .agent
+            .env_vars
+            .insert("not.posix".to_string(), "x".to_string());
+        let error = prepare_deploy(&request).expect_err("invalid env names must fail closed");
+        assert!(error.to_string().contains("not.posix"));
+    }
+
+    #[test]
+    fn only_conflict_claim_errors_are_claim_loss() {
+        let rate_limited = BoxApiError::RateLimited {
+            code: "start_limit_reached".to_string(),
+            retry_after_seconds: None,
+            request_id: None,
+        };
+        let unauthorized = BoxApiError::Http {
+            status: 401,
+            code: "unauthorized".to_string(),
+            message: "no".to_string(),
+            request_id: None,
+        };
+        let billing = BoxApiError::Http {
+            status: 402,
+            code: "payment_required".to_string(),
+            message: "no".to_string(),
+            request_id: None,
+        };
+        let conflict = BoxApiError::Http {
+            status: 409,
+            code: "conflict".to_string(),
+            message: "no".to_string(),
+            request_id: None,
+        };
+        let bad_conflict = BoxApiError::Http {
+            status: 400,
+            code: "subdomain_conflict".to_string(),
+            message: "no".to_string(),
+            request_id: None,
+        };
+        assert!(!is_claim_loss(&rate_limited));
+        assert!(!is_claim_loss(&unauthorized));
+        assert!(!is_claim_loss(&billing));
+        assert!(is_claim_loss(&conflict));
+        assert!(is_claim_loss(&bad_conflict));
     }
 }
