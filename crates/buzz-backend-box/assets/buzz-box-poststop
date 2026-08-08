@@ -9,19 +9,34 @@ atomic_write() {
     marker_path=$1
     marker_content=$2
     marker_tmp="${marker_path}.tmp.$$"
-    printf '%s\n' "$marker_content" > "$marker_tmp"
-    mv -f "$marker_tmp" "$marker_path"
+    if printf '%s\n' "$marker_content" > "$marker_tmp"; then
+        :
+    else
+        status=$?
+        rm -f -- "$marker_tmp" || true
+        return "$status"
+    fi
+    if mv -f "$marker_tmp" "$marker_path"; then
+        :
+    else
+        status=$?
+        rm -f -- "$marker_tmp" || true
+        return "$status"
+    fi
 }
 
 intent=$(cat "$stop_intent_path" 2>/dev/null || true)
 state=$(cat "$state_path" 2>/dev/null || true)
 case "$intent" in
-    external|refused-not-armed) exit 0 ;;
+    external|refused-not-armed|refused-external) exit 0 ;;
 esac
 if printf '%s' "$state" | grep -Fq '"stop_intent":"external"'; then
     exit 0
 fi
 if printf '%s' "$state" | grep -Fq '"startup":"refused-not-armed"'; then
+    exit 0
+fi
+if printf '%s' "$state" | grep -Fq '"startup":"refused-external"'; then
     exit 0
 fi
 if ! printf '%s' "$state" | grep -Fq '"launch_armed":true'; then

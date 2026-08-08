@@ -72,6 +72,12 @@ record_external() {
 }
 trap record_external TERM INT
 
+refuse_external() {
+    rm -f -- "$env_path" "$launch_authorized_path"
+    atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":false,\"started\":false,\"startup\":\"refused-external\",\"stop_intent\":\"external\"}" || true
+    exit 67
+}
+
 prior_intent=$(cat "$stop_intent_path" 2>/dev/null || true)
 authorized_nonce=$(cat "$launch_authorized_path" 2>/dev/null || true)
 
@@ -96,8 +102,21 @@ if [ "$authorized_nonce" != "$invocation" ]; then
             ;;
     esac
 fi
+# External stop wins over a matching authorization. The authorization is a
+# capability, not permission to override an already-recorded external stop.
+if [ "$prior_intent" = external ]; then
+    refuse_external
+fi
 rm -f -- "$launch_authorized_path"
 launch_armed=1
+
+# The authorization was consumed above. Re-read the external fence before
+# doing any launch work so an ExecStop racing the consume cannot authorize a
+# new Docker child.
+if [ "$(cat "$stop_intent_path" 2>/dev/null || true)" = external ]; then
+    refuse_external
+fi
+
 atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":true,\"started\":false,\"startup\":\"armed\",\"stop_intent\":\"none\"}" || exit 66
 
 if [ "$(stat -c '%u:%g:%a' "$env_path" 2>/dev/null || true)" != 0:0:600 ]; then
@@ -113,6 +132,13 @@ fi
 : > "$consumed_path"
 chmod 666 "$consumed_path"
 docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+# Keep this check immediately adjacent to docker run. An external stop may
+# arrive while image/env preflight or stale-container removal is in progress.
+if [ "$(cat "$stop_intent_path" 2>/dev/null || true)" = external ]; then
+    refuse_external
+fi
+
 docker run --name "$container_name" \
     --mount type=tmpfs,dst=/run/buzz-agent,tmpfs-mode=700 \
     --mount type=bind,src="$env_path",dst=/run/buzz-agent/env.pending,ro \

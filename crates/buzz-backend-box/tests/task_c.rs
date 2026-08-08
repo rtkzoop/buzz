@@ -42,6 +42,282 @@ fn install_fake_box(bin_dir: &PathBuf, log_path: &PathBuf) {
     }
 }
 
+fn install_executable(path: &PathBuf, content: &str) {
+    fs::write(path, content).expect("fake executable should be written");
+    let mut permissions = fs::metadata(path)
+        .expect("fake executable metadata should be readable")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+    }
+    fs::set_permissions(path, permissions).expect("fake executable should be executable");
+}
+
+fn supervisor_race_case(label: &str, prior_external: bool, inject_external: bool) {
+    let root = asset_test_root(label);
+    let var_dir = root.join("var/lib/buzz-agent");
+    let run_dir = root.join("run/buzz-agent");
+    let libexec_dir = root.join("usr/local/libexec");
+    let bin_dir = root.join("bin");
+    let script_path = root.join("supervise.sh");
+    let docker_log = root.join("docker.log");
+    let box_log = root.join("box.log");
+    let image_ref =
+        "registry.example/buzz@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fs::create_dir_all(&var_dir).expect("state directory should be created");
+    fs::create_dir_all(&run_dir).expect("run directory should be created");
+    fs::create_dir_all(&libexec_dir).expect("libexec directory should be created");
+    fs::create_dir_all(&bin_dir).expect("fake bin directory should be created");
+    fs::write(run_dir.join("invocation"), "nonce-1\n").expect("invocation should be written");
+    fs::write(var_dir.join("image.ref"), format!("{image_ref}\n"))
+        .expect("image marker should be written");
+    fs::write(
+        run_dir.join("env.pending"),
+        r#"{"BUZZ_MANAGED_AGENT_START_NONCE":"nonce-1"}"#,
+    )
+    .expect("pending env should be written");
+    #[cfg(unix)]
+    fs::set_permissions(run_dir.join("env.pending"), {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o600)
+    })
+    .expect("pending env should be secured");
+    fs::write(run_dir.join("launch-authorized"), "nonce-1\n")
+        .expect("launch authorization should be written");
+    if prior_external {
+        fs::write(var_dir.join("stop-intent"), "external\n")
+            .expect("external intent should be written");
+    }
+
+    install_executable(
+        &bin_dir.join("stat"),
+        "#!/bin/sh\nprintf '%s\\n' '0:0:600'\n",
+    );
+    let external_marker = var_dir.join("stop-intent");
+    install_executable(
+        &bin_dir.join("box"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BOX_LOG\"\n",
+    );
+    let docker_script = if inject_external {
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nif [ \"$1\" = rm ] && [ \"$2\" = -f ]; then\n    printf '%s\\n' external > \"$STOP_INTENT_PATH\"\nfi\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n    printf '%s\\n' \"$DOCKER_IMAGE\"\nfi\n".to_string()
+    } else {
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nif [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n    printf '%s\\n' \"$DOCKER_IMAGE\"\nfi\n".to_string()
+    };
+    install_executable(&bin_dir.join("docker"), &docker_script);
+
+    let script = EMBEDDED_SUPERVISOR
+        .replace(
+            "/var/lib/buzz-agent",
+            var_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/run/buzz-agent",
+            run_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/usr/local/libexec",
+            libexec_dir
+                .to_str()
+                .expect("temporary path should be UTF-8"),
+        );
+    fs::write(&script_path, script).expect("supervisor script should be written");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test PATH should be set")
+    );
+    let output = Command::new("sh")
+        .arg(&script_path)
+        .env("PATH", path)
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &docker_log)
+        .env("DOCKER_IMAGE", image_ref)
+        .env("STOP_INTENT_PATH", &external_marker)
+        .env("BOX_LOG", &box_log)
+        .output()
+        .expect("supervisor should execute");
+    assert_eq!(
+        output.status.code(),
+        Some(67),
+        "unexpected refusal status for {label}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let docker_log = fs::read_to_string(&docker_log).unwrap_or_default();
+    assert!(
+        !docker_log.lines().any(|line| line.starts_with("run ")),
+        "supervisor started Docker for {label}: {docker_log}"
+    );
+    assert!(
+        !box_log.exists(),
+        "supervisor invoked box stop self for {label}"
+    );
+    assert!(
+        !run_dir.join("env.pending").exists(),
+        "pending env leaked for {label}"
+    );
+    assert!(
+        !run_dir.join("launch-authorized").exists(),
+        "launch authorization leaked for {label}"
+    );
+    assert!(
+        fs::read_to_string(var_dir.join("state.json"))
+            .expect("refusal state should exist")
+            .contains("refused-external"),
+        "external refusal state missing for {label}"
+    );
+    fs::remove_dir_all(root).expect("asset test root should be removed");
+}
+
+#[test]
+fn supervisor_refuses_matching_authorization_with_preexisting_external_intent() {
+    supervisor_race_case("preexisting-external", true, false);
+}
+
+#[test]
+fn supervisor_refuses_external_intent_injected_before_docker_run() {
+    supervisor_race_case("injected-external", false, true);
+}
+
+fn assert_no_marker_temps(path: &PathBuf, label: &str) {
+    let temps = fs::read_dir(path)
+        .expect("marker directory should be readable")
+        .map(|entry| entry.expect("marker entry should be readable").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".tmp."))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        temps.is_empty(),
+        "marker temp files leaked for {label}: {temps:?}"
+    );
+}
+
+#[test]
+fn external_stop_cleans_marker_temp_when_mv_fails() {
+    let root = asset_test_root("external-stop-mv-failure");
+    let var_dir = root.join("var/lib/buzz-agent");
+    let run_dir = root.join("run/buzz-agent");
+    let bin_dir = root.join("bin");
+    let script_path = root.join("external-stop.sh");
+    fs::create_dir_all(&var_dir).expect("state directory should be created");
+    fs::create_dir_all(&run_dir).expect("run directory should be created");
+    fs::create_dir_all(&bin_dir).expect("fake bin directory should be created");
+    install_executable(&bin_dir.join("mv"), "#!/bin/sh\nexit 73\n");
+    let script = EMBEDDED_EXTERNAL_STOP
+        .replace(
+            "/var/lib/buzz-agent",
+            var_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/run/buzz-agent",
+            run_dir.to_str().expect("temporary path should be UTF-8"),
+        );
+    fs::write(&script_path, script).expect("external-stop script should be written");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test PATH should be set")
+    );
+    let output = Command::new("sh")
+        .arg(&script_path)
+        .env("PATH", path)
+        .env_remove("GREP_OPTIONS")
+        .output()
+        .expect("external-stop should execute");
+    assert_eq!(output.status.code(), Some(73));
+    assert_no_marker_temps(&var_dir, "external-stop");
+    fs::remove_dir_all(root).expect("asset test root should be removed");
+}
+
+#[test]
+fn external_stop_marks_external_and_revokes_launch_authorization() {
+    let root = asset_test_root("external-stop-revokes-auth");
+    let var_dir = root.join("var/lib/buzz-agent");
+    let run_dir = root.join("run/buzz-agent");
+    let bin_dir = root.join("bin");
+    let script_path = root.join("external-stop.sh");
+    fs::create_dir_all(&var_dir).expect("state directory should be created");
+    fs::create_dir_all(&run_dir).expect("run directory should be created");
+    fs::create_dir_all(&bin_dir).expect("fake bin directory should be created");
+    fs::write(run_dir.join("launch-authorized"), "nonce-1\n")
+        .expect("launch authorization should be written");
+    install_executable(&bin_dir.join("docker"), "#!/bin/sh\nexit 0\n");
+    let script = EMBEDDED_EXTERNAL_STOP
+        .replace(
+            "/var/lib/buzz-agent",
+            var_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/run/buzz-agent",
+            run_dir.to_str().expect("temporary path should be UTF-8"),
+        );
+    fs::write(&script_path, script).expect("external-stop script should be written");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test PATH should be set")
+    );
+    let output = Command::new("sh")
+        .arg(&script_path)
+        .env("PATH", path)
+        .env_remove("GREP_OPTIONS")
+        .output()
+        .expect("external-stop should execute");
+    assert!(
+        output.status.success(),
+        "external-stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!run_dir.join("launch-authorized").exists());
+    assert_eq!(
+        fs::read_to_string(var_dir.join("stop-intent")).expect("external intent should exist"),
+        "external\n"
+    );
+    assert!(fs::read_to_string(var_dir.join("state.json"))
+        .expect("external state should exist")
+        .contains("\"stop_intent\":\"external\""));
+    fs::remove_dir_all(root).expect("asset test root should be removed");
+}
+
+#[test]
+fn poststop_cleans_marker_temp_when_mv_fails() {
+    let root = asset_test_root("poststop-mv-failure");
+    let var_dir = root.join("var/lib/buzz-agent");
+    let bin_dir = root.join("bin");
+    let script_path = root.join("poststop.sh");
+    fs::create_dir_all(&var_dir).expect("state directory should be created");
+    fs::create_dir_all(&bin_dir).expect("fake bin directory should be created");
+    fs::write(
+        var_dir.join("state.json"),
+        "{\"launch_armed\":true,\"startup\":\"armed\",\"stop_intent\":\"none\"}",
+    )
+    .expect("state marker should be written");
+    install_executable(&bin_dir.join("mv"), "#!/bin/sh\nexit 73\n");
+    let script = EMBEDDED_POSTSTOP.replace(
+        "/var/lib/buzz-agent",
+        var_dir.to_str().expect("temporary path should be UTF-8"),
+    );
+    fs::write(&script_path, script).expect("poststop script should be written");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test PATH should be set")
+    );
+    let output = Command::new("sh")
+        .arg(&script_path)
+        .env("PATH", path)
+        .env_remove("GREP_OPTIONS")
+        .output()
+        .expect("poststop should execute");
+    assert_eq!(output.status.code(), Some(73));
+    assert_no_marker_temps(&var_dir, "poststop");
+    fs::remove_dir_all(root).expect("asset test root should be removed");
+}
+
 fn run_poststop_case(label: &str, intent: Option<&str>, state: &str, should_stop: bool) {
     let root = asset_test_root(label);
     let var_dir = root.join("var/lib/buzz-agent");
@@ -107,6 +383,12 @@ fn poststop_obeys_armed_external_and_refusal_matrix() {
         "not-armed",
         Some("refused-not-armed"),
         "{\"launch_armed\":false,\"startup\":\"refused-not-armed\",\"stop_intent\":\"refused-not-armed\"}",
+        false,
+    );
+    run_poststop_case(
+        "refused-external",
+        Some("refused-external"),
+        "{\"launch_armed\":false,\"startup\":\"refused-external\",\"stop_intent\":\"external\"}",
         false,
     );
 }
@@ -282,6 +564,9 @@ fn task_c_assets_are_shell_safe_and_unit_has_required_supervision_policy() {
     assert!(EMBEDDED_SUPERVISOR.contains("while :; do"));
     assert!(EMBEDDED_SUPERVISOR.contains("mv -f"));
     assert!(EMBEDDED_EXTERNAL_STOP.contains("mv -f"));
+    assert!(EMBEDDED_EXTERNAL_STOP.contains("launch_authorized_path"));
+    assert!(EMBEDDED_EXTERNAL_STOP.contains("rm -f -- \"$launch_authorized_path\""));
     assert!(EMBEDDED_POSTSTOP.contains("mv -f"));
+    assert!(EMBEDDED_POSTSTOP.contains("refused-external"));
     assert!(!EMBEDDED_UNIT.contains("Environment="));
 }
