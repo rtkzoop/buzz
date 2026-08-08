@@ -11,6 +11,12 @@ launch_authorized_path=/run/buzz-agent/launch-authorized
 consumed_path=/run/buzz-agent/env-consumed
 entrypoint_path=/usr/local/libexec/buzz-box-entrypoint
 lock_path=/run/buzz-agent/supervisor.lock
+handoff_lock_path=/run/buzz-agent/launch-handoff.lock
+handoff_owner_path=$handoff_lock_path/pid
+handoff_lock_acquired=0
+handoff_lock_attempts=0
+handoff_lock_max_attempts=120
+handoff_lock_retry_seconds=1
 container_name=buzz-agent
 external_stop=0
 signal_interrupted=0
@@ -36,7 +42,66 @@ atomic_write() {
     fi
 }
 
+# This is a short-lived launch handoff lock, not the supervisor lifetime lock.
+# mkdir is the POSIX atomic acquisition operation. The PID file lets a later
+# deploy or stop remove a lock left by a dead owner; retries are bounded so a
+# live owner that does not exit cannot create an unbounded stop wait.
+release_handoff_lock() {
+    if [ "$handoff_lock_acquired" -eq 1 ]; then
+        rm -f -- "$handoff_owner_path"
+        rmdir "$handoff_lock_path" 2>/dev/null || true
+        handoff_lock_acquired=0
+    fi
+}
+
+acquire_handoff_lock() {
+    handoff_lock_attempts=0
+    missing_owner_attempts=0
+    while [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; do
+        if mkdir "$handoff_lock_path" 2>/dev/null; then
+            # Set ownership before the first operation that can fail so the
+            # EXIT trap can remove the directory even during PID-file setup.
+            handoff_lock_acquired=1
+            if ! printf '%s\n' "$$" > "$handoff_owner_path"; then
+                release_handoff_lock
+                return 74
+            fi
+            return 0
+        fi
+
+        handoff_lock_attempts=$((handoff_lock_attempts + 1))
+        owner_pid=$(cat "$handoff_owner_path" 2>/dev/null || true)
+        stale_owner=0
+        case "$owner_pid" in
+            '')
+                # A creator writes pid immediately after mkdir. Give that
+                # tiny setup window one retry before treating an empty owner
+                # as a crashed creator.
+                missing_owner_attempts=$((missing_owner_attempts + 1))
+                if [ "$missing_owner_attempts" -ge 2 ]; then
+                    stale_owner=1
+                fi
+                ;;
+            0|*[!0-9]*) stale_owner=1 ;;
+            *)
+                missing_owner_attempts=0
+                if ! kill -0 "$owner_pid" 2>/dev/null; then
+                    stale_owner=1
+                fi
+                ;;
+        esac
+        if [ "$stale_owner" -eq 1 ]; then
+            rm -f -- "$handoff_owner_path"
+            rmdir "$handoff_lock_path" 2>/dev/null || true
+        elif [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; then
+            sleep "$handoff_lock_retry_seconds"
+        fi
+    done
+    return 75
+}
+
 cleanup_exit() {
+    release_handoff_lock
     rm -f -- "$env_path" "$launch_authorized_path"
     if [ "$lock_acquired" -eq 1 ]; then
         rmdir "$lock_path" 2>/dev/null || true
@@ -71,6 +136,7 @@ record_external() {
     docker stop --time=110 "$container_name" >/dev/null 2>&1 || true
 }
 trap record_external TERM INT
+trap 'exit 129' HUP
 
 refuse_external() {
     rm -f -- "$env_path" "$launch_authorized_path"
@@ -133,8 +199,15 @@ fi
 chmod 666 "$consumed_path"
 docker rm -f "$container_name" >/dev/null 2>&1 || true
 
-# Keep this check immediately adjacent to docker run. An external stop may
-# arrive while image/env preflight or stale-container removal is in progress.
+# The handoff lock is deliberately held only across the final check and the
+# docker run spawn. This is the linearization point for launch versus
+# external-stop: if external-stop acquires first, this check sees external and
+# no child is created; if supervisor acquires first, the child may be created,
+# and external-stop acquires next and immediately stops that child. It is not
+# a promise that a launch-winning process can never be created.
+if ! acquire_handoff_lock; then
+    exit 74
+fi
 if [ "$(cat "$stop_intent_path" 2>/dev/null || true)" = external ]; then
     refuse_external
 fi
@@ -146,6 +219,7 @@ docker run --name "$container_name" \
     --mount type=bind,src="$entrypoint_path",dst=/usr/local/libexec/buzz-box-entrypoint,ro \
     "$image_ref" /usr/local/libexec/buzz-box-entrypoint /run/buzz-agent/env.pending &
 child=$!
+release_handoff_lock
 
 ready=0
 attempt=0

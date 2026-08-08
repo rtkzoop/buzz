@@ -5,6 +5,12 @@ umask 077
 state_path=/var/lib/buzz-agent/state.json
 stop_intent_path=/var/lib/buzz-agent/stop-intent
 launch_authorized_path=/run/buzz-agent/launch-authorized
+handoff_lock_path=/run/buzz-agent/launch-handoff.lock
+handoff_owner_path=$handoff_lock_path/pid
+handoff_lock_acquired=0
+handoff_lock_attempts=0
+handoff_lock_max_attempts=120
+handoff_lock_retry_seconds=1
 
 atomic_write() {
     marker_path=$1
@@ -26,8 +32,72 @@ atomic_write() {
     fi
 }
 
+# This short-lived lock is shared with the supervisor. It serializes the
+# external intent write with the supervisor's final check and docker run, but
+# is released before the container's lifetime ends. Dead owners are reclaimed
+# from their PID file and waiting is bounded to avoid a permanent stop block.
+release_handoff_lock() {
+    if [ "$handoff_lock_acquired" -eq 1 ]; then
+        rm -f -- "$handoff_owner_path"
+        rmdir "$handoff_lock_path" 2>/dev/null || true
+        handoff_lock_acquired=0
+    fi
+}
+
+acquire_handoff_lock() {
+    handoff_lock_attempts=0
+    missing_owner_attempts=0
+    while [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; do
+        if mkdir "$handoff_lock_path" 2>/dev/null; then
+            handoff_lock_acquired=1
+            if ! printf '%s\n' "$$" > "$handoff_owner_path"; then
+                release_handoff_lock
+                return 74
+            fi
+            return 0
+        fi
+
+        handoff_lock_attempts=$((handoff_lock_attempts + 1))
+        owner_pid=$(cat "$handoff_owner_path" 2>/dev/null || true)
+        stale_owner=0
+        case "$owner_pid" in
+            '')
+                missing_owner_attempts=$((missing_owner_attempts + 1))
+                if [ "$missing_owner_attempts" -ge 2 ]; then
+                    stale_owner=1
+                fi
+                ;;
+            0|*[!0-9]*) stale_owner=1 ;;
+            *)
+                missing_owner_attempts=0
+                if ! kill -0 "$owner_pid" 2>/dev/null; then
+                    stale_owner=1
+                fi
+                ;;
+        esac
+        if [ "$stale_owner" -eq 1 ]; then
+            rm -f -- "$handoff_owner_path"
+            rmdir "$handoff_lock_path" 2>/dev/null || true
+        elif [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; then
+            sleep "$handoff_lock_retry_seconds"
+        fi
+    done
+    return 75
+}
+
+cleanup_exit() {
+    release_handoff_lock
+}
+trap cleanup_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # This helper runs before systemd stops the launcher. It fences the
 # post-stop hook from treating an owner-requested stop as a crash.
+if ! acquire_handoff_lock; then
+    exit 74
+fi
 atomic_write "$stop_intent_path" external
 rm -f -- "$launch_authorized_path"
 atomic_write "$state_path" '{"launch_armed":false,"started":false,"stop_intent":"external"}'

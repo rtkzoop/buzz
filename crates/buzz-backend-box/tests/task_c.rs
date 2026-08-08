@@ -5,9 +5,10 @@ use buzz_backend_box::provision::{
 use buzz_backend_box::redact::Redactor;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn asset_test_root(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
@@ -53,6 +54,448 @@ fn install_executable(path: &PathBuf, content: &str) {
         permissions.set_mode(0o755);
     }
     fs::set_permissions(path, permissions).expect("fake executable should be executable");
+}
+
+struct HandoffHarness {
+    root: PathBuf,
+    run_dir: PathBuf,
+    bin_dir: PathBuf,
+    supervisor_path: PathBuf,
+    external_stop_path: PathBuf,
+    docker_log: PathBuf,
+    box_log: PathBuf,
+    image_ref: String,
+    docker_release: PathBuf,
+    stop_release: PathBuf,
+    supervisor_run_entered: PathBuf,
+    external_stop_entered: PathBuf,
+}
+
+impl Drop for HandoffHarness {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn handoff_harness(label: &str) -> HandoffHarness {
+    let root = asset_test_root(label);
+    let var_dir = root.join("var/lib/buzz-agent");
+    let run_dir = root.join("run/buzz-agent");
+    let libexec_dir = root.join("usr/local/libexec");
+    let bin_dir = root.join("bin");
+    let supervisor_path = root.join("supervise.sh");
+    let external_stop_path = root.join("external-stop.sh");
+    let docker_log = root.join("docker.log");
+    let box_log = root.join("box.log");
+    let docker_release = root.join("docker-release");
+    let stop_release = root.join("stop-release");
+    let supervisor_run_entered = root.join("supervisor-run-entered");
+    let external_stop_entered = root.join("external-stop-entered");
+    let image_ref =
+        "registry.example/buzz@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string();
+
+    fs::create_dir_all(&var_dir).expect("state directory should be created");
+    fs::create_dir_all(&run_dir).expect("run directory should be created");
+    fs::create_dir_all(&libexec_dir).expect("libexec directory should be created");
+    fs::create_dir_all(&bin_dir).expect("fake bin directory should be created");
+    fs::write(run_dir.join("invocation"), "nonce-1\n").expect("invocation should be written");
+    fs::write(var_dir.join("image.ref"), format!("{image_ref}\n"))
+        .expect("image marker should be written");
+    fs::write(
+        run_dir.join("env.pending"),
+        r#"{"BUZZ_MANAGED_AGENT_START_NONCE":"nonce-1"}"#,
+    )
+    .expect("pending env should be written");
+    #[cfg(unix)]
+    fs::set_permissions(run_dir.join("env.pending"), {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(0o600)
+    })
+    .expect("pending env should be secured");
+    fs::write(run_dir.join("launch-authorized"), "nonce-1\n")
+        .expect("launch authorization should be written");
+
+    install_executable(
+        &bin_dir.join("stat"),
+        "#!/bin/sh\nprintf '%s\\n' '0:0:600'\n",
+    );
+    install_executable(
+        &bin_dir.join("box"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BOX_LOG\"\n",
+    );
+    install_executable(
+        &bin_dir.join("docker"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+    image)
+        printf '%s\n' "$DOCKER_IMAGE"
+        ;;
+    run)
+        : > "$SUPERVISOR_RUN_ENTERED"
+        while [ ! -f "$DOCKER_RELEASE" ]; do
+            sleep 1
+        done
+        printf '%s\n' consumed > "$CONSUMED_PATH"
+        ;;
+    stop)
+        : > "$EXTERNAL_STOP_ENTERED"
+        : > "$DOCKER_RELEASE"
+        while [ ! -f "$STOP_RELEASE" ]; do
+            sleep 1
+        done
+        ;;
+    rm)
+        ;;
+esac
+"#,
+    );
+
+    let supervisor = EMBEDDED_SUPERVISOR
+        .replace(
+            "/var/lib/buzz-agent",
+            var_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/run/buzz-agent",
+            run_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/usr/local/libexec",
+            libexec_dir
+                .to_str()
+                .expect("temporary path should be UTF-8"),
+        );
+    fs::write(&supervisor_path, supervisor).expect("supervisor script should be written");
+
+    let external_stop = EMBEDDED_EXTERNAL_STOP
+        .replace(
+            "/var/lib/buzz-agent",
+            var_dir.to_str().expect("temporary path should be UTF-8"),
+        )
+        .replace(
+            "/run/buzz-agent",
+            run_dir.to_str().expect("temporary path should be UTF-8"),
+        );
+    fs::write(&external_stop_path, external_stop).expect("external-stop script should be written");
+
+    HandoffHarness {
+        root,
+        run_dir,
+        bin_dir,
+        supervisor_path,
+        external_stop_path,
+        docker_log,
+        box_log,
+        image_ref,
+        docker_release,
+        stop_release,
+        supervisor_run_entered,
+        external_stop_entered,
+    }
+}
+
+fn command_path(harness: &HandoffHarness) -> String {
+    format!(
+        "{}:{}",
+        harness.bin_dir.display(),
+        std::env::var("PATH").expect("test PATH should be set")
+    )
+}
+
+fn spawn_supervisor(harness: &HandoffHarness) -> Child {
+    Command::new("sh")
+        .arg(&harness.supervisor_path)
+        .env("PATH", command_path(harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("DOCKER_RELEASE", &harness.docker_release)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("SUPERVISOR_RUN_ENTERED", &harness.supervisor_run_entered)
+        .env("EXTERNAL_STOP_ENTERED", &harness.external_stop_entered)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor should spawn")
+}
+
+fn spawn_external_stop(harness: &HandoffHarness) -> Child {
+    Command::new("sh")
+        .arg(&harness.external_stop_path)
+        .env("PATH", command_path(harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("DOCKER_RELEASE", &harness.docker_release)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("SUPERVISOR_RUN_ENTERED", &harness.supervisor_run_entered)
+        .env("EXTERNAL_STOP_ENTERED", &harness.external_stop_entered)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("external-stop should spawn")
+}
+
+fn wait_for_path(path: &Path, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {label}: {}", path.display());
+}
+
+fn wait_for_success(child: &mut Child, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("child status should be readable") {
+            assert!(status.success(), "{label} exited unsuccessfully: {status}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("timed out waiting for {label}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_status(child: &mut Child, label: &str, expected_code: i32) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("child status should be readable") {
+            assert_eq!(
+                status.code(),
+                Some(expected_code),
+                "{label} exited with an unexpected status: {status}"
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("timed out waiting for {label}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn seed_live_handoff_lock(harness: &HandoffHarness) {
+    let lock_path = harness.run_dir.join("launch-handoff.lock");
+    fs::create_dir(&lock_path).expect("handoff lock should be seeded");
+    fs::write(lock_path.join("pid"), format!("{}\n", std::process::id()))
+        .expect("handoff lock owner should be written");
+}
+
+fn release_seeded_handoff_lock(harness: &HandoffHarness) {
+    let lock_path = harness.run_dir.join("launch-handoff.lock");
+    let _ = fs::remove_file(lock_path.join("pid"));
+    fs::remove_dir(lock_path).expect("seeded handoff lock should be released");
+}
+
+#[test]
+fn external_stop_wins_handoff_lock_before_supervisor_and_prevents_run() {
+    // The external-stop winner linearizes before the supervisor's final check,
+    // so the supervisor must refuse without starting Docker.
+    let harness = handoff_harness("external-wins");
+    seed_live_handoff_lock(&harness);
+    let supervisor_waiting = harness.root.join("supervisor-handoff-waiting");
+    let supervisor_allow = harness.root.join("supervisor-handoff-allow");
+    install_executable(
+        &harness.bin_dir.join("mkdir"),
+        "#!/bin/sh\nif [ -n \"${SUPERVISOR_HANDOFF_WAITING:-}\" ] && case \"$1\" in */launch-handoff.lock) true;; *) false;; esac; then\n    status=0\n    /bin/mkdir \"$@\" || status=$?\n    : > \"$SUPERVISOR_HANDOFF_WAITING\"\n    while [ ! -f \"$SUPERVISOR_HANDOFF_ALLOW\" ]; do sleep 1; done\n    exit \"$status\"\nfi\nexec /bin/mkdir \"$@\"\n",
+    );
+    let mut supervisor = Command::new("sh")
+        .arg(&harness.supervisor_path)
+        .env("PATH", command_path(&harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("DOCKER_RELEASE", &harness.docker_release)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("SUPERVISOR_RUN_ENTERED", &harness.supervisor_run_entered)
+        .env("EXTERNAL_STOP_ENTERED", &harness.external_stop_entered)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .env("SUPERVISOR_HANDOFF_WAITING", &supervisor_waiting)
+        .env("SUPERVISOR_HANDOFF_ALLOW", &supervisor_allow)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor should spawn");
+    wait_for_path(&supervisor_waiting, "supervisor handoff wait");
+
+    let mut external_stop = spawn_external_stop(&harness);
+    release_seeded_handoff_lock(&harness);
+    wait_for_path(
+        &harness.external_stop_entered,
+        "external-stop handoff ownership",
+    );
+    fs::write(&supervisor_allow, "ok\n").expect("supervisor handoff wrapper should be released");
+    fs::write(&harness.stop_release, "ok\n").expect("external-stop should be released");
+    wait_for_success(&mut external_stop, "external-stop");
+    wait_for_status(&mut supervisor, "supervisor external refusal", 67);
+
+    let docker_log = fs::read_to_string(&harness.docker_log).unwrap_or_default();
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        0,
+        "external-stop winning the handoff must prevent docker run: {docker_log}"
+    );
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("stop "))
+            .count(),
+        1,
+        "external-stop should issue one docker stop: {docker_log}"
+    );
+    assert!(!harness.run_dir.join("launch-handoff.lock").exists());
+}
+
+#[test]
+fn supervisor_wins_handoff_then_external_stop_stops_one_container() {
+    // The supervisor winner is also valid: Docker may already exist, but the
+    // next handoff owner must issue docker stop and both processes must finish.
+    let harness = handoff_harness("supervisor-wins");
+    let mut supervisor = spawn_supervisor(&harness);
+    wait_for_path(&harness.supervisor_run_entered, "supervisor docker run");
+    let mut external_stop = spawn_external_stop(&harness);
+    wait_for_path(&harness.external_stop_entered, "external-stop docker stop");
+    fs::write(&harness.stop_release, "ok\n").expect("external-stop should be released");
+    wait_for_success(&mut external_stop, "external-stop");
+    wait_for_success(&mut supervisor, "supervisor");
+
+    let docker_log = fs::read_to_string(&harness.docker_log).unwrap_or_default();
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        1,
+        "supervisor may start at most one container: {docker_log}"
+    );
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("stop "))
+            .count(),
+        1,
+        "external-stop should stop the launched container: {docker_log}"
+    );
+    assert!(!harness.run_dir.join("launch-handoff.lock").exists());
+}
+
+#[test]
+fn stale_handoff_owner_is_recovered_without_unbounded_wait() {
+    let harness = handoff_harness("stale-owner");
+    let lock_path = harness.run_dir.join("launch-handoff.lock");
+    fs::create_dir(&lock_path).expect("stale handoff lock should be seeded");
+    fs::write(lock_path.join("pid"), "99999999\n").expect("stale owner should be written");
+
+    let mut external_stop = spawn_external_stop(&harness);
+    wait_for_path(&harness.external_stop_entered, "stale-owner recovery");
+    fs::write(&harness.stop_release, "ok\n").expect("external-stop should be released");
+    wait_for_success(&mut external_stop, "external-stop stale-owner recovery");
+    assert!(!lock_path.exists(), "stale handoff lock should be removed");
+}
+
+#[test]
+fn supervisor_signal_while_handoff_check_is_blocked_cleans_lock() {
+    let harness = handoff_harness("supervisor-signal-cleanup");
+    let count_path = harness.root.join("stop-intent-count");
+    let final_check_entered = harness.root.join("final-check-entered");
+    let final_check_release = harness.root.join("final-check-release");
+    install_executable(
+        &harness.bin_dir.join("cat"),
+        "#!/bin/sh\ncase \"$1\" in\n  *stop-intent)\n    count=0\n    if [ -f \"$CAT_COUNT_PATH\" ]; then read count < \"$CAT_COUNT_PATH\"; fi\n    count=$((count + 1))\n    printf '%s\\n' \"$count\" > \"$CAT_COUNT_PATH\"\n    if [ \"$count\" -eq 3 ]; then\n      : > \"$FINAL_CHECK_ENTERED\"\n      while [ ! -f \"$FINAL_CHECK_RELEASE\" ]; do sleep 1; done\n    fi\n    ;;\nesac\nexec /bin/cat \"$@\"\n",
+    );
+    let mut supervisor = Command::new("sh")
+        .arg(&harness.supervisor_path)
+        .env("PATH", command_path(&harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("DOCKER_RELEASE", &harness.docker_release)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("SUPERVISOR_RUN_ENTERED", &harness.supervisor_run_entered)
+        .env("EXTERNAL_STOP_ENTERED", &harness.external_stop_entered)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .env("CAT_COUNT_PATH", &count_path)
+        .env("FINAL_CHECK_ENTERED", &final_check_entered)
+        .env("FINAL_CHECK_RELEASE", &final_check_release)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor should spawn");
+    wait_for_path(&final_check_entered, "supervisor final handoff check");
+    assert!(harness.run_dir.join("launch-handoff.lock").exists());
+    let status = Command::new("kill")
+        .args(["-TERM", &supervisor.id().to_string()])
+        .status()
+        .expect("kill should be available");
+    assert!(status.success(), "supervisor TERM should be sent");
+    fs::write(&final_check_release, "ok\n").expect("final check should be released");
+    fs::write(&harness.stop_release, "ok\n").expect("signal stop should be released");
+    wait_for_success(&mut supervisor, "signalled supervisor");
+    assert!(
+        !harness.run_dir.join("launch-handoff.lock").exists(),
+        "signal exit must not leave handoff lock"
+    );
+}
+
+#[test]
+fn external_stop_signal_while_handoff_write_is_blocked_cleans_lock() {
+    let harness = handoff_harness("external-stop-signal-cleanup");
+    let mv_entered = harness.root.join("mv-entered");
+    let mv_release = harness.root.join("mv-release");
+    install_executable(
+        &harness.bin_dir.join("mv"),
+        "#!/bin/sh\ncase \"$3\" in\n  *stop-intent)\n    : > \"$MV_ENTERED\"\n    while [ ! -f \"$MV_RELEASE\" ]; do sleep 1; done\n    ;;\nesac\nexec /bin/mv \"$@\"\n",
+    );
+    let mut external_stop = Command::new("sh")
+        .arg(&harness.external_stop_path)
+        .env("PATH", command_path(&harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("DOCKER_RELEASE", &harness.docker_release)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("SUPERVISOR_RUN_ENTERED", &harness.supervisor_run_entered)
+        .env("EXTERNAL_STOP_ENTERED", &harness.external_stop_entered)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .env("MV_ENTERED", &mv_entered)
+        .env("MV_RELEASE", &mv_release)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("external-stop should spawn");
+    wait_for_path(&mv_entered, "external-stop handoff write");
+    assert!(harness.run_dir.join("launch-handoff.lock").exists());
+    let status = Command::new("kill")
+        .args(["-TERM", &external_stop.id().to_string()])
+        .status()
+        .expect("kill should be available");
+    assert!(status.success(), "external-stop TERM should be sent");
+    fs::write(&mv_release, "ok\n").expect("external-stop write should be released");
+    wait_for_status(&mut external_stop, "signalled external-stop", 143);
+    assert!(
+        !harness.run_dir.join("launch-handoff.lock").exists(),
+        "signal exit must not leave handoff lock"
+    );
 }
 
 fn supervisor_race_case(label: &str, prior_external: bool, inject_external: bool) {
@@ -553,6 +996,12 @@ fn task_c_assets_are_shell_safe_and_unit_has_required_supervision_policy() {
         "dst=/run/buzz-agent/env.pending,ro",
         "dst=/run/buzz-agent/env-consumed,rw",
         "box stop self",
+        "launch-handoff.lock",
+        "handoff_owner_path",
+        "handoff_lock_max_attempts",
+        "kill -0",
+        "linearization point",
+        "launch-winning process can never be created",
     ] {
         assert!(
             EMBEDDED_SUPERVISOR.contains(required),
@@ -566,6 +1015,18 @@ fn task_c_assets_are_shell_safe_and_unit_has_required_supervision_policy() {
     assert!(EMBEDDED_EXTERNAL_STOP.contains("mv -f"));
     assert!(EMBEDDED_EXTERNAL_STOP.contains("launch_authorized_path"));
     assert!(EMBEDDED_EXTERNAL_STOP.contains("rm -f -- \"$launch_authorized_path\""));
+    for required in [
+        "launch-handoff.lock",
+        "handoff_owner_path",
+        "handoff_lock_max_attempts",
+        "kill -0",
+        "short-lived lock",
+    ] {
+        assert!(
+            EMBEDDED_EXTERNAL_STOP.contains(required),
+            "external-stop missing {required}"
+        );
+    }
     assert!(EMBEDDED_POSTSTOP.contains("mv -f"));
     assert!(EMBEDDED_POSTSTOP.contains("refused-external"));
     assert!(!EMBEDDED_UNIT.contains("Environment="));
