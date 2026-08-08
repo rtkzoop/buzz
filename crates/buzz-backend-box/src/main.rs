@@ -3,6 +3,7 @@
 //! The binary consumes one JSON request from stdin and emits one JSON response
 //! on stdout. Operational failures are in-band and still exit successfully.
 
+use buzz_backend_box::provision::BoxProvisioner;
 use buzz_backend_box::reconcile;
 use buzz_backend_box::wire::{self, Request, Response};
 use std::io::Read;
@@ -36,12 +37,10 @@ async fn respond(input: &str) -> Response {
 
     match request {
         Request::Info => Response::info(),
-        Request::Deploy(request) => {
-            match reconcile::deploy(&request, &reconcile::StubProvisioner).await {
-                Ok(agent_id) => Response::Deploy(wire::DeployResponse { ok: true, agent_id }),
-                Err(error) => Response::error(error.to_string()),
-            }
-        }
+        Request::Deploy(request) => match reconcile::deploy(&request, &BoxProvisioner).await {
+            Ok(agent_id) => Response::Deploy(wire::DeployResponse { ok: true, agent_id }),
+            Err(error) => Response::error(error.to_string()),
+        },
     }
 }
 
@@ -60,7 +59,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deploy_is_an_in_band_not_implemented_error() {
+    async fn deploy_is_an_in_band_error() {
         let response = respond(
             r#"{"op":"deploy","agent":{"relay_url":"wss://relay","private_key_nsec":"nsec1test"}}"#,
         )

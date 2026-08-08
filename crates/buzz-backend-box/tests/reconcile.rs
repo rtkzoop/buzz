@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use buzz_backend_box::api::{
     BoxApi, BoxApiError, BoxRecord, BoxState, CommandRequest, ListBoxesQuery,
 };
@@ -11,7 +12,8 @@ use buzz_backend_box::classify::{
     StopIntent, BINDING_VERSION, MANAGED_BY,
 };
 use buzz_backend_box::naming::AgentIdentity;
-use buzz_backend_box::observe::observe_box;
+use buzz_backend_box::observe::{observe_box, LAUNCH_INTENT_PATH, OWNERSHIP_MARKER_PATH};
+use buzz_backend_box::provision::BoxProvisioner;
 use buzz_backend_box::reconcile::{
     prepare_deploy, reconcile, ProvisionRequest, Provisioner, ReconcileError, ReconcileOptions,
 };
@@ -24,6 +26,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 type ServiceResult = (bool, i32, String, bool);
+type FileWrite = (String, String, String);
+type CommandFailure = (String, String);
 
 #[derive(Clone, Default)]
 struct FakeState {
@@ -39,6 +43,11 @@ struct FakeState {
     create_count: Arc<Mutex<u64>>,
     stop_count: Arc<Mutex<u64>>,
     injected_files: Arc<Mutex<Vec<String>>>,
+    file_writes: Arc<Mutex<Vec<FileWrite>>>,
+    commands: Arc<Mutex<Vec<String>>>,
+    command_failure: Arc<Mutex<Option<CommandFailure>>>,
+    command_timeouts: Arc<Mutex<Vec<u64>>>,
+    service_active: Arc<Mutex<bool>>,
     service_active_after_resume: Arc<Mutex<bool>>,
     service_results: Arc<Mutex<Vec<ServiceResult>>>,
     read_paths: Arc<Mutex<Vec<String>>>,
@@ -200,9 +209,33 @@ async fn resume_box(
 
 async fn execute_command(
     AxumState(state): AxumState<FakeState>,
-    Path(_box_id): Path<String>,
+    Path(box_id): Path<String>,
     Json(body): Json<CommandRequest>,
 ) -> impl IntoResponse {
+    state.commands.lock().await.push(body.command.clone());
+    state
+        .command_timeouts
+        .lock()
+        .await
+        .push(body.timeout_seconds.unwrap_or_default());
+    let failure = {
+        let mut configured = state.command_failure.lock().await;
+        if configured
+            .as_ref()
+            .is_some_and(|(needle, _)| body.command.contains(needle))
+        {
+            configured.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, stderr)) = failure {
+        return envelope(
+            "command.finished",
+            json!({"success": false, "exitCode": 1, "stdout": "", "stderr": stderr, "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+        )
+        .into_response();
+    }
     if let Some((success, exit_code, stdout, timed_out)) = {
         let mut results = state.service_results.lock().await;
         (!results.is_empty()).then(|| results.remove(0))
@@ -213,7 +246,41 @@ async fn execute_command(
         )
         .into_response();
     }
-    let active = *state.service_active_after_resume.lock().await;
+    if body.command.contains("systemctl start buzz-agent.service") {
+        *state.service_active.lock().await = true;
+        state.files.lock().await.insert(
+            (box_id.clone(), "run/buzz-agent/env-consumed".to_string()),
+            "consumed".to_string(),
+        );
+        state.files.lock().await.insert(
+            (box_id.clone(), "var/lib/buzz-agent/state.json".to_string()),
+            json!({"started": true, "startup": "ready"}).to_string(),
+        );
+    }
+    if body.command.contains("image-pull.status") {
+        return envelope(
+            "command.finished",
+            json!({"success": true, "exitCode": 0, "stdout": "ready", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+        )
+        .into_response();
+    }
+    if body
+        .command
+        .contains("stat -c '%u:%g:%a' /run/buzz-agent/env.pending")
+    {
+        return envelope(
+            "command.finished",
+            json!({"success": true, "exitCode": 0, "stdout": "0:0:600", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+        )
+        .into_response();
+    }
+    if body.command.contains("rm -f /run/buzz-agent/env.pending") {
+        let mut files = state.files.lock().await;
+        files.remove(&(box_id.clone(), "run/buzz-agent/env.pending".to_string()));
+        files.remove(&(box_id, "run/buzz-agent/env-consumed".to_string()));
+    }
+    let active =
+        *state.service_active.lock().await || *state.service_active_after_resume.lock().await;
     let stdout = if active || body.command.contains("is-active") {
         "active"
     } else {
@@ -251,12 +318,28 @@ async fn write_file(
 ) -> impl IntoResponse {
     let path = body["path"].as_str().unwrap_or("unknown").to_string();
     let content = body["content"].as_str().unwrap_or("unknown").to_string();
+    let encoding = body["encoding"].as_str().unwrap_or("utf8").to_string();
     state.injected_files.lock().await.push(content.clone());
+    state
+        .file_writes
+        .lock()
+        .await
+        .push((path.clone(), content.clone(), encoding.clone()));
+    let stored_content = if encoding == "base64" {
+        String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(&content)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    } else {
+        content
+    };
     state
         .files
         .lock()
         .await
-        .insert((box_id, path.clone()), content);
+        .insert((box_id, path.clone()), stored_content);
     envelope("file.written", json!({"path": path})).into_response()
 }
 
@@ -734,7 +817,10 @@ async fn ambient_box_key_is_redacted_from_api_errors() {
         !rendered.contains("fake-key-123"),
         "leaked error: {rendered}"
     );
-    assert!(rendered.contains("[redacted]"));
+    assert!(
+        rendered.contains("[redacted]"),
+        "rendered provisioning error: {rendered}"
+    );
     server_task.abort();
 }
 
@@ -770,6 +856,193 @@ async fn marker_files_use_relative_box_workdir_paths() {
         .await
         .iter()
         .all(|path| !path.starts_with('/')));
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_noop() {
+    let (identity, request) = identity_and_request();
+    let prepared = prepare_deploy(&request).expect("request should prepare");
+    let state = FakeState::default();
+    let (base_url, server_task) = server(state.clone()).await;
+    let api = BoxApi::with_api_key(base_url, "fake-key", Duration::from_secs(2))
+        .expect("client should build");
+
+    let result = reconcile(
+        &api,
+        &prepared,
+        &BoxProvisioner,
+        ReconcileOptions {
+            deadline: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1),
+        },
+    )
+    .await
+    .expect("real provisioner should confirm startup");
+    assert_eq!(result, "candidate-1");
+
+    let commands = state.commands.lock().await.clone();
+    assert_eq!(
+        commands.len(),
+        12,
+        "unexpected command sequence: {commands:?}"
+    );
+    assert!(commands[0].starts_with("install -d "));
+    assert!(commands[1].starts_with("chown root:root /etc/systemd/system"));
+    assert_eq!(commands[2], "systemctl daemon-reload");
+    assert_eq!(commands[3], "systemctl enable buzz-agent.service");
+    assert!(commands[4].contains("nohup sh -c"));
+    assert!(commands[4].contains("docker pull --quiet"));
+    assert_eq!(
+        commands[5],
+        "cat /var/lib/buzz-agent/image-pull.status 2>/dev/null || printf pending"
+    );
+    assert_eq!(
+        commands[6],
+        "install -o root -g root -m 666 /dev/null /run/buzz-agent/env-consumed"
+    );
+    assert!(commands[7].contains("chown root:root /run/buzz-agent/env.pending"));
+    assert_eq!(commands[8], "systemctl start buzz-agent.service");
+    assert_eq!(commands[9], "systemctl is-active buzz-agent.service");
+    assert_eq!(
+        commands[10],
+        "rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
+    );
+    assert_eq!(commands[11], "systemctl is-active buzz-agent.service");
+
+    let mut forbidden_values = prepared.env.values().cloned().collect::<Vec<_>>();
+    forbidden_values.push(request.agent.private_key_nsec.clone());
+    if let Some(auth_tag) = request.agent.auth_tag.clone() {
+        forbidden_values.push(auth_tag);
+    }
+    for command in &commands {
+        assert!(!command.contains("--env-file"));
+        for value in &forbidden_values {
+            assert!(
+                !value.is_empty() && !command.contains(value),
+                "secret in command: {command}"
+            );
+        }
+    }
+    assert!(state
+        .command_timeouts
+        .lock()
+        .await
+        .iter()
+        .all(|timeout| *timeout <= 60));
+
+    let writes = state.file_writes.lock().await.clone();
+    assert_eq!(writes.len(), 10, "unexpected file writes: {writes:?}");
+    assert!(writes.iter().all(|(path, _, _)| !path.starts_with('/')));
+    let (_, env_payload, encoding) = writes
+        .iter()
+        .find(|(path, _, _)| path == "run/buzz-agent/env.pending")
+        .expect("pending environment should be written");
+    assert_eq!(encoding, "base64");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(env_payload)
+        .expect("environment payload should be base64");
+    assert_eq!(
+        decoded,
+        serde_json::to_vec(&prepared.env).expect("env should serialize canonically")
+    );
+
+    let files = state.files.lock().await.clone();
+    assert!(!files.contains_key(&(
+        "candidate-1".to_string(),
+        "run/buzz-agent/env.pending".to_string()
+    )));
+    assert!(!files.contains_key(&(
+        "candidate-1".to_string(),
+        "run/buzz-agent/env-consumed".to_string()
+    )));
+    let ownership: Value = serde_json::from_str(
+        files
+            .get(&("candidate-1".to_string(), OWNERSHIP_MARKER_PATH.to_string()))
+            .expect("ownership marker should be present"),
+    )
+    .expect("ownership marker should be JSON");
+    assert_eq!(ownership["pubkey"], identity.pubkey_hex());
+    assert_eq!(ownership["managed_by"], MANAGED_BY);
+    assert_eq!(ownership["binding_version"], BINDING_VERSION);
+    let expected_launch_intent = format!("{}\n", prepared.launch_intent.as_str());
+    assert_eq!(
+        files
+            .get(&("candidate-1".to_string(), LAUNCH_INTENT_PATH.to_string()))
+            .map(String::as_str),
+        Some(expected_launch_intent.as_str())
+    );
+
+    let record = state
+        .boxes
+        .lock()
+        .await
+        .get("candidate-1")
+        .cloned()
+        .expect("candidate should remain present");
+    let observed = observe_box(&api, record, &identity)
+        .await
+        .expect("round-trip observation should succeed")
+        .expect("ownership should be verified");
+    assert_eq!(
+        observed.launch_intent.as_ref(),
+        Some(&prepared.launch_intent)
+    );
+    assert_eq!(
+        classify(Some(&observed), &prepared.launch_intent),
+        Action::NoOp {
+            agent_id: "candidate-1".to_string()
+        }
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn provisioning_failure_redacts_error_and_removes_pending_secret_file() {
+    let (_, request) = identity_and_request();
+    let prepared = prepare_deploy(&request).expect("request should prepare");
+    let state = FakeState::default();
+    *state.command_failure.lock().await = Some((
+        "systemctl start buzz-agent.service".to_string(),
+        "startup failed while handling model-secret".to_string(),
+    ));
+    let (base_url, server_task) = server(state.clone()).await;
+    let api = BoxApi::with_api_key(base_url, "fake-key", Duration::from_secs(2))
+        .expect("client should build");
+
+    let error = reconcile(
+        &api,
+        &prepared,
+        &BoxProvisioner,
+        ReconcileOptions {
+            deadline: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1),
+        },
+    )
+    .await
+    .expect_err("failed start should surface as a provisioning error");
+    let rendered = error.to_string();
+    for secret in [
+        "model-secret",
+        "auth-secret",
+        request.agent.private_key_nsec.as_str(),
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "secret leaked in error: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("[redacted]"),
+        "rendered provisioning error: {rendered}"
+    );
+    assert!(state.commands.lock().await.last().is_some_and(
+        |command| command == "rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
+    ));
+    assert!(!state.files.lock().await.contains_key(&(
+        "candidate-1".to_string(),
+        "run/buzz-agent/env.pending".to_string()
+    )));
     server_task.abort();
 }
 

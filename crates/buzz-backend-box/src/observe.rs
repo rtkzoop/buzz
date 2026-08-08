@@ -25,6 +25,8 @@ pub const STATE_MARKER_PATH: &str = "var/lib/buzz-agent/state.json";
 pub const STOP_INTENT_PATH: &str = "var/lib/buzz-agent/stop-intent";
 /// Non-secret launch-intent fingerprint.
 pub const LAUNCH_INTENT_PATH: &str = "var/lib/buzz-agent/launch-intent.sha256";
+/// Non-secret readiness marker emitted after the entrypoint consumes its env.
+pub const ENV_CONSUMED_MARKER_PATH: &str = "run/buzz-agent/env-consumed";
 /// Fixed systemd unit supervised by the provider.
 pub const SERVICE_UNIT: &str = "buzz-agent.service";
 

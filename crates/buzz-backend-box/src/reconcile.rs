@@ -13,11 +13,12 @@ use crate::classify::{classify, Action, ClassificationError, Fingerprint, Harnes
 use crate::config::{self, ProviderConfig};
 use crate::naming::AgentIdentity;
 use crate::observe::{observe_box, ObserveError};
+use crate::redact::Redactor;
 use crate::wire::{AgentPayload, DeployRequest};
 use serde_json::Map;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// The reconciliation operation deadline required by the provider contract.
@@ -60,87 +61,6 @@ fn nonempty_trimmed(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Provider-local bounded redaction seam. Task C will replace this with the
-/// complete shared secret redactor, but all Task B error paths already pass
-/// through this boundary.
-#[derive(Clone, Default)]
-pub struct Redactor {
-    secrets: Vec<String>,
-}
-
-impl fmt::Debug for Redactor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Redactor")
-            .field("secret_count", &self.secrets.len())
-            .finish()
-    }
-}
-
-impl Redactor {
-    /// Build a redactor from non-empty secret values, longest first.
-    pub fn from_values(values: impl IntoIterator<Item = String>) -> Self {
-        let mut secrets: Vec<String> = values
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect();
-        secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        secrets.dedup();
-        Self { secrets }
-    }
-
-    /// Add one credential value to the redaction set.
-    pub fn with_value(mut self, value: impl Into<String>) -> Self {
-        let value = value.into();
-        if !value.is_empty() {
-            self.secrets.push(value);
-            self.secrets
-                .sort_by_key(|entry| std::cmp::Reverse(entry.len()));
-            self.secrets.dedup();
-        }
-        self
-    }
-
-    /// Replace known secrets and token-shaped prefixes in untrusted text.
-    pub fn redact(&self, input: &str) -> String {
-        let mut output = input.to_string();
-        for secret in &self.secrets {
-            output = output.replace(secret, "[redacted]");
-        }
-        for prefix in [
-            "nsec1",
-            "sprt_tok_",
-            "ghp_",
-            "gho_",
-            "ghu_",
-            "ghs_",
-            "ghr_",
-            "github_pat_",
-        ] {
-            output = redact_token_prefix(&output, prefix);
-        }
-        output
-            .chars()
-            .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-            .take(512)
-            .collect()
-    }
-}
-
-fn redact_token_prefix(input: &str, prefix: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut remaining = input;
-    while let Some(index) = remaining.find(prefix) {
-        output.push_str(&remaining[..index]);
-        let token = &remaining[index..];
-        let end = token.find(char::is_whitespace).unwrap_or(token.len());
-        output.push_str("[redacted]");
-        remaining = &token[end..];
-    }
-    output.push_str(remaining);
-    output
-}
-
 /// Prepared, non-network deployment context.
 #[derive(Clone, Debug)]
 pub struct PreparedDeploy {
@@ -164,12 +84,17 @@ pub fn prepare_deploy(request: &DeployRequest) -> Result<PreparedDeploy, Reconci
     let identity = AgentIdentity::from_nsec(&request.agent.private_key_nsec)
         .map_err(ReconcileError::InvalidRequest)?;
     let config = config::parse(&request.provider_config).map_err(ReconcileError::InvalidRequest)?;
-    let env = build_environment(&request.agent, &config)?;
+    let mut env = build_environment(&request.agent, &config)?;
+    env.insert(
+        "BUZZ_MANAGED_AGENT_START_NONCE".to_string(),
+        launch_nonce(identity.pubkey_hex()),
+    );
     let redactor = Redactor::from_values(
         env.values()
             .cloned()
             .chain(std::iter::once(request.agent.private_key_nsec.clone()))
             .chain(request.agent.auth_tag.clone())
+            .chain(std::iter::once(request.agent.relay_url.clone()))
             .collect::<Vec<_>>(),
     );
     let launch_intent = build_launch_intent(&identity, &config, env.keys().cloned())?;
@@ -182,6 +107,20 @@ pub fn prepare_deploy(request: &DeployRequest) -> Result<PreparedDeploy, Reconci
         launch_intent,
         subdomain,
     })
+}
+
+fn launch_nonce(pubkey: &str) -> String {
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let mut input = String::with_capacity(pubkey.len() + timestamp.len() + 24);
+    input.push_str(pubkey);
+    input.push(':');
+    input.push_str(&timestamp);
+    input.push(':');
+    input.push_str(&std::process::id().to_string());
+    hex::encode(Sha256::digest(input.as_bytes()))
 }
 
 fn build_environment(
@@ -331,23 +270,26 @@ fn build_launch_intent(
     Ok(Fingerprint::from_canonical_bytes(&bytes))
 }
 
-/// Typed error returned by the Task B provisioner seam.
+/// Typed error returned by the Box provisioner.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ProvisionError {
-    /// Secret injection and service installation belong to Task C.
-    #[error("Box provisioning is not yet implemented; secret injection and service installation are Task C")]
-    NotYetImplemented,
-    /// A future provisioner may return a bounded safe message.
+    /// A bounded, already-redacted provisioning failure.
     #[error("Box provisioning failed: {0}")]
     Failed(String),
 }
 
 /// Inputs supplied to a provisioner after ownership has been claimed.
 pub struct ProvisionRequest<'a> {
+    /// Authenticated Box client for commands, files, and marker reads.
+    pub api: &'a BoxApi,
     /// Claimed Box record.
     pub box_record: &'a BoxRecord,
     /// Prepared deployment context, including secrets held only in memory.
     pub prepared: &'a PreparedDeploy,
+    /// Absolute reconciliation deadline shared with the caller.
+    pub deadline: Instant,
+    /// Poll interval selected by the reconciliation caller.
+    pub poll_interval: Duration,
 }
 
 /// The seam for Task C secret injection, service installation, and launch.
@@ -355,16 +297,6 @@ pub struct ProvisionRequest<'a> {
 pub trait Provisioner {
     /// Provision and start the fixed service inside a verified claimed Box.
     async fn provision(&self, request: ProvisionRequest<'_>) -> Result<(), ProvisionError>;
-}
-
-/// Task B's truthful stub provisioner.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StubProvisioner;
-
-impl Provisioner for StubProvisioner {
-    async fn provision(&self, _request: ProvisionRequest<'_>) -> Result<(), ProvisionError> {
-        Err(ProvisionError::NotYetImplemented)
-    }
 }
 
 /// Reconciliation timing overrides, with production defaults of 600 seconds
@@ -492,8 +424,11 @@ pub async fn reconcile(
                         // crossed the API boundary. Task C owns this seam.
                         provisioner
                             .provision(ProvisionRequest {
+                                api,
                                 box_record: &claimed,
                                 prepared,
+                                deadline: started + options.deadline,
+                                poll_interval: options.poll_interval,
                             })
                             .await?;
                         return reobserve_until_started(
@@ -531,8 +466,11 @@ pub async fn reconcile(
                 let ready = wait_for_ready(api, &resumed.id, prepared, options, started).await?;
                 provisioner
                     .provision(ProvisionRequest {
+                        api,
                         box_record: &ready,
                         prepared,
+                        deadline: started + options.deadline,
+                        poll_interval: options.poll_interval,
                     })
                     .await?;
                 return reobserve_until_started(
@@ -555,8 +493,11 @@ pub async fn reconcile(
                     .map_err(|error| api_error(api, prepared, error))?;
                 provisioner
                     .provision(ProvisionRequest {
+                        api,
                         box_record: &record,
                         prepared,
+                        deadline: started + options.deadline,
+                        poll_interval: options.poll_interval,
                     })
                     .await?;
                 return reobserve_until_started(

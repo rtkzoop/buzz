@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+umask 077
+
+state_path=/var/lib/buzz-agent/state.json
+stop_intent_path=/var/lib/buzz-agent/stop-intent
+printf '%s\n' external > "$stop_intent_path"
+printf '{"started":false,"stop_intent":"external"}\n' > "$state_path"
+docker stop --time=110 buzz-agent >/dev/null 2>&1 || true

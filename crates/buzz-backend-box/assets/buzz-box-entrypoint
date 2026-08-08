@@ -1,0 +1,125 @@
+#!/bin/sh
+# The approved image does not provide a stable JSON utility. This fixed parser
+# accepts only the canonical JSON object of string keys and string values that
+# the provider emits. Malformed, non-string, or non-POSIX input exits before the
+# file is unlinked or the harness is started.
+set -eu
+umask 077
+
+if [ "$#" -ne 1 ]; then
+    exit 64
+fi
+env_file=$1
+[ -r "$env_file" ] || exit 65
+json=$(cat -- "$env_file") || exit 66
+[ -n "$json" ] || exit 67
+rest=$json
+parsed=
+char=
+
+skip_ws() {
+    while :; do
+        case "$rest" in
+            " "*|"
+"*|"	"*) rest=${rest#?} ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+take_char() {
+    [ -n "$rest" ] || return 1
+    char=${rest%"${rest#?}"}
+    rest=${rest#?}
+}
+
+parse_string() {
+    parsed=
+    case "$rest" in
+        \"*) rest=${rest#?} ;;
+        *) return 1 ;;
+    esac
+    while [ -n "$rest" ]; do
+        take_char || return 1
+        case "$char" in
+            \" ) return 0 ;;
+            \\ )
+                take_char || return 1
+                case "$char" in
+                    \"|\\|/ ) parsed=$parsed$char ;;
+                    b ) parsed=$parsed$(printf '\b') ;;
+                    f ) parsed=$parsed$(printf '\f') ;;
+                    n ) parsed="${parsed}
+" ;;
+                    r ) parsed=$parsed$(printf '\r') ;;
+                    t ) parsed=$parsed$(printf '\t') ;;
+                    u )
+                        hex=
+                        count=0
+                        while [ "$count" -lt 4 ]; do
+                            take_char || return 1
+                            case "$char" in
+                                [0-9A-Fa-f]) hex=$hex$char ;;
+                                *) return 1 ;;
+                            esac
+                            count=$((count + 1))
+                        done
+                        case "$hex" in
+                            0000) return 1 ;;
+                            000a) parsed="${parsed}
+" ;;
+                            *)
+                                codepoint=$(printf '%b' "\\u$hex") || return 1
+                                [ -n "$codepoint" ] || return 1
+                                parsed=$parsed$codepoint
+                                ;;
+                        esac
+                        ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *) parsed=$parsed$char ;;
+        esac
+    done
+    return 1
+}
+
+parse_object() {
+    skip_ws
+    case "$rest" in
+        \{*) rest=${rest#?} ;;
+        *) return 1 ;;
+    esac
+    skip_ws
+    case "$rest" in
+        \}*) rest=${rest#?} ; return 0 ;;
+    esac
+    while :; do
+        parse_string || return 1
+        key=$parsed
+        case "$key" in
+            ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1 ;;
+        esac
+        skip_ws
+        case "$rest" in
+            :*) rest=${rest#?} ;;
+            *) return 1 ;;
+        esac
+        skip_ws
+        parse_string || return 1
+        export "$key=$parsed" || return 1
+        skip_ws
+        case "$rest" in
+            ,*) rest=${rest#?} ; skip_ws ;;
+            \}*) rest=${rest#?} ; return 0 ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+parse_object || exit 68
+skip_ws
+[ -z "$rest" ] || exit 69
+rm -f -- "$env_file" 2>/dev/null || true
+printf '%s\n' consumed > /run/buzz-agent/env-consumed
+exec buzz-acp

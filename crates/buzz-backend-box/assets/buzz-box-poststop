@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+umask 077
+
+stop_intent_path=/var/lib/buzz-agent/stop-intent
+state_path=/var/lib/buzz-agent/state.json
+intent=$(cat "$stop_intent_path" 2>/dev/null || true)
+case "$intent" in
+    external|self) exit 0 ;;
+esac
+if [ -f "$state_path" ] && grep -Fq '"stop_intent":"external"' "$state_path"; then
+    exit 0
+fi
+box stop self >/dev/null 2>&1 || true

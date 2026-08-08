@@ -1,0 +1,24 @@
+[Unit]
+Description=Buzz ACP agent in Docker
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/buzz-agent
+ExecStart=/usr/local/libexec/buzz-box-supervise
+ExecStop=/usr/local/libexec/buzz-box-external-stop
+ExecStopPost=/usr/local/libexec/buzz-box-poststop
+Restart=no
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=120s
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
