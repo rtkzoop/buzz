@@ -4,11 +4,32 @@ umask 077
 
 stop_intent_path=/var/lib/buzz-agent/stop-intent
 state_path=/var/lib/buzz-agent/state.json
+
+atomic_write() {
+    marker_path=$1
+    marker_content=$2
+    marker_tmp="${marker_path}.tmp.$$"
+    printf '%s\n' "$marker_content" > "$marker_tmp"
+    mv -f "$marker_tmp" "$marker_path"
+}
+
 intent=$(cat "$stop_intent_path" 2>/dev/null || true)
+state=$(cat "$state_path" 2>/dev/null || true)
 case "$intent" in
-    external|self) exit 0 ;;
+    external|refused-not-armed) exit 0 ;;
 esac
-if [ -f "$state_path" ] && grep -Fq '"stop_intent":"external"' "$state_path"; then
+if printf '%s' "$state" | grep -Fq '"stop_intent":"external"'; then
     exit 0
 fi
+if printf '%s' "$state" | grep -Fq '"startup":"refused-not-armed"'; then
+    exit 0
+fi
+if ! printf '%s' "$state" | grep -Fq '"launch_armed":true'; then
+    exit 0
+fi
+# An armed launch with no external/refusal intent is the crash or intentional
+# self-exit path. The launcher normally writes these markers first, but this
+# fallback is what makes ExecStopPost safe if it dies before doing so.
+atomic_write "$stop_intent_path" self
+atomic_write "$state_path" '{"launch_armed":true,"started":false,"stop_intent":"self","poststop":true}'
 box stop self >/dev/null 2>&1 || true

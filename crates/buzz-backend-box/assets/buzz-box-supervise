@@ -7,16 +7,47 @@ stop_intent_path=/var/lib/buzz-agent/stop-intent
 invocation_path=/run/buzz-agent/invocation
 image_path=/var/lib/buzz-agent/image.ref
 env_path=/run/buzz-agent/env.pending
+launch_authorized_path=/run/buzz-agent/launch-authorized
 consumed_path=/run/buzz-agent/env-consumed
 entrypoint_path=/usr/local/libexec/buzz-box-entrypoint
 lock_path=/run/buzz-agent/supervisor.lock
 container_name=buzz-agent
 external_stop=0
+signal_interrupted=0
+launch_armed=0
+invocation=
+lock_acquired=0
+
+# Markers are read by systemd's post-stop hook and by the next resumed VM.
+# Always replace them atomically on the same filesystem. The pending env file
+# is different: it is a transient secret owned by this launcher and is removed
+# by the EXIT trap on every path, including preflight and lock failures.
+atomic_write() {
+    marker_path=$1
+    marker_content=$2
+    marker_tmp="${marker_path}.tmp.$$"
+    if ! printf '%s\n' "$marker_content" > "$marker_tmp"; then
+        rm -f -- "$marker_tmp"
+        return 1
+    fi
+    if ! mv -f "$marker_tmp" "$marker_path"; then
+        rm -f -- "$marker_tmp"
+        return 1
+    fi
+}
+
+cleanup_exit() {
+    rm -f -- "$env_path" "$launch_authorized_path"
+    if [ "$lock_acquired" -eq 1 ]; then
+        rmdir "$lock_path" 2>/dev/null || true
+    fi
+}
+trap cleanup_exit EXIT
 
 if ! mkdir "$lock_path" 2>/dev/null; then
     exit 73
 fi
-trap 'rmdir "$lock_path" 2>/dev/null || true' EXIT
+lock_acquired=1
 
 invocation=$(cat "$invocation_path" 2>/dev/null || true)
 image_ref=$(cat "$image_path" 2>/dev/null || true)
@@ -33,12 +64,41 @@ if ! printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
 fi
 
 record_external() {
+    signal_interrupted=1
     external_stop=1
-    printf '%s\n' external > "$stop_intent_path"
-    printf '{"invocation":"%s","started":false,"stop_intent":"external"}\n' "$invocation" > "$state_path"
+    atomic_write "$stop_intent_path" external || true
+    atomic_write "$state_path" "{\"invocation\":\"${invocation:-}\",\"launch_armed\":$launch_armed,\"started\":false,\"stop_intent\":\"external\"}" || true
     docker stop --time=110 "$container_name" >/dev/null 2>&1 || true
 }
 trap record_external TERM INT
+
+prior_intent=$(cat "$stop_intent_path" 2>/dev/null || true)
+authorized_nonce=$(cat "$launch_authorized_path" 2>/dev/null || true)
+
+# A resumed enabled unit must never infer a new launch from disk state. A
+# matching launch-authorized nonce is the only explicit-start capability. This
+# covers prior self and external intent, and also the no-marker resume race.
+if [ "$authorized_nonce" != "$invocation" ]; then
+    case "$prior_intent" in
+        self|external)
+            # A prior intentional or external stop is never relaunched
+            # without a matching fresh authorization marker.
+            atomic_write "$stop_intent_path" refused-not-armed || true
+            atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":false,\"started\":false,\"startup\":\"refused-not-armed\",\"stop_intent\":\"refused-not-armed\"}" || true
+            exit 67
+            ;;
+        *)
+            # Even a missing prior intent is not enough during resume. This
+            # is the enabled-unit versus provisioner race guard.
+            atomic_write "$stop_intent_path" refused-not-armed || true
+            atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":false,\"started\":false,\"startup\":\"refused-not-armed\",\"stop_intent\":\"refused-not-armed\"}" || true
+            exit 67
+            ;;
+    esac
+fi
+rm -f -- "$launch_authorized_path"
+launch_armed=1
+atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":true,\"started\":false,\"startup\":\"armed\",\"stop_intent\":\"none\"}" || exit 66
 
 if [ "$(stat -c '%u:%g:%a' "$env_path" 2>/dev/null || true)" != 0:0:600 ]; then
     exit 66
@@ -77,7 +137,15 @@ done
 rm -f -- "$env_path"
 
 child_status=0
-wait "$child" || child_status=$?
+while :; do
+    wait "$child"
+    child_status=$?
+    if [ "$child_status" -gt 128 ] && [ "$signal_interrupted" -eq 1 ]; then
+        signal_interrupted=0
+        continue
+    fi
+    break
+done
 if [ "$external_stop" -eq 1 ] || [ "$(cat "$stop_intent_path" 2>/dev/null || true)" = external ]; then
     docker rm -f "$container_name" >/dev/null 2>&1 || true
     exit 0
@@ -90,9 +158,8 @@ else
     started=false
     startup=broken
 fi
-printf '{"invocation":"%s","started":%s,"startup":"%s","stop_intent":"self","child_status":%s}\n' \
-    "$invocation" "$started" "$startup" "$child_status" > "$state_path"
-printf '%s\n' self > "$stop_intent_path"
+atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":true,\"started\":$started,\"startup\":\"$startup\",\"stop_intent\":\"self\",\"child_status\":$child_status}" || true
+atomic_write "$stop_intent_path" self || true
 docker rm "$container_name" >/dev/null 2>&1 || true
 box stop self >/dev/null 2>&1 || true
 exit "$child_status"

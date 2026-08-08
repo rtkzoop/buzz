@@ -120,6 +120,7 @@ parse_object() {
 parse_object || exit 68
 skip_ws
 [ -z "$rest" ] || exit 69
-rm -f -- "$env_file" 2>/dev/null || true
+# The env file is a read-only bind mount. The launcher owns host-side removal,
+# and waits for this non-secret marker before removing its copy.
 printf '%s\n' consumed > /run/buzz-agent/env-consumed
 exec buzz-acp

@@ -31,6 +31,7 @@ const POSTSTOP_FILE: &str = "usr/local/libexec/buzz-box-poststop";
 const IMAGE_FILE: &str = "var/lib/buzz-agent/image.ref";
 const INVOCATION_FILE: &str = "run/buzz-agent/invocation";
 const ENV_FILE: &str = "run/buzz-agent/env.pending";
+const LAUNCH_AUTHORIZED_FILE: &str = "run/buzz-agent/launch-authorized";
 const ENV_FILE_ABS: &str = "/run/buzz-agent/env.pending";
 const CONSUMED_FILE_ABS: &str = "/run/buzz-agent/env-consumed";
 const PULL_STATUS_FILE_ABS: &str = "/var/lib/buzz-agent/image-pull.status";
@@ -158,6 +159,26 @@ async fn provision_inner(
         ));
     }
 
+    run_command(
+        request.api,
+        box_id,
+        "reset prior stop intent before launch",
+        "rm -f /var/lib/buzz-agent/stop-intent /var/lib/buzz-agent/state.json",
+        10,
+        redactor,
+    )
+    .await?;
+    // This write is deliberately the final arming operation. The launcher
+    // consumes the nonce before it can start Docker, so an enabled unit that
+    // races resume without this marker refuses with no self-stop side effect.
+    write_utf8(
+        request.api,
+        box_id,
+        LAUNCH_AUTHORIZED_FILE,
+        &format!("{nonce}\n"),
+        redactor,
+    )
+    .await?;
     run_command(
         request.api,
         box_id,

@@ -4,6 +4,17 @@ umask 077
 
 state_path=/var/lib/buzz-agent/state.json
 stop_intent_path=/var/lib/buzz-agent/stop-intent
-printf '%s\n' external > "$stop_intent_path"
-printf '{"started":false,"stop_intent":"external"}\n' > "$state_path"
+
+atomic_write() {
+    marker_path=$1
+    marker_content=$2
+    marker_tmp="${marker_path}.tmp.$$"
+    printf '%s\n' "$marker_content" > "$marker_tmp"
+    mv -f "$marker_tmp" "$marker_path"
+}
+
+# This helper runs before systemd stops the launcher. It fences the
+# post-stop hook from treating an owner-requested stop as a crash.
+atomic_write "$stop_intent_path" external
+atomic_write "$state_path" '{"launch_armed":false,"started":false,"stop_intent":"external"}'
 docker stop --time=110 buzz-agent >/dev/null 2>&1 || true

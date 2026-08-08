@@ -45,6 +45,7 @@ struct FakeState {
     injected_files: Arc<Mutex<Vec<String>>>,
     file_writes: Arc<Mutex<Vec<FileWrite>>>,
     commands: Arc<Mutex<Vec<String>>>,
+    operations: Arc<Mutex<Vec<String>>>,
     command_failure: Arc<Mutex<Option<CommandFailure>>>,
     command_timeouts: Arc<Mutex<Vec<u64>>>,
     service_active: Arc<Mutex<bool>>,
@@ -214,6 +215,11 @@ async fn execute_command(
 ) -> impl IntoResponse {
     state.commands.lock().await.push(body.command.clone());
     state
+        .operations
+        .lock()
+        .await
+        .push(format!("command:{}", body.command));
+    state
         .command_timeouts
         .lock()
         .await
@@ -325,6 +331,7 @@ async fn write_file(
         .lock()
         .await
         .push((path.clone(), content.clone(), encoding.clone()));
+    state.operations.lock().await.push(format!("file:{path}"));
     let stored_content = if encoding == "base64" {
         String::from_utf8(
             base64::engine::general_purpose::STANDARD
@@ -884,7 +891,7 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     let commands = state.commands.lock().await.clone();
     assert_eq!(
         commands.len(),
-        12,
+        13,
         "unexpected command sequence: {commands:?}"
     );
     assert!(commands[0].starts_with("install -d "));
@@ -902,13 +909,15 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
         "install -o root -g root -m 666 /dev/null /run/buzz-agent/env-consumed"
     );
     assert!(commands[7].contains("chown root:root /run/buzz-agent/env.pending"));
-    assert_eq!(commands[8], "systemctl start buzz-agent.service");
-    assert_eq!(commands[9], "systemctl is-active buzz-agent.service");
+    assert!(commands[8].contains("/var/lib/buzz-agent/stop-intent"));
+    assert!(commands[8].contains("/var/lib/buzz-agent/state.json"));
+    assert_eq!(commands[9], "systemctl start buzz-agent.service");
+    assert_eq!(commands[10], "systemctl is-active buzz-agent.service");
     assert_eq!(
-        commands[10],
+        commands[11],
         "rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
     );
-    assert_eq!(commands[11], "systemctl is-active buzz-agent.service");
+    assert_eq!(commands[12], "systemctl is-active buzz-agent.service");
 
     let mut forbidden_values = prepared.env.values().cloned().collect::<Vec<_>>();
     forbidden_values.push(request.agent.private_key_nsec.clone());
@@ -932,7 +941,7 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
         .all(|timeout| *timeout <= 60));
 
     let writes = state.file_writes.lock().await.clone();
-    assert_eq!(writes.len(), 10, "unexpected file writes: {writes:?}");
+    assert_eq!(writes.len(), 11, "unexpected file writes: {writes:?}");
     assert!(writes.iter().all(|(path, _, _)| !path.starts_with('/')));
     let (_, env_payload, encoding) = writes
         .iter()
@@ -945,6 +954,42 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     assert_eq!(
         decoded,
         serde_json::to_vec(&prepared.env).expect("env should serialize canonically")
+    );
+    let auth_index = writes
+        .iter()
+        .position(|(path, _, _)| path == "run/buzz-agent/launch-authorized")
+        .expect("launch authorization marker should be written");
+    let env_index = writes
+        .iter()
+        .position(|(path, _, _)| path == "run/buzz-agent/env.pending")
+        .expect("pending environment should be written");
+    assert!(
+        auth_index > env_index,
+        "authorization must follow env setup"
+    );
+    assert_eq!(
+        writes[auth_index].1,
+        format!(
+            "{}\n",
+            prepared
+                .env
+                .get("BUZZ_MANAGED_AGENT_START_NONCE")
+                .expect("launch nonce should be present")
+        )
+    );
+    let operations = state.operations.lock().await.clone();
+    let authorization_operation = operations
+        .iter()
+        .position(|operation| operation == "file:run/buzz-agent/launch-authorized")
+        .expect("authorization operation should be recorded");
+    let start_operation = operations
+        .iter()
+        .position(|operation| operation == "command:systemctl start buzz-agent.service")
+        .expect("systemd start operation should be recorded");
+    assert_eq!(
+        authorization_operation + 1,
+        start_operation,
+        "launch authorization must be the final operation before systemd start: {operations:?}"
     );
 
     let files = state.files.lock().await.clone();
@@ -1043,6 +1088,74 @@ async fn provisioning_failure_redacts_error_and_removes_pending_secret_file() {
         "candidate-1".to_string(),
         "run/buzz-agent/env.pending".to_string()
     )));
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn provisioning_stderr_redacts_discarded_environment_tiers() {
+    let (_, mut request) = identity_and_request();
+    request.agent.env_vars.insert(
+        "LEGACY_DISCARDED_SENTINEL".to_string(),
+        "legacy-discarded-secret".to_string(),
+    );
+    request.agent.auth_tag = None;
+    request.agent.launch = Some(buzz_backend_box::wire::LaunchBlock {
+        command: None,
+        args: Vec::new(),
+        env: BTreeMap::from([
+            (
+                "BUZZ_AUTH_TAG".to_string(),
+                "stripped-authoritative-secret".to_string(),
+            ),
+            (
+                "LAUNCH_DISCARDED_SENTINEL".to_string(),
+                "launch-secret".to_string(),
+            ),
+        ]),
+        policy_env: BTreeMap::from([(
+            "POLICY_DISCARDED_SENTINEL".to_string(),
+            "policy-secret".to_string(),
+        )]),
+        owner_pubkey: Some("owner".to_string()),
+    });
+    let prepared = prepare_deploy(&request).expect("request should prepare");
+    let state = FakeState::default();
+    *state.command_failure.lock().await = Some((
+        "systemctl start buzz-agent.service".to_string(),
+        "startup failed: legacy-discarded-secret stripped-authoritative-secret launch-secret policy-secret fake-key-123".to_string(),
+    ));
+    let (base_url, server_task) = server(state).await;
+    let api = BoxApi::with_api_key(base_url, "fake-key-123", Duration::from_secs(2))
+        .expect("client should build");
+
+    let error = reconcile(
+        &api,
+        &prepared,
+        &BoxProvisioner,
+        ReconcileOptions {
+            deadline: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1),
+        },
+    )
+    .await
+    .expect_err("failed start should surface as a provisioning error");
+    let rendered = error.to_string();
+    for secret in [
+        "legacy-discarded-secret",
+        "stripped-authoritative-secret",
+        "launch-secret",
+        "policy-secret",
+        "fake-key-123",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "secret leaked in error: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("[redacted]"),
+        "rendered error: {rendered}"
+    );
     server_task.abort();
 }
 

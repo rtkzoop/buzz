@@ -89,14 +89,18 @@ pub fn prepare_deploy(request: &DeployRequest) -> Result<PreparedDeploy, Reconci
         "BUZZ_MANAGED_AGENT_START_NONCE".to_string(),
         launch_nonce(identity.pubkey_hex()),
     );
-    let redactor = Redactor::from_values(
-        env.values()
-            .cloned()
-            .chain(std::iter::once(request.agent.private_key_nsec.clone()))
-            .chain(request.agent.auth_tag.clone())
-            .chain(std::iter::once(request.agent.relay_url.clone()))
-            .collect::<Vec<_>>(),
-    );
+    let mut redaction_values = request.agent.env_vars.values().cloned().collect::<Vec<_>>();
+    if let Some(launch) = &request.agent.launch {
+        redaction_values.extend(launch.env.values().cloned());
+        redaction_values.extend(launch.policy_env.values().cloned());
+    }
+    redaction_values.extend(env.values().cloned());
+    redaction_values.push(request.agent.private_key_nsec.clone());
+    if let Some(auth_tag) = &request.agent.auth_tag {
+        redaction_values.push(auth_tag.clone());
+    }
+    redaction_values.push(request.agent.relay_url.clone());
+    let redactor = Redactor::from_values(redaction_values);
     let launch_intent = build_launch_intent(&identity, &config, env.keys().cloned())?;
     let subdomain = identity.subdomain(&config.scope);
     Ok(PreparedDeploy {
