@@ -11,8 +11,14 @@ name = "buzz-backend-box"
 path = "src/main.rs"
 
 [dependencies]
+reqwest = { workspace = true, features = ["query"] }
+tokio = { workspace = true }
 nostr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

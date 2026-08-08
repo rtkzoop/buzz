@@ -1,4 +1,4 @@
 {
   "ok": false,
-  "error": "deploy not yet implemented"
+  "error": "invalid Box deploy request: private_key_nsec is not a decodable nsec1 key"
 }
