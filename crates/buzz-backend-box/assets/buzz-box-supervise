@@ -23,6 +23,8 @@ signal_interrupted=0
 launch_armed=0
 invocation=
 lock_acquired=0
+child=
+child_started=0
 
 # Markers are read by systemd's post-stop hook and by the next resumed VM.
 # Always replace them atomically on the same filesystem. The pending env file
@@ -56,7 +58,6 @@ release_handoff_lock() {
 
 acquire_handoff_lock() {
     handoff_lock_attempts=0
-    missing_owner_attempts=0
     while [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; do
         if mkdir "$handoff_lock_path" 2>/dev/null; then
             # Set ownership before the first operation that can fail so the
@@ -73,19 +74,16 @@ acquire_handoff_lock() {
         owner_pid=$(cat "$handoff_owner_path" 2>/dev/null || true)
         stale_owner=0
         case "$owner_pid" in
-            '')
-                # A creator writes pid immediately after mkdir. Give that
-                # tiny setup window one retry before treating an empty owner
-                # as a crashed creator.
-                missing_owner_attempts=$((missing_owner_attempts + 1))
-                if [ "$missing_owner_attempts" -ge 2 ]; then
-                    stale_owner=1
-                fi
+            ''|*[!0-9]*)
+                # Empty, missing, zero, and malformed ownership are
+                # unverifiable. Safety beats availability here: do not delete
+                # a lock that may still be in its mkdir-to-pid publication
+                # window. The bounded wait fails closed instead.
                 ;;
-            0|*[!0-9]*) stale_owner=1 ;;
             *)
-                missing_owner_attempts=0
-                if ! kill -0 "$owner_pid" 2>/dev/null; then
+                if [ "$owner_pid" -eq 0 ] 2>/dev/null; then
+                    :
+                elif ! kill -0 "$owner_pid" 2>/dev/null; then
                     stale_owner=1
                 fi
                 ;;
@@ -132,8 +130,22 @@ record_external() {
     signal_interrupted=1
     external_stop=1
     atomic_write "$stop_intent_path" external || true
-    atomic_write "$state_path" "{\"invocation\":\"${invocation:-}\",\"launch_armed\":$launch_armed,\"started\":false,\"stop_intent\":\"external\"}" || true
+    rm -f -- "$launch_authorized_path"
+    launch_armed=0
+    if [ "$child_started" -eq 1 ]; then
+        started=true
+    else
+        started=false
+    fi
+    atomic_write "$state_path" "{\"invocation\":\"${invocation:-}\",\"launch_armed\":false,\"started\":$started,\"stop_intent\":\"external\"}" || true
     docker stop --time=110 "$container_name" >/dev/null 2>&1 || true
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    if [ "$child_started" -eq 0 ]; then
+        # The launch sequence must not resume after this trap. A prelaunch
+        # external stop is a successful cancellation, so exit cleanly after
+        # EXIT cleanup releases the handoff lock and removes launch secrets.
+        exit 0
+    fi
 }
 trap record_external TERM INT
 trap 'exit 129' HUP
@@ -219,6 +231,7 @@ docker run --name "$container_name" \
     --mount type=bind,src="$entrypoint_path",dst=/usr/local/libexec/buzz-box-entrypoint,ro \
     "$image_ref" /usr/local/libexec/buzz-box-entrypoint /run/buzz-agent/env.pending &
 child=$!
+child_started=1
 release_handoff_lock
 
 ready=0

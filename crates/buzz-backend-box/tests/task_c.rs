@@ -301,6 +301,239 @@ fn release_seeded_handoff_lock(harness: &HandoffHarness) {
     fs::remove_dir(lock_path).expect("seeded handoff lock should be released");
 }
 
+fn shorten_handoff_retries(path: &Path) {
+    let script = fs::read_to_string(path).expect("handoff script should be readable");
+    assert!(script.contains("handoff_lock_max_attempts=120"));
+    assert!(script.contains("handoff_lock_retry_seconds=1"));
+    let script = script
+        .replace(
+            "handoff_lock_max_attempts=120",
+            "handoff_lock_max_attempts=3",
+        )
+        .replace(
+            "handoff_lock_retry_seconds=1",
+            "handoff_lock_retry_seconds=0.01",
+        );
+    fs::write(path, script).expect("shortened handoff script should be written");
+}
+
+fn install_owner_case_docker(harness: &HandoffHarness, inspect_image: bool) {
+    let image = if inspect_image {
+        "case \"$1\" in\n    image) printf '%s\\n' \"$DOCKER_IMAGE\" ;;\nesac\n"
+    } else {
+        ""
+    };
+    install_executable(
+        &harness.bin_dir.join("docker"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\n{image}"),
+    );
+}
+
+fn seed_owner_case(harness: &HandoffHarness, owner: Option<&str>) {
+    let lock_path = harness.run_dir.join("launch-handoff.lock");
+    fs::create_dir(&lock_path).expect("owner-case lock should be seeded");
+    if let Some(owner) = owner {
+        fs::write(lock_path.join("pid"), owner).expect("owner-case pid should be written");
+    }
+}
+
+#[test]
+fn unverifiable_handoff_owners_fail_closed_for_external_stop() {
+    for (label, owner) in [
+        ("missing-owner", None),
+        ("empty-owner", Some("")),
+        ("zero-owner", Some("0\n")),
+        ("malformed-owner", Some("malformed\n")),
+    ] {
+        let harness = handoff_harness(label);
+        shorten_handoff_retries(&harness.external_stop_path);
+        install_owner_case_docker(&harness, false);
+        seed_owner_case(&harness, owner);
+
+        let mut external_stop = spawn_external_stop(&harness);
+        wait_for_status(&mut external_stop, label, 74);
+
+        assert!(
+            harness.run_dir.join("launch-handoff.lock").exists(),
+            "unverifiable {label} lock must remain"
+        );
+        assert!(
+            fs::read_to_string(&harness.docker_log)
+                .unwrap_or_default()
+                .is_empty(),
+            "unverifiable {label} owner must not reach Docker"
+        );
+    }
+}
+
+#[test]
+fn numeric_handoff_owners_keep_dead_recovery_and_live_protection() {
+    let dead = handoff_harness("dead-owner-short-retry");
+    shorten_handoff_retries(&dead.external_stop_path);
+    install_owner_case_docker(&dead, false);
+    seed_owner_case(&dead, Some("99999999\n"));
+    let mut dead_stop = spawn_external_stop(&dead);
+    wait_for_success(&mut dead_stop, "dead numeric owner recovery");
+    assert!(!dead.run_dir.join("launch-handoff.lock").exists());
+    assert!(fs::read_to_string(&dead.docker_log)
+        .expect("dead-owner Docker log should exist")
+        .lines()
+        .any(|line| line.starts_with("stop ")));
+
+    let live = handoff_harness("live-owner-short-retry");
+    shorten_handoff_retries(&live.external_stop_path);
+    install_owner_case_docker(&live, false);
+    seed_owner_case(&live, Some(&format!("{}\n", std::process::id())));
+    let mut live_stop = spawn_external_stop(&live);
+    wait_for_status(&mut live_stop, "live numeric owner protection", 74);
+    assert!(live.run_dir.join("launch-handoff.lock").exists());
+    assert!(
+        fs::read_to_string(&live.docker_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "live numeric owner must not reach Docker"
+    );
+}
+
+#[test]
+fn supervisor_unverifiable_owner_keeps_lock_and_never_runs_docker() {
+    for (label, owner) in [
+        ("supervisor-missing-owner", None),
+        ("supervisor-empty-owner", Some("")),
+        ("supervisor-zero-owner", Some("0\n")),
+        ("supervisor-malformed-owner", Some("malformed\n")),
+    ] {
+        let harness = handoff_harness(label);
+        shorten_handoff_retries(&harness.supervisor_path);
+        install_owner_case_docker(&harness, true);
+        seed_owner_case(&harness, owner);
+
+        let mut supervisor = spawn_supervisor(&harness);
+        wait_for_status(&mut supervisor, label, 74);
+
+        let docker_log = fs::read_to_string(&harness.docker_log).unwrap_or_default();
+        assert!(
+            !docker_log.lines().any(|line| line.starts_with("run ")),
+            "unverifiable {label} owner must not start Docker: {docker_log}"
+        );
+        assert!(
+            harness.run_dir.join("launch-handoff.lock").exists(),
+            "unverifiable {label} lock must remain"
+        );
+    }
+}
+
+#[test]
+fn term_during_final_handoff_check_aborts_before_docker_run() {
+    let harness = handoff_harness("term-before-launch");
+    let count_path = harness.root.join("stop-intent-count");
+    let term_sent = harness.root.join("term-sent");
+    let supervisor_pid_path = harness.root.join("supervisor-pid");
+    install_executable(
+        &harness.bin_dir.join("cat"),
+        "#!/bin/sh\ncase \"$1\" in\n  *stop-intent)\n    count=0\n    if [ -f \"$CAT_COUNT_PATH\" ]; then read count < \"$CAT_COUNT_PATH\"; fi\n    count=$((count + 1))\n    printf '%s\\n' \"$count\" > \"$CAT_COUNT_PATH\"\n    if [ \"$count\" -eq 3 ]; then\n      : > \"$TERM_SENT\"\n      target=$(/bin/cat \"$SUPERVISOR_PID_PATH\")\n      kill -TERM \"$target\"\n    fi\n    ;;\nesac\nexec /bin/cat \"$@\"\n",
+    );
+
+    let mut supervisor = Command::new("sh")
+        .arg(&harness.supervisor_path)
+        .env("PATH", command_path(&harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("STOP_RELEASE", &harness.stop_release)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .env("CAT_COUNT_PATH", &count_path)
+        .env("TERM_SENT", &term_sent)
+        .env("SUPERVISOR_PID_PATH", &supervisor_pid_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor should spawn for prelaunch TERM race");
+    fs::write(&supervisor_pid_path, format!("{}\n", supervisor.id()))
+        .expect("supervisor pid should be written");
+    wait_for_success(&mut supervisor, "prelaunch TERM supervisor");
+
+    let docker_log = fs::read_to_string(&harness.docker_log).unwrap_or_default();
+    assert!(
+        term_sent.exists(),
+        "TERM should be injected during final check"
+    );
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        0,
+        "prelaunch TERM must prevent docker run: {docker_log}"
+    );
+    assert!(
+        docker_log.lines().any(|line| line.starts_with("stop ")),
+        "prelaunch TERM should attempt to stop a named container: {docker_log}"
+    );
+    assert!(!harness.run_dir.join("launch-handoff.lock").exists());
+    assert!(!harness.run_dir.join("env.pending").exists());
+    assert!(!harness.run_dir.join("launch-authorized").exists());
+}
+
+#[test]
+fn term_after_launch_stops_and_reaps_child_without_self_stop() {
+    let harness = handoff_harness("term-after-launch");
+    install_executable(
+        &harness.bin_dir.join("docker"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\ncase \"$1\" in\n  image) printf '%s\\n' \"$DOCKER_IMAGE\" ;;\n  run) : > \"$RUN_ENTERED\"; : > \"$CONSUMED_PATH\"; while [ ! -f \"$RUN_RELEASE\" ]; do sleep 1; done ;;\n  stop) : > \"$STOP_ENTERED\"; : > \"$RUN_RELEASE\" ;;\nesac\n",
+    );
+    let run_entered = harness.root.join("run-entered");
+    let run_release = harness.root.join("run-release");
+    let stop_entered = harness.root.join("stop-entered");
+    let mut supervisor = Command::new("sh")
+        .arg(&harness.supervisor_path)
+        .env("PATH", command_path(&harness))
+        .env_remove("GREP_OPTIONS")
+        .env("DOCKER_LOG", &harness.docker_log)
+        .env("DOCKER_IMAGE", &harness.image_ref)
+        .env("BOX_LOG", &harness.box_log)
+        .env("CONSUMED_PATH", harness.run_dir.join("env-consumed"))
+        .env("RUN_ENTERED", &run_entered)
+        .env("RUN_RELEASE", &run_release)
+        .env("STOP_ENTERED", &stop_entered)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervisor should spawn for postlaunch TERM race");
+    wait_for_path(&run_entered, "postlaunch docker run");
+    let status = Command::new("kill")
+        .args(["-TERM", &supervisor.id().to_string()])
+        .status()
+        .expect("kill should be available");
+    assert!(status.success(), "postlaunch TERM should be sent");
+    wait_for_path(&stop_entered, "postlaunch docker stop");
+    wait_for_success(&mut supervisor, "postlaunch TERM supervisor");
+
+    let docker_log = fs::read_to_string(&harness.docker_log).unwrap_or_default();
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count(),
+        1,
+        "postlaunch TERM should have exactly one child: {docker_log}"
+    );
+    assert_eq!(
+        docker_log
+            .lines()
+            .filter(|line| line.starts_with("stop "))
+            .count(),
+        1,
+        "postlaunch TERM should stop the child once: {docker_log}"
+    );
+    assert!(
+        !harness.box_log.exists(),
+        "external TERM must not self-stop"
+    );
+    assert!(!harness.run_dir.join("launch-handoff.lock").exists());
+}
+
 #[test]
 fn external_stop_wins_handoff_lock_before_supervisor_and_prevents_run() {
     // The external-stop winner linearizes before the supervisor's final check,

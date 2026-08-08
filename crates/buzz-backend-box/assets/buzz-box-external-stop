@@ -46,7 +46,6 @@ release_handoff_lock() {
 
 acquire_handoff_lock() {
     handoff_lock_attempts=0
-    missing_owner_attempts=0
     while [ "$handoff_lock_attempts" -lt "$handoff_lock_max_attempts" ]; do
         if mkdir "$handoff_lock_path" 2>/dev/null; then
             handoff_lock_acquired=1
@@ -61,16 +60,16 @@ acquire_handoff_lock() {
         owner_pid=$(cat "$handoff_owner_path" 2>/dev/null || true)
         stale_owner=0
         case "$owner_pid" in
-            '')
-                missing_owner_attempts=$((missing_owner_attempts + 1))
-                if [ "$missing_owner_attempts" -ge 2 ]; then
-                    stale_owner=1
-                fi
+            ''|*[!0-9]*)
+                # Empty, missing, zero, and malformed ownership are
+                # unverifiable. Safety beats availability here: do not delete
+                # a lock that may still be in its mkdir-to-pid publication
+                # window. The bounded wait fails closed instead.
                 ;;
-            0|*[!0-9]*) stale_owner=1 ;;
             *)
-                missing_owner_attempts=0
-                if ! kill -0 "$owner_pid" 2>/dev/null; then
+                if [ "$owner_pid" -eq 0 ] 2>/dev/null; then
+                    :
+                elif ! kill -0 "$owner_pid" 2>/dev/null; then
                     stale_owner=1
                 fi
                 ;;
