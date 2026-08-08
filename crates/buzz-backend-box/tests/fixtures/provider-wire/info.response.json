@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "name": "box",
+  "version": "0.1.0",
+  "protocol_version": 1,
+  "description": "Deploys Buzz agents to ASCII Box VMs",
+  "config_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "image": {
+        "default": "ghcr.io/block/buzz-sprig:sha-6530b58@sha256:17facfc7608d8ddb33bc056c9aaba1098f4ef6abe5655702fbfd7584d1f74d76",
+        "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$",
+        "title": "Immutable agent image",
+        "type": "string"
+      },
+      "inactivity_seconds": {
+        "default": 7200,
+        "minimum": 60,
+        "title": "Stop after inactivity (seconds)",
+        "type": "integer"
+      },
+      "machine_type": {
+        "default": "small",
+        "enum": ["small", "default", "large"],
+        "title": "Machine type",
+        "type": "string"
+      },
+      "scope": {
+        "default": "default",
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+        "title": "Deployment scope",
+        "type": "string"
+      },
+      "workspace_mode": {
+        "default": "persistent",
+        "enum": ["persistent", "fresh"],
+        "title": "Workspace mode",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  }
+}

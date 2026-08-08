@@ -1,0 +1,9 @@
+{
+  "op": "deploy",
+  "request_id": "req-2",
+  "agent": {
+    "relay_url": "wss://relay.example.test",
+    "private_key_nsec": "nsec1test"
+  },
+  "provider_config": {}
+}
