@@ -1768,3 +1768,113 @@ Everything else — status, control,
 memory — was already on the relay, which is why the design holds: the relay
 was the management plane all along, and the desktop was only ever one of
 its doors.
+
+## ASCII Box provider binding
+
+`buzz-backend-box` is the ASCII Box sibling of
+`buzz-backend-kubernetes`. It is discovered by the normal `buzz-backend-*`
+executable scan. Desktop packages it as a sidecar on supported macOS and Linux
+hosts; it is deliberately not a mobile provider and is not added to Windows
+sidecar packaging in v1.
+
+### Install and discover
+
+Build the provider with the repository toolchain and place the executable in a
+Desktop provider directory, or use the signed Desktop bundle produced by the
+release workflow:
+
+```bash
+. ./bin/activate-hermit
+cargo build --release -p buzz-backend-box
+```
+
+The executable name must remain exactly `buzz-backend-box`. Desktop resolves the
+provider by filename, stages the selected bytes, runs `info`, validates
+`protocol_version: 1`, and sends the nsec only in the subsequent `deploy` call.
+A provider copied into the executable directory must be executable. Run
+`just sidecar-list-check` when changing packaging manifests.
+
+### Ambient authentication and GUI environments
+
+The provider never accepts a Box credential in `provider_config`. It resolves
+`BOX_API_KEY` first, then falls back to the Box CLI credential file at
+`~/.config/ascii/box/config.json`. The key is ambient provider-process state,
+not persisted agent configuration. A macOS GUI application is launched by
+launchd with a minimal environment and does not automatically inherit a
+login-shell export. Operators must provision `BOX_API_KEY` through the GUI's
+launch environment or use the CLI credential fallback, and must ensure any
+helper binaries needed by their local setup are on the provider's effective
+`PATH`.
+
+The non-secret `provider_config` schema is:
+
+```json
+{
+  "machine_type": "small|default|large",
+  "image": "immutable image reference with digest",
+  "inactivity_seconds": 7200,
+  "scope": "default",
+  "workspace_mode": "persistent|fresh"
+}
+```
+
+Unknown fields and secret-like configuration are rejected. `persistent` is the
+normal workspace mode because Box snapshots retain the agent workspace. The
+provider writes high-sensitivity launch values through its temporary `/run`
+file flow, never as command arguments and never through account-wide Box
+environment inheritance.
+
+### Lifecycle and operational boundaries
+
+Relay presence remains the only managed-agent status signal in protocol v1.
+Desktop has no remote Box status, log, exec, or kill channel after `deploy`.
+A Box being `ready`, `idle`, or `running` is not proof that the Buzz harness is
+online. Protocol v1 has no remote `status`, `logs`, or `undeploy` operation.
+There is no remote log operation in this protocol; operators need substrate-side
+diagnostics if they require durable logs.
+
+Box stop is archive, not delete. The current public Box API has no supported
+hard-delete operation. Archived snapshots and persistent workspace data can
+remain in the account, so operators must treat archive as retained data and
+billing/account-lifecycle state, not secure erasure. The provider's cleanup is
+intentionally stop/archive only and never force-stop or hard-delete.
+
+The systemd unit uses `Restart=no`. This is deliberate because the current ACP
+exit-code behavior does not safely distinguish an intentional shutdown from an
+abnormal exit. The launcher records stop intent, stops the Docker workload, and
+self-stops the Box on the non-external exit path where possible. An explicit
+Desktop **Start** is the lifecycle request that may reconcile an archived Box,
+resume it, repair a never-started provider-owned candidate when positive intent
+permits, or no-op/adopt an already started harness. A relay `!shutdown` or
+intentional stop is final until a fresh explicit Start. Presence will transition
+offline through the harness shutdown path; Box API state alone must not be used
+as the UI status.
+
+ASCII currently documents EU-only Box regions (Germany, Finland, and France).
+ASCII also states that SOC 2 is in progress and that it does not yet have
+compliance certifications. Regulated deployments must keep a provider with
+appropriate procurement and residency assurances, such as the Kubernetes
+binding, until those constraints are satisfied.
+
+### Live validation spike
+
+The platform-dependent assumptions remain unverified until an operator runs the
+manual spike with an approved Box account. The binary is compiled but is never
+invoked by provider deploys or release jobs:
+
+```bash
+cargo build -p buzz-backend-box --bin box-live-spike
+./target/debug/box-live-spike --help
+./target/debug/box-live-spike --dry-run all
+```
+
+Every mutating group requires both an ambient `BOX_API_KEY` and an explicit
+`--confirm-live`. The spike's `limits` group is read-only but still requires
+`BOX_API_KEY`. The output is structured JSON with pass/fail/unverified records,
+HTTP status and error code when available, Box IDs, timings, and
+`manual_check_required` records for private registry auth, exact WSS/model
+provider reachability, region/compliance, digest/fork behavior, API-log
+retention, and other claims that cannot be safely inferred. The spike uses
+stop/archive cleanup and carries a short TTL for candidates, but running it can
+still create billable resources. No live spike result is implied by this
+source tree.

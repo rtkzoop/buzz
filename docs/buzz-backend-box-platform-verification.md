@@ -740,7 +740,20 @@ Networking facts were recovered from the reachable [Billing & Limits](https://do
 
 ## 10. Required live validation spike
 
-Before implementing the full provider, validate these behaviors against a real Box account:
+The safe operator harness is `crates/buzz-backend-box/src/bin/box-live-spike.rs`.
+It compiles with the provider and exposes the checklist below as structured
+JSON groups: `limits`, `no-env-self-stop`, `subdomain-race`,
+`file-mode-output-caps`, `docker-snapshot-resume`, `network`, and `all`.
+`--help` and `--dry-run all` perform zero network I/O. Every group that can
+create, stop, or resume a Box requires both `BOX_API_KEY` and
+`--confirm-live`; `limits` requires the ambient key and is read-only. The
+binary uses stop/archive cleanup, never force-stop or hard-delete, and emits
+`manual_check_required` records for claims that need operator judgment.
+
+No live Box account was used for this implementation. The checklist below
+therefore remains **UNVERIFIED** and must not be read as a result report.
+
+Before production enablement, validate these behaviors against a real Box account:
 
 1. Create a Box with `noEnv: true` and inspect neutral variables, files, and the presence or absence of the CLI token file.
 2. Run `box stop self` from that Box without `BOX_API_KEY` and confirm it succeeds.

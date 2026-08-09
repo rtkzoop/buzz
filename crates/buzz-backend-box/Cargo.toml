@@ -10,6 +10,10 @@ description = "ASCII Box backend provider for Buzz remote agents"
 name = "buzz-backend-box"
 path = "src/main.rs"
 
+[[bin]]
+name = "box-live-spike"
+path = "src/bin/box-live-spike.rs"
+
 [dependencies]
 reqwest = { workspace = true, features = ["query"] }
 tokio = { workspace = true }

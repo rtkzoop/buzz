@@ -112,6 +112,11 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Box backend provider: pure decision layers and safe local spike CLI gates.
+  # The live spike is never invoked with --confirm-live here.
+  run_test_step "buzz-backend-box tests" \
+    cargo test -p buzz-backend-box --all-targets -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

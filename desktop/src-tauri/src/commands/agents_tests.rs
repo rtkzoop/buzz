@@ -479,7 +479,7 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
 }
 
 #[test]
-fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
+fn tauri_platform_configs_bundle_remote_providers_only_on_supported_hosts() {
     use tauri_utils::{config::parse::read_from, platform::Target};
 
     let config_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -492,12 +492,15 @@ fn tauri_platform_configs_bundle_kubernetes_only_on_supported_hosts() {
         let external_bins = config["bundle"]["externalBin"]
             .as_array()
             .expect("bundle.externalBin array");
-        let has_kubernetes = external_bins
-            .iter()
-            .any(|value| value == "binaries/buzz-backend-kubernetes");
-        assert_eq!(
-            has_kubernetes, expected,
-            "unexpected Kubernetes externalBin for {target}; merged {paths:?}"
-        );
+        for provider in ["kubernetes", "box"] {
+            let expected_name = format!("binaries/buzz-backend-{provider}");
+            let has_provider = external_bins
+                .iter()
+                .any(|value| value.as_str() == Some(expected_name.as_str()));
+            assert_eq!(
+                has_provider, expected,
+                "unexpected {provider} externalBin for {target}; merged {paths:?}"
+            );
+        }
     }
 }

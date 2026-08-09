@@ -1,6 +1,14 @@
 # `buzz-backend-box` Implementation Plan
 
-**Status:** Implementation plan (synthesized from swarm research)
+**Status:** Task D implementation complete; production enablement is blocked on the unrun live validation spike. No live Box mutation was authorized or performed in this change.
+
+**Implementation status:**
+- [ ] Phase 0 live account validation — **UNVERIFIED**; credentials were not assumed and no mutating spike group was run.
+- [x] Phase 1 provider crate, wire contract, typed client, and config schema.
+- [x] Phase 2 reconcile/deploy path.
+- [x] Phase 3 supervision assets, secret-file flow, cleanup, and redaction.
+- [x] Phase 4 offline/fake-server/unit coverage and safe CLI gate coverage. Live regression remains blocked on Phase 0.
+- [x] Phase 5 desktop packaging, CI/release wiring, operator docs, and gated spike binary.
 **Date:** 2026-08-08
 **Depends on:**
 - [`docs/buzz-backend-box-research.md`](./buzz-backend-box-research.md) — original architecture research
@@ -28,7 +36,7 @@ Three parallel research tracks (provider contract, Box platform verification, li
 
 ## Phase 0 — Live validation spike (blocking gate)
 
-A small standalone binary (`crates/buzz-backend-box/examples/spike.rs` or a scratch crate, not shipped) driven by `BOX_API_KEY`, exercising a real Box account. Every UNVERIFIED item below must be resolved and its outcome recorded in `docs/buzz-backend-box-platform-verification.md` before Phase 2 begins.
+A gated validation binary now lives at `crates/buzz-backend-box/src/bin/box-live-spike.rs`. It is compiled by `cargo build -p buzz-backend-box --all-targets` and safe CLI paths are tested, but it is not invoked by provider deploys or release jobs. Every live mutation requires both `BOX_API_KEY` and `--confirm-live`; `--dry-run all` performs zero network I/O. Every UNVERIFIED item below must be resolved and its outcome recorded in `docs/buzz-backend-box-platform-verification.md` before production enablement. The live items remain unchecked because no credentials or live authorization were assumed.
 
 ### 0.1 Identity and self-stop (highest risk)
 
@@ -221,9 +229,9 @@ Longest-first exact replacement of: every env value (all tiers), `private_key_ns
 
 ## Phase 5 — Packaging, docs, rollout
 
-1. Build/publish `buzz-backend-box` separately from the agent image; add to justfile build/package/staging/production sidecar lists so Desktop discovery (`buzz-backend-*` exe scan) finds it.
-2. Update `docs/remote-agents.md` with a Box provider section: ambient auth setup, EU-only residency + SOC 2-in-progress caveat, persistent-disk retention warning (archive ≠ delete; no public hard-delete API), snapshot threat model.
-3. Update the three research docs' open questions with spike answers.
+1. Build/publish `buzz-backend-box` separately from the agent image; add to justfile build/package/staging/production sidecar lists so Desktop discovery (`buzz-backend-*` exe scan) finds it. **Implemented in Task D.**
+2. Update `docs/remote-agents.md` with a Box provider section: ambient auth setup, EU-only residency + SOC 2-in-progress caveat, persistent-disk retention warning (archive ≠ delete; no public hard-delete API), snapshot threat model. **Implemented in Task D.**
+3. Update the three research docs' open questions with spike answers. **Live answers remain blocked on Phase 0; no result is claimed here.**
 4. Follow-ups (separate work): `buzz-backend-core` extraction (1.2 Option B), protocol v2 (`undeploy`/status/logs, echo `backend_agent_id` into deploy to skip discovery scans), E2B provider for ephemeral workloads, pinned ACP exit-code contract enabling bounded `Restart=on-failure`.
 
 ## Risk register
