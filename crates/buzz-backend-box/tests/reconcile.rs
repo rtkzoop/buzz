@@ -173,7 +173,7 @@ async fn update_box(
         state.files.lock().await.insert(
             (
                 box_id.clone(),
-                "var/lib/buzz-agent/ownership.json".to_string(),
+                "/var/lib/buzz-agent/ownership.json".to_string(),
             ),
             marker,
         );
@@ -242,6 +242,74 @@ async fn execute_command(
         )
         .into_response();
     }
+    // Root marker-read probe: sudo -n sh -c 'if [ -e PATH ]; then cat PATH; else exit 44; fi'
+    if let Some(rest) = body.command.strip_prefix("sudo -n sh -c 'if [ -e ") {
+        let path = rest.split_whitespace().next().unwrap_or("").to_string();
+        let files = state.files.lock().await;
+        return match files.get(&(box_id.clone(), path)) {
+            Some(content) => envelope(
+                "command.finished",
+                json!({"success": true, "exitCode": 0, "stdout": content, "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+            )
+            .into_response(),
+            None => envelope(
+                "command.finished",
+                json!({"success": false, "exitCode": 44, "stdout": "", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+            )
+            .into_response(),
+        };
+    }
+    // Staged install: sudo -n install -o root -g root -m MODE SRC DEST && rm -f SRC
+    if body.command.starts_with("sudo -n install -o root -g root -m ") {
+        let tokens: Vec<&str> = body.command.split_whitespace().collect();
+        if let Some(pos) = tokens.iter().position(|token| *token == "-m") {
+            if tokens.len() > pos + 3 && tokens[pos + 2] != "/dev/null" {
+                let src = tokens[pos + 2].to_string();
+                let dest = tokens[pos + 3].to_string();
+                let mut files = state.files.lock().await;
+                if let Some(content) = files.remove(&(box_id.clone(), src)) {
+                    files.insert((box_id.clone(), dest), content);
+                }
+            }
+        }
+        return envelope(
+            "command.finished",
+            json!({"success": true, "exitCode": 0, "stdout": "", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+        )
+        .into_response();
+    }
+    // Secret install: chmod 600 SRC && sudo -n sh -c 'umask 077 && base64 -d < SRC > DEST ...'
+    if body.command.contains("base64 -d < ") {
+        let src = body
+            .command
+            .split("base64 -d < ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+        let dest = body
+            .command
+            .split("> ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+        let mut files = state.files.lock().await;
+        if let Some(encoded) = files.remove(&(box_id.clone(), src)) {
+            let decoded = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            files.insert((box_id.clone(), dest), decoded);
+        }
+        return envelope(
+            "command.finished",
+            json!({"success": true, "exitCode": 0, "stdout": "1000:1000:600", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
+        )
+        .into_response();
+    }
     if let Some((success, exit_code, stdout, timed_out)) = {
         let mut results = state.service_results.lock().await;
         (!results.is_empty()).then(|| results.remove(0))
@@ -255,11 +323,11 @@ async fn execute_command(
     if body.command.contains("systemctl start buzz-agent.service") {
         *state.service_active.lock().await = true;
         state.files.lock().await.insert(
-            (box_id.clone(), "run/buzz-agent/env-consumed".to_string()),
+            (box_id.clone(), "/run/buzz-agent/env-consumed".to_string()),
             "consumed".to_string(),
         );
         state.files.lock().await.insert(
-            (box_id.clone(), "var/lib/buzz-agent/state.json".to_string()),
+            (box_id.clone(), "/var/lib/buzz-agent/state.json".to_string()),
             json!({"started": true, "startup": "ready"}).to_string(),
         );
     }
@@ -270,20 +338,10 @@ async fn execute_command(
         )
         .into_response();
     }
-    if body
-        .command
-        .contains("stat -c '%u:%g:%a' /run/buzz-agent/env.pending")
-    {
-        return envelope(
-            "command.finished",
-            json!({"success": true, "exitCode": 0, "stdout": "0:0:600", "stderr": "", "timedOut": false, "stdoutTruncated": false, "stderrTruncated": false}),
-        )
-        .into_response();
-    }
     if body.command.contains("rm -f /run/buzz-agent/env.pending") {
         let mut files = state.files.lock().await;
-        files.remove(&(box_id.clone(), "run/buzz-agent/env.pending".to_string()));
-        files.remove(&(box_id, "run/buzz-agent/env-consumed".to_string()));
+        files.remove(&(box_id.clone(), "/run/buzz-agent/env.pending".to_string()));
+        files.remove(&(box_id, "/run/buzz-agent/env-consumed".to_string()));
     }
     let active =
         *state.service_active.lock().await || *state.service_active_after_resume.lock().await;
@@ -429,7 +487,7 @@ async fn seed_owned_box(state: &FakeState, record: &BoxRecord, identity: &AgentI
     state.files.lock().await.insert(
         (
             record.id.clone(),
-            "var/lib/buzz-agent/ownership.json".to_string(),
+            "/var/lib/buzz-agent/ownership.json".to_string(),
         ),
         json!({"agent_pubkey": identity.pubkey_hex(), "managedBy": MANAGED_BY, "bindingVersion": BINDING_VERSION}).to_string(),
     );
@@ -845,7 +903,7 @@ async fn marker_files_use_relative_box_workdir_paths() {
     state.files.lock().await.insert(
         (
             record.id.clone(),
-            "var/lib/buzz-agent/ownership.json".to_string(),
+            "/var/lib/buzz-agent/ownership.json".to_string(),
         ),
         json!({"agent_pubkey": identity.pubkey_hex(), "managedBy": MANAGED_BY, "bindingVersion": BINDING_VERSION}).to_string(),
     );
@@ -889,35 +947,74 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     assert_eq!(result, "candidate-1");
 
     let commands = state.commands.lock().await.clone();
-    assert_eq!(
-        commands.len(),
-        13,
-        "unexpected command sequence: {commands:?}"
+    // Directory prep stages through the work dir and elevates with sudo.
+    assert!(commands[0].starts_with("install -d -m 700 .buzz-provision && sudo -n install -d "));
+    // Every system file is staged, then installed root-owned with the staging
+    // copy removed in the same command.
+    let installs: Vec<&String> = commands
+        .iter()
+        .filter(|command| command.starts_with("sudo -n install -o root -g root -m "))
+        .collect();
+    for destination in [
+        "/etc/systemd/system/buzz-agent.service",
+        "/usr/local/libexec/buzz-box-supervise",
+        "/usr/local/libexec/buzz-box-entrypoint",
+        "/usr/local/libexec/buzz-box-external-stop",
+        "/usr/local/libexec/buzz-box-poststop",
+        "/var/lib/buzz-agent/image.ref",
+        "/run/buzz-agent/invocation",
+        "/var/lib/buzz-agent/launch-intent.sha256",
+        "/var/lib/buzz-agent/ownership.json",
+        "/run/buzz-agent/launch-authorized",
+    ] {
+        assert!(
+            installs
+                .iter()
+                .any(|command| command.contains(destination) && command.contains("&& rm -f .buzz-provision/")),
+            "missing staged install for {destination}: {commands:?}"
+        );
+    }
+    assert!(commands.iter().any(|c| *c == "sudo -n systemctl daemon-reload"));
+    assert!(commands.iter().any(|c| *c == "sudo -n systemctl enable buzz-agent.service"));
+    let pull = commands
+        .iter()
+        .find(|command| command.contains("nohup sh -c"))
+        .expect("detached pull should run");
+    assert!(pull.contains("docker pull --quiet"));
+    assert!(!pull.contains("/var/lib/buzz-agent/image-pull"));
+    assert!(commands
+        .iter()
+        .any(|c| *c == "cat .buzz-provision/image-pull.status 2>/dev/null || printf pending"));
+    assert!(commands
+        .iter()
+        .any(|c| *c == "sudo -n install -o root -g root -m 666 /dev/null /run/buzz-agent/env-consumed"));
+    // The secret env is staged mode-600, decoded as root onto tmpfs, staging
+    // removed, and ownership verified — all in one command.
+    let secure = commands
+        .iter()
+        .find(|command| command.contains("base64 -d < "))
+        .expect("secret env install should run");
+    assert!(secure.starts_with("chmod 600 .buzz-provision/"));
+    assert!(secure.contains("umask 077"));
+    assert!(secure.contains("> /run/buzz-agent/env.pending"));
+    assert!(secure.contains("chown 1000:1000 /run/buzz-agent/env.pending"));
+    assert!(secure.contains("&& rm -f .buzz-provision/"));
+    assert!(secure.contains("stat -c '%u:%g:%a' /run/buzz-agent/env.pending"));
+    assert!(commands
+        .iter()
+        .any(|c| *c == "sudo -n rm -f /var/lib/buzz-agent/stop-intent /var/lib/buzz-agent/state.json"));
+    let start_index = commands
+        .iter()
+        .position(|c| *c == "sudo -n systemctl start buzz-agent.service")
+        .expect("service start should run");
+    // Launch authorization is the final arming operation before start.
+    assert!(
+        commands[start_index - 1].contains("/run/buzz-agent/launch-authorized"),
+        "authorization must immediately precede start: {commands:?}"
     );
-    assert!(commands[0].starts_with("install -d "));
-    assert!(commands[1].starts_with("chown root:root /etc/systemd/system"));
-    assert_eq!(commands[2], "systemctl daemon-reload");
-    assert_eq!(commands[3], "systemctl enable buzz-agent.service");
-    assert!(commands[4].contains("nohup sh -c"));
-    assert!(commands[4].contains("docker pull --quiet"));
-    assert_eq!(
-        commands[5],
-        "cat /var/lib/buzz-agent/image-pull.status 2>/dev/null || printf pending"
-    );
-    assert_eq!(
-        commands[6],
-        "install -o root -g root -m 666 /dev/null /run/buzz-agent/env-consumed"
-    );
-    assert!(commands[7].contains("chown root:root /run/buzz-agent/env.pending"));
-    assert!(commands[8].contains("/var/lib/buzz-agent/stop-intent"));
-    assert!(commands[8].contains("/var/lib/buzz-agent/state.json"));
-    assert_eq!(commands[9], "systemctl start buzz-agent.service");
-    assert_eq!(commands[10], "systemctl is-active buzz-agent.service");
-    assert_eq!(
-        commands[11],
-        "rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
-    );
-    assert_eq!(commands[12], "systemctl is-active buzz-agent.service");
+    assert!(commands
+        .iter()
+        .any(|c| c.contains("rm -f .buzz-provision/run__buzz-agent__env.pending && sudo -n rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed")));
 
     let mut forbidden_values = prepared.env.values().cloned().collect::<Vec<_>>();
     forbidden_values.push(request.agent.private_key_nsec.clone());
@@ -942,14 +1039,17 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
 
     let writes = state.file_writes.lock().await.clone();
     assert_eq!(writes.len(), 11, "unexpected file writes: {writes:?}");
-    assert!(writes.iter().all(|(path, _, _)| !path.starts_with('/')));
+    // Every file API write stays inside the work-directory staging area.
+    assert!(writes
+        .iter()
+        .all(|(path, _, _)| path.starts_with(".buzz-provision/")));
     let (_, env_payload, encoding) = writes
         .iter()
-        .find(|(path, _, _)| path == "run/buzz-agent/env.pending")
-        .expect("pending environment should be written");
-    assert_eq!(encoding, "base64");
+        .find(|(path, _, _)| path == ".buzz-provision/run__buzz-agent__env.pending")
+        .expect("pending environment should be staged");
+    assert_eq!(encoding, "utf8");
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(env_payload)
+        .decode(env_payload.trim())
         .expect("environment payload should be base64");
     assert_eq!(
         decoded,
@@ -957,12 +1057,12 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     );
     let auth_index = writes
         .iter()
-        .position(|(path, _, _)| path == "run/buzz-agent/launch-authorized")
-        .expect("launch authorization marker should be written");
+        .position(|(path, _, _)| path == ".buzz-provision/run__buzz-agent__launch-authorized")
+        .expect("launch authorization marker should be staged");
     let env_index = writes
         .iter()
-        .position(|(path, _, _)| path == "run/buzz-agent/env.pending")
-        .expect("pending environment should be written");
+        .position(|(path, _, _)| path == ".buzz-provision/run__buzz-agent__env.pending")
+        .expect("pending environment should be staged");
     assert!(
         auth_index > env_index,
         "authorization must follow env setup"
@@ -980,11 +1080,14 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     let operations = state.operations.lock().await.clone();
     let authorization_operation = operations
         .iter()
-        .position(|operation| operation == "file:run/buzz-agent/launch-authorized")
-        .expect("authorization operation should be recorded");
+        .rposition(|operation| {
+            operation.starts_with("command:")
+                && operation.contains("/run/buzz-agent/launch-authorized")
+        })
+        .expect("authorization install should be recorded");
     let start_operation = operations
         .iter()
-        .position(|operation| operation == "command:systemctl start buzz-agent.service")
+        .position(|operation| operation == "command:sudo -n systemctl start buzz-agent.service")
         .expect("systemd start operation should be recorded");
     assert_eq!(
         authorization_operation + 1,
@@ -995,12 +1098,16 @@ async fn real_provisioner_writes_secure_assets_injects_env_and_round_trips_to_no
     let files = state.files.lock().await.clone();
     assert!(!files.contains_key(&(
         "candidate-1".to_string(),
-        "run/buzz-agent/env.pending".to_string()
+        "/run/buzz-agent/env.pending".to_string()
     )));
     assert!(!files.contains_key(&(
         "candidate-1".to_string(),
-        "run/buzz-agent/env-consumed".to_string()
+        "/run/buzz-agent/env-consumed".to_string()
     )));
+    // No staged secret may survive provisioning.
+    assert!(files
+        .keys()
+        .all(|(_, path)| !path.starts_with(".buzz-provision/")));
     let ownership: Value = serde_json::from_str(
         files
             .get(&("candidate-1".to_string(), OWNERSHIP_MARKER_PATH.to_string()))
@@ -1081,12 +1188,18 @@ async fn provisioning_failure_redacts_error_and_removes_pending_secret_file() {
         rendered.contains("[redacted]"),
         "rendered provisioning error: {rendered}"
     );
-    assert!(state.commands.lock().await.last().is_some_and(
-        |command| command == "rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
-    ));
-    assert!(!state.files.lock().await.contains_key(&(
+    assert!(state.commands.lock().await.last().is_some_and(|command| {
+        command
+            == "rm -f .buzz-provision/run__buzz-agent__env.pending && sudo -n rm -f /run/buzz-agent/env.pending /run/buzz-agent/env-consumed"
+    }));
+    let files = state.files.lock().await;
+    assert!(!files.contains_key(&(
         "candidate-1".to_string(),
-        "run/buzz-agent/env.pending".to_string()
+        "/run/buzz-agent/env.pending".to_string()
+    )));
+    assert!(!files.contains_key(&(
+        "candidate-1".to_string(),
+        ".buzz-provision/run__buzz-agent__env.pending".to_string()
     )));
     server_task.abort();
 }

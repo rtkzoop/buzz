@@ -16,17 +16,22 @@ use thiserror::Error;
 
 /// Root-owned marker describing provider ownership.
 ///
-/// Box file API paths are relative to the Box work directory. Reads and the
-/// future provisioner writes intentionally use this same relative spelling.
-pub const OWNERSHIP_MARKER_PATH: &str = "var/lib/buzz-agent/ownership.json";
+/// Markers live in root-owned system paths outside the Box work directory,
+/// so they are read through the command API (as root) rather than the file
+/// API, which is jailed to the work directory.
+pub const OWNERSHIP_MARKER_PATH: &str = "/var/lib/buzz-agent/ownership.json";
 /// Non-secret state written by the launcher.
-pub const STATE_MARKER_PATH: &str = "var/lib/buzz-agent/state.json";
+pub const STATE_MARKER_PATH: &str = "/var/lib/buzz-agent/state.json";
 /// Stop-intent marker consulted after resume.
-pub const STOP_INTENT_PATH: &str = "var/lib/buzz-agent/stop-intent";
+pub const STOP_INTENT_PATH: &str = "/var/lib/buzz-agent/stop-intent";
 /// Non-secret launch-intent fingerprint.
-pub const LAUNCH_INTENT_PATH: &str = "var/lib/buzz-agent/launch-intent.sha256";
+pub const LAUNCH_INTENT_PATH: &str = "/var/lib/buzz-agent/launch-intent.sha256";
 /// Non-secret readiness marker emitted after the entrypoint consumes its env.
-pub const ENV_CONSUMED_MARKER_PATH: &str = "run/buzz-agent/env-consumed";
+pub const ENV_CONSUMED_MARKER_PATH: &str = "/run/buzz-agent/env-consumed";
+/// Exit code the marker-read probe uses to report an absent file. Reads and
+/// content are separated from other failures so a transport error can never
+/// masquerade as a missing marker.
+pub(crate) const ABSENT_MARKER_EXIT_CODE: i32 = 44;
 /// Fixed systemd unit supervised by the provider.
 pub const SERVICE_UNIT: &str = "buzz-agent.service";
 
@@ -39,6 +44,9 @@ pub enum ObserveError {
     /// A marker existed but could not be decoded into the provider contract.
     #[error("Box ownership or state marker was malformed")]
     MalformedMarker,
+    /// A marker read command failed for a reason other than a missing file.
+    #[error("Box marker read failed")]
+    MarkerRead,
     /// The service command returned an unusable state.
     #[error("Box service state was ambiguous")]
     AmbiguousService,
@@ -196,16 +204,42 @@ fn parse_stop_intent(value: &str) -> Option<StopIntent> {
     }
 }
 
-async fn read_optional_file(
+/// Build the root marker-read probe for one absolute path.
+///
+/// The Box command API runs as the unprivileged `user` account and the file
+/// API is jailed to the work directory, so root-owned markers are read with
+/// passwordless `sudo`. A missing file exits with the fixed absent code; any
+/// other failure is surfaced as an error, never as "absent".
+pub(crate) fn marker_read_command(path: &str) -> String {
+    format!(
+        "sudo -n sh -c 'if [ -e {path} ]; then cat {path}; else exit {code}; fi'",
+        code = ABSENT_MARKER_EXIT_CODE,
+    )
+}
+
+pub(crate) async fn read_optional_file(
     api: &BoxApi,
     box_id: &str,
     path: &str,
 ) -> Result<Option<String>, ObserveError> {
-    match api.read_file(box_id, path, Some("utf8")).await {
-        Ok(file) => Ok(Some(file.content)),
-        Err(BoxApiError::Http { status: 404, .. }) => Ok(None),
-        Err(error) => Err(ObserveError::Api(error)),
+    let result = api
+        .execute(
+            box_id,
+            &CommandRequest {
+                command: marker_read_command(path),
+                cwd: None,
+                timeout_seconds: Some(10),
+            },
+        )
+        .await?;
+    if result.exit_code == Some(ABSENT_MARKER_EXIT_CODE) {
+        return Ok(None);
     }
+    if !result.success || result.exit_code != Some(0) || result.timed_out || result.stdout_truncated
+    {
+        return Err(ObserveError::MarkerRead);
+    }
+    Ok(Some(result.stdout))
 }
 
 #[cfg(test)]
@@ -217,6 +251,14 @@ mod tests {
         let keys = nostr::Keys::generate();
         let nsec = keys.secret_key().to_bech32().expect("key should encode");
         AgentIdentity::from_nsec(&nsec).expect("generated key should decode")
+    }
+
+    #[test]
+    fn marker_read_probe_is_sudo_gated_and_distinguishes_absence() {
+        let command = marker_read_command(OWNERSHIP_MARKER_PATH);
+        assert!(command.starts_with("sudo -n sh -c "));
+        assert!(command.contains(OWNERSHIP_MARKER_PATH));
+        assert!(command.contains(&format!("exit {ABSENT_MARKER_EXIT_CODE}")));
     }
 
     #[test]
@@ -258,14 +300,19 @@ mod tests {
     }
 
     #[test]
-    fn marker_paths_are_relative_to_the_box_work_directory() {
+    fn marker_paths_are_absolute_system_paths_outside_the_work_directory() {
         for path in [
             OWNERSHIP_MARKER_PATH,
             STATE_MARKER_PATH,
             STOP_INTENT_PATH,
             LAUNCH_INTENT_PATH,
+            ENV_CONSUMED_MARKER_PATH,
         ] {
-            assert!(!path.starts_with('/'), "absolute marker path: {path}");
+            assert!(path.starts_with('/'), "relative marker path: {path}");
+            assert!(
+                path.starts_with("/var/lib/buzz-agent/") || path.starts_with("/run/buzz-agent/"),
+                "marker outside provider-owned directories: {path}"
+            );
         }
     }
 }

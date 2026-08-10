@@ -118,7 +118,7 @@ fn handoff_harness(label: &str) -> HandoffHarness {
 
     install_executable(
         &bin_dir.join("stat"),
-        "#!/bin/sh\nprintf '%s\\n' '0:0:600'\n",
+        "#!/bin/sh\nprintf '%s\\n' '1000:1000:600'\n",
     );
     install_executable(
         &bin_dir.join("box"),
@@ -769,7 +769,7 @@ fn supervisor_race_case(label: &str, prior_external: bool, inject_external: bool
 
     install_executable(
         &bin_dir.join("stat"),
-        "#!/bin/sh\nprintf '%s\\n' '0:0:600'\n",
+        "#!/bin/sh\nprintf '%s\\n' '1000:1000:600'\n",
     );
     let external_marker = var_dir.join("stop-intent");
     install_executable(
@@ -1227,7 +1227,7 @@ fn task_c_assets_are_shell_safe_and_unit_has_required_supervision_policy() {
         "refused-not-armed",
         "launch_armed",
         "dst=/run/buzz-agent/env.pending,ro",
-        "dst=/run/buzz-agent/env-consumed,rw",
+        "dst=/run/buzz-agent/env-consumed",
         "box stop self",
         "launch-handoff.lock",
         "handoff_owner_path",

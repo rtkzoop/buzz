@@ -545,14 +545,43 @@ async fn create_candidate(
     api: &BoxApi,
     prepared: &PreparedDeploy,
 ) -> Result<BoxRecord, ReconcileError> {
-    api.create(&CreateBoxRequest {
+    let mut request = CreateBoxRequest {
         no_env: true,
         ttl_seconds: None,
         machine_type: prepared.config.machine_type.as_str().to_string(),
         env: Map::new(),
-    })
-    .await
-    .map_err(|error| api_error(api, prepared, error))
+    };
+    match api.create(&request).await {
+        Ok(record) => Ok(record),
+        Err(error) if requires_auto_stop_ttl(&error) => {
+            // Trial-tier accounts refuse `ttlSeconds: null`. Fall back to a
+            // platform TTL wide enough to cover provisioning; the provider's
+            // own inactivity supervision still governs steady-state life.
+            request.ttl_seconds = Some(
+                prepared
+                    .config
+                    .inactivity_seconds
+                    .max(MIN_TRIAL_TTL_SECONDS),
+            );
+            api.create(&request)
+                .await
+                .map_err(|error| api_error(api, prepared, error))
+        }
+        Err(error) => Err(api_error(api, prepared, error)),
+    }
+}
+
+/// Floor for the trial-tier fallback TTL so short inactivity windows cannot
+/// archive a Box before provisioning finishes.
+const MIN_TRIAL_TTL_SECONDS: u64 = 900;
+
+/// Whether Box creation was refused because the account tier requires an
+/// auto-stop TTL (observed live as HTTP 400 `trial_auto_stop_required`).
+fn requires_auto_stop_ttl(error: &BoxApiError) -> bool {
+    matches!(
+        error,
+        BoxApiError::Http { status: 400, code, .. } if code == "trial_auto_stop_required"
+    )
 }
 
 enum ClaimOutcome {

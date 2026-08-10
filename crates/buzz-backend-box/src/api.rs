@@ -784,7 +784,16 @@ fn extract_payload<T: DeserializeOwned>(
         .get(field)
         .or_else(|| value.get("data").and_then(|data| data.get(field)))
         .or_else(|| value.get("data"))
-        .or_else(|| value.get("result"));
+        .or_else(|| value.get("result"))
+        // The live API also returns payloads flat at the top level next to
+        // the `ok`/`type` envelope markers (for example
+        // `{"ok":true,"type":"command.finished","success":true,...}`).
+        .or_else(|| {
+            value
+                .as_object()
+                .filter(|object| object.get("ok") == Some(&Value::Bool(true)))
+                .map(|_| value)
+        });
     source
         .cloned()
         .ok_or(BoxApiError::InvalidPayload { resource })
@@ -839,6 +848,49 @@ fn sanitize_detail(value: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn extract_payload_accepts_flat_ok_envelope() {
+        // The live command API returns the payload flat beside the envelope:
+        // {"ok":true,"type":"command.finished","success":true,...}
+        let value = serde_json::json!({
+            "ok": true,
+            "type": "command.finished",
+            "success": true,
+            "exitCode": 0,
+            "signal": null,
+            "stdout": "hello\n",
+            "stderr": "",
+            "stdoutTruncated": false,
+            "stderrTruncated": false,
+            "timedOut": false
+        });
+        let result: CommandResult = extract_payload(&value, "command", "commandResult")
+            .expect("flat ok envelope should parse");
+        assert!(result.success);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
+    fn extract_payload_still_prefers_named_field() {
+        let value = serde_json::json!({
+            "ok": true,
+            "command": {"success": true, "exitCode": 3, "stdout": "nested"}
+        });
+        let result: CommandResult =
+            extract_payload(&value, "command", "commandResult").expect("named field should win");
+        assert_eq!(result.exit_code, Some(3));
+        assert_eq!(result.stdout, "nested");
+    }
+
+    #[test]
+    fn extract_payload_rejects_non_ok_flat_envelope() {
+        let value = serde_json::json!({"ok": false, "error": "boom"});
+        let result: Result<CommandResult, BoxApiError> =
+            extract_payload(&value, "command", "commandResult");
+        assert!(result.is_err());
+    }
 
     #[test]
     fn parses_all_documented_states_and_preserves_unknown() {

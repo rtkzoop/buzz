@@ -197,7 +197,7 @@ fi
 
 atomic_write "$state_path" "{\"invocation\":\"$invocation\",\"launch_armed\":true,\"started\":false,\"startup\":\"armed\",\"stop_intent\":\"none\"}" || exit 66
 
-if [ "$(stat -c '%u:%g:%a' "$env_path" 2>/dev/null || true)" != 0:0:600 ]; then
+if [ "$(stat -c '%u:%g:%a' "$env_path" 2>/dev/null || true)" != 1000:1000:600 ]; then
     exit 66
 fi
 if ! grep -Fq '"BUZZ_MANAGED_AGENT_START_NONCE":"'"$invocation"'"' "$env_path"; then
@@ -225,11 +225,12 @@ if [ "$(cat "$stop_intent_path" 2>/dev/null || true)" = external ]; then
 fi
 
 docker run --name "$container_name" \
-    --mount type=tmpfs,dst=/run/buzz-agent,tmpfs-mode=700 \
+    --tmpfs /run/buzz-agent:rw,mode=700,uid=1000,gid=1000 \
     --mount type=bind,src="$env_path",dst=/run/buzz-agent/env.pending,ro \
-    --mount type=bind,src="$consumed_path",dst=/run/buzz-agent/env-consumed,rw \
+    --mount type=bind,src="$consumed_path",dst=/run/buzz-agent/env-consumed \
     --mount type=bind,src="$entrypoint_path",dst=/usr/local/libexec/buzz-box-entrypoint,ro \
-    "$image_ref" /usr/local/libexec/buzz-box-entrypoint /run/buzz-agent/env.pending &
+    --entrypoint /usr/local/libexec/buzz-box-entrypoint \
+    "$image_ref" /run/buzz-agent/env.pending &
 child=$!
 child_started=1
 release_handoff_lock

@@ -1,12 +1,16 @@
 //! Box-side installation, secret injection, and service launch.
 //!
-//! The provider writes only non-secret supervision assets and non-secret
-//! markers to persistent paths. The resolved environment is serialized once
-//! as canonical JSON and sent through the file API as base64 to the `/run`
-//! tmpfs path. No command string contains an environment value.
+//! The Box file API is jailed to the unprivileged work directory and the
+//! command API runs as `user` with passwordless `sudo`. Every system file is
+//! therefore staged through the file API inside the work directory and moved
+//! into its root-owned destination with `sudo install`, which removes the
+//! staging copy in the same command. The resolved environment is serialized
+//! once as canonical JSON, staged as base64, restricted to mode 600 before
+//! any other step, and installed onto the `/run` tmpfs. No command string
+//! contains an environment value.
 
-use crate::api::{BoxApi, BoxApiError, CommandRequest, CommandResult, WriteFileRequest};
-use crate::observe::{ENV_CONSUMED_MARKER_PATH, LAUNCH_INTENT_PATH, OWNERSHIP_MARKER_PATH};
+use crate::api::{BoxApi, CommandRequest, CommandResult, WriteFileRequest};
+use crate::observe::{LAUNCH_INTENT_PATH, OWNERSHIP_MARKER_PATH};
 use crate::reconcile::{ProvisionError, ProvisionRequest, Provisioner};
 use base64::Engine as _;
 use serde_json::json;
@@ -23,20 +27,26 @@ pub const EMBEDDED_EXTERNAL_STOP: &str = include_str!("../assets/buzz-box-extern
 /// Embedded last-resort poststop helper.
 pub const EMBEDDED_POSTSTOP: &str = include_str!("../assets/buzz-box-poststop");
 
-const SERVICE_UNIT_FILE: &str = "etc/systemd/system/buzz-agent.service";
-const SUPERVISOR_FILE: &str = "usr/local/libexec/buzz-box-supervise";
-const ENTRYPOINT_FILE: &str = "usr/local/libexec/buzz-box-entrypoint";
-const EXTERNAL_STOP_FILE: &str = "usr/local/libexec/buzz-box-external-stop";
-const POSTSTOP_FILE: &str = "usr/local/libexec/buzz-box-poststop";
-const IMAGE_FILE: &str = "var/lib/buzz-agent/image.ref";
-const INVOCATION_FILE: &str = "run/buzz-agent/invocation";
-const ENV_FILE: &str = "run/buzz-agent/env.pending";
-const LAUNCH_AUTHORIZED_FILE: &str = "run/buzz-agent/launch-authorized";
+/// Work-directory staging area used for every file that must end up in a
+/// root-owned system path. Staged copies are removed by the same `sudo
+/// install` command that moves them into place.
+const STAGING_DIR: &str = ".buzz-provision";
+const SERVICE_UNIT_FILE: &str = "/etc/systemd/system/buzz-agent.service";
+const SUPERVISOR_FILE: &str = "/usr/local/libexec/buzz-box-supervise";
+const ENTRYPOINT_FILE: &str = "/usr/local/libexec/buzz-box-entrypoint";
+const EXTERNAL_STOP_FILE: &str = "/usr/local/libexec/buzz-box-external-stop";
+const POSTSTOP_FILE: &str = "/usr/local/libexec/buzz-box-poststop";
+const IMAGE_FILE: &str = "/var/lib/buzz-agent/image.ref";
+const INVOCATION_FILE: &str = "/run/buzz-agent/invocation";
 const ENV_FILE_ABS: &str = "/run/buzz-agent/env.pending";
+const LAUNCH_AUTHORIZED_FILE: &str = "/run/buzz-agent/launch-authorized";
 const CONSUMED_FILE_ABS: &str = "/run/buzz-agent/env-consumed";
-const PULL_STATUS_FILE_ABS: &str = "/var/lib/buzz-agent/image-pull.status";
-const PULL_LOG_FILE_ABS: &str = "/var/lib/buzz-agent/image-pull.log";
-const PULL_PID_FILE_ABS: &str = "/var/lib/buzz-agent/image-pull.pid";
+/// Pull bookkeeping lives in the user-writable staging area because the
+/// detached pull worker runs unprivileged; only the markers consumed by the
+/// supervisor live in root-owned paths.
+const PULL_STATUS_FILE: &str = ".buzz-provision/image-pull.status";
+const PULL_LOG_FILE: &str = ".buzz-provision/image-pull.log";
+const PULL_PID_FILE: &str = ".buzz-provision/image-pull.pid";
 const MAX_PULL_ATTEMPTS: usize = 3;
 
 /// A real Box provisioner. The API client is supplied through each request so
@@ -86,35 +96,39 @@ async fn provision_inner(
     let ownership = serde_json::to_string(&ownership)
         .map_err(|_| failure(redactor, "ownership marker was not serializable"))?;
 
-    write_utf8(
+    stage_install_utf8(
         request.api,
         box_id,
         IMAGE_FILE,
         &format!("{image}\n"),
+        "644",
         redactor,
     )
     .await?;
-    write_utf8(
+    stage_install_utf8(
         request.api,
         box_id,
         INVOCATION_FILE,
         &format!("{nonce}\n"),
+        "644",
         redactor,
     )
     .await?;
-    write_utf8(
+    stage_install_utf8(
         request.api,
         box_id,
         LAUNCH_INTENT_PATH,
         &format!("{}\n", request.prepared.launch_intent),
+        "644",
         redactor,
     )
     .await?;
-    write_utf8(
+    stage_install_utf8(
         request.api,
         box_id,
         OWNERSHIP_MARKER_PATH,
         &format!("{ownership}\n"),
+        "644",
         redactor,
     )
     .await?;
@@ -123,7 +137,7 @@ async fn provision_inner(
         request.api,
         box_id,
         "prepare consumed marker",
-        "install -o root -g root -m 666 /dev/null /run/buzz-agent/env-consumed",
+        &format!("sudo -n install -o root -g root -m 666 /dev/null {CONSUMED_FILE_ABS}"),
         30,
         redactor,
     )
@@ -132,13 +146,20 @@ async fn provision_inner(
     let env_bytes = serde_json::to_vec(&request.prepared.env)
         .map_err(|_| failure(redactor, "launch environment was not serializable"))?;
     let env_content = base64::engine::general_purpose::STANDARD.encode(env_bytes);
+    // The secret is staged base64-encoded in the work directory, restricted
+    // to mode 600 as the very next operation, decoded straight onto the
+    // `/run` tmpfs owned by the container agent uid (1000) mode 600, and
+    // the staging copy removed in the same
+    // command. Its plaintext never touches the persistent disk and no
+    // command string contains an environment value.
+    let env_staging = staging_path(ENV_FILE_ABS);
     write_file(
         request.api,
         box_id,
         &WriteFileRequest {
-            path: ENV_FILE.to_string(),
+            path: env_staging.clone(),
             content: env_content,
-            encoding: "base64".to_string(),
+            encoding: "utf8".to_string(),
         },
         redactor,
     )
@@ -147,12 +168,16 @@ async fn provision_inner(
         request.api,
         box_id,
         "secure pending environment",
-        "chown root:root /run/buzz-agent/env.pending && chmod 600 /run/buzz-agent/env.pending && stat -c '%u:%g:%a' /run/buzz-agent/env.pending",
+        &format!(
+            "chmod 600 {staging} && sudo -n sh -c 'umask 077 && base64 -d < {staging} > {dest} && chown 1000:1000 {dest} && chmod 600 {dest}' && rm -f {staging} && sudo -n stat -c '%u:%g:%a' {dest}",
+            staging = env_staging,
+            dest = ENV_FILE_ABS,
+        ),
         30,
         redactor,
     )
     .await?;
-    if mode_result.stdout.trim() != "0:0:600" {
+    if mode_result.stdout.trim() != "1000:1000:600" {
         return Err(failure(
             redactor,
             "pending environment ownership or mode verification failed",
@@ -163,7 +188,7 @@ async fn provision_inner(
         request.api,
         box_id,
         "reset prior stop intent before launch",
-        "rm -f /var/lib/buzz-agent/stop-intent /var/lib/buzz-agent/state.json",
+        "sudo -n rm -f /var/lib/buzz-agent/stop-intent /var/lib/buzz-agent/state.json",
         10,
         redactor,
     )
@@ -171,11 +196,12 @@ async fn provision_inner(
     // This write is deliberately the final arming operation. The launcher
     // consumes the nonce before it can start Docker, so an enabled unit that
     // races resume without this marker refuses with no self-stop side effect.
-    write_utf8(
+    stage_install_utf8(
         request.api,
         box_id,
         LAUNCH_AUTHORIZED_FILE,
         &format!("{nonce}\n"),
+        "644",
         redactor,
     )
     .await?;
@@ -183,7 +209,7 @@ async fn provision_inner(
         request.api,
         box_id,
         "start buzz-agent.service",
-        "systemctl start buzz-agent.service",
+        "sudo -n systemctl start buzz-agent.service",
         30,
         redactor,
     )
@@ -201,34 +227,27 @@ async fn install_assets(
         api,
         box_id,
         "prepare Box directories",
-        "install -d -o root -g root -m 700 /var/lib/buzz-agent /run/buzz-agent /usr/local/libexec && test \"$(stat -c '%u:%g:%a' /var/lib/buzz-agent)\" = 0:0:700 && test \"$(stat -c '%u:%g:%a' /run/buzz-agent)\" = 0:0:700 && test \"$(stat -f -c '%T' /run)\" = tmpfs",
+        &format!(
+            "install -d -m 700 {STAGING_DIR} && sudo -n install -d -o root -g root -m 700 /var/lib/buzz-agent /run/buzz-agent && sudo -n install -d -o root -g root -m 755 /usr/local/libexec && test \"$(sudo -n stat -c '%u:%g:%a' /var/lib/buzz-agent)\" = 0:0:700 && test \"$(sudo -n stat -c '%u:%g:%a' /run/buzz-agent)\" = 0:0:700 && test \"$(stat -f -c '%T' /run)\" = tmpfs",
+        ),
         60,
         redactor,
     )
     .await?;
-    for (path, content) in [
-        (SERVICE_UNIT_FILE, EMBEDDED_UNIT),
-        (SUPERVISOR_FILE, EMBEDDED_SUPERVISOR),
-        (ENTRYPOINT_FILE, EMBEDDED_ENTRYPOINT),
-        (EXTERNAL_STOP_FILE, EMBEDDED_EXTERNAL_STOP),
-        (POSTSTOP_FILE, EMBEDDED_POSTSTOP),
+    for (path, content, mode) in [
+        (SERVICE_UNIT_FILE, EMBEDDED_UNIT, "644"),
+        (SUPERVISOR_FILE, EMBEDDED_SUPERVISOR, "755"),
+        (ENTRYPOINT_FILE, EMBEDDED_ENTRYPOINT, "755"),
+        (EXTERNAL_STOP_FILE, EMBEDDED_EXTERNAL_STOP, "755"),
+        (POSTSTOP_FILE, EMBEDDED_POSTSTOP, "755"),
     ] {
-        write_utf8(api, box_id, path, content, redactor).await?;
+        stage_install_utf8(api, box_id, path, content, mode, redactor).await?;
     }
     run_command(
         api,
         box_id,
-        "secure supervision assets",
-        "chown root:root /etc/systemd/system/buzz-agent.service /usr/local/libexec/buzz-box-supervise /usr/local/libexec/buzz-box-entrypoint /usr/local/libexec/buzz-box-external-stop /usr/local/libexec/buzz-box-poststop && chmod 644 /etc/systemd/system/buzz-agent.service && chmod 755 /usr/local/libexec/buzz-box-supervise /usr/local/libexec/buzz-box-entrypoint /usr/local/libexec/buzz-box-external-stop /usr/local/libexec/buzz-box-poststop",
-        30,
-        redactor,
-    )
-    .await?;
-    run_command(
-        api,
-        box_id,
         "reload systemd",
-        "systemctl daemon-reload",
+        "sudo -n systemctl daemon-reload",
         30,
         redactor,
     )
@@ -237,7 +256,50 @@ async fn install_assets(
         api,
         box_id,
         "enable buzz-agent.service",
-        "systemctl enable buzz-agent.service",
+        "sudo -n systemctl enable buzz-agent.service",
+        30,
+        redactor,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Work-directory staging spelling for an absolute destination path.
+fn staging_path(destination: &str) -> String {
+    format!(
+        "{STAGING_DIR}/{}",
+        destination.trim_start_matches('/').replace('/', "__")
+    )
+}
+
+/// Stage a non-secret UTF-8 file through the jailed file API, then move it
+/// into its root-owned destination with `sudo install`, removing the staging
+/// copy in the same command.
+async fn stage_install_utf8(
+    api: &BoxApi,
+    box_id: &str,
+    destination: &str,
+    content: &str,
+    mode: &str,
+    redactor: &crate::redact::Redactor,
+) -> Result<(), ProvisionError> {
+    let staging = staging_path(destination);
+    write_file(
+        api,
+        box_id,
+        &WriteFileRequest {
+            path: staging.clone(),
+            content: content.to_string(),
+            encoding: "utf8".to_string(),
+        },
+        redactor,
+    )
+    .await?;
+    run_command(
+        api,
+        box_id,
+        &format!("install {destination}"),
+        &format!("sudo -n install -o root -g root -m {mode} {staging} {destination} && rm -f {staging}"),
         30,
         redactor,
     )
@@ -260,13 +322,13 @@ async fn ensure_image(
     let inspect_format = "{{range .RepoDigests}}{{println .}}{{end}}";
     let inner = format!(
         "if docker pull --quiet {image}; then if docker image inspect --format '{inspect_format}' {image} | grep -Fqx {image}; then printf ready > {status}; else printf digest-mismatch > {status}; fi; else printf pull-failed > {status}; fi",
-        status = PULL_STATUS_FILE_ABS,
+        status = PULL_STATUS_FILE,
     );
     let kickoff = format!(
         "rm -f {status} {log} {pid}; nohup sh -c {inner} >{log} 2>&1 </dev/null & echo $! > {pid}",
-        status = PULL_STATUS_FILE_ABS,
-        log = PULL_LOG_FILE_ABS,
-        pid = PULL_PID_FILE_ABS,
+        status = PULL_STATUS_FILE,
+        log = PULL_LOG_FILE,
+        pid = PULL_PID_FILE,
         inner = shell_quote(&inner),
     );
     for _attempt in 0..MAX_PULL_ATTEMPTS {
@@ -285,7 +347,7 @@ async fn ensure_image(
                 api,
                 box_id,
                 "poll detached image pull",
-                "cat /var/lib/buzz-agent/image-pull.status 2>/dev/null || printf pending",
+                &format!("cat {PULL_STATUS_FILE} 2>/dev/null || printf pending"),
                 10,
                 redactor,
             )
@@ -332,9 +394,10 @@ async fn marker_exists(
     box_id: &str,
     redactor: &crate::redact::Redactor,
 ) -> Result<bool, ProvisionError> {
-    match api.read_file(box_id, ENV_CONSUMED_MARKER_PATH, None).await {
-        Ok(file) => Ok(file.content.trim() == "consumed"),
-        Err(BoxApiError::Http { status: 404, .. }) => Ok(false),
+    match crate::observe::read_optional_file(api, box_id, crate::observe::ENV_CONSUMED_MARKER_PATH)
+        .await
+    {
+        Ok(content) => Ok(content.is_some_and(|value| value.trim() == "consumed")),
         Err(error) => Err(failure(
             redactor,
             &format!("reading startup marker: {error}"),
@@ -351,32 +414,15 @@ async fn cleanup_env_file(
         api,
         box_id,
         "remove pending environment",
-        &format!("rm -f {ENV_FILE_ABS} {CONSUMED_FILE_ABS}"),
+        &format!(
+            "rm -f {staging} && sudo -n rm -f {ENV_FILE_ABS} {CONSUMED_FILE_ABS}",
+            staging = staging_path(ENV_FILE_ABS),
+        ),
         10,
         redactor,
     )
     .await
     .map(|_| ())
-}
-
-async fn write_utf8(
-    api: &BoxApi,
-    box_id: &str,
-    path: &str,
-    content: &str,
-    redactor: &crate::redact::Redactor,
-) -> Result<(), ProvisionError> {
-    write_file(
-        api,
-        box_id,
-        &WriteFileRequest {
-            path: path.to_string(),
-            content: content.to_string(),
-            encoding: "utf8".to_string(),
-        },
-        redactor,
-    )
-    .await
 }
 
 async fn write_file(
@@ -459,12 +505,28 @@ mod tests {
     }
 
     #[test]
+    fn staging_paths_stay_inside_the_work_directory_and_are_unique() {
+        for destination in [
+            SERVICE_UNIT_FILE,
+            SUPERVISOR_FILE,
+            ENV_FILE_ABS,
+            OWNERSHIP_MARKER_PATH,
+        ] {
+            let staged = staging_path(destination);
+            assert!(staged.starts_with(".buzz-provision/"), "escaped: {staged}");
+            assert!(!staged.contains('/'.to_string().repeat(2).as_str()));
+            assert!(!staged[STAGING_DIR.len() + 1..].contains('/'), "nested: {staged}");
+        }
+        assert_ne!(staging_path("/a/b"), staging_path("/a/c"));
+    }
+
+    #[test]
     fn detached_pull_command_contains_digest_verification_and_no_environment_file_mode() {
         let image = shell_quote("registry/image@sha256:abc");
         let inspect_format = "{{range .RepoDigests}}{{println .}}{{end}}";
         let inner = format!(
             "if docker pull --quiet {image}; then if docker image inspect --format '{inspect_format}' {image} | grep -Fqx {image}; then printf ready > {status}; fi; fi",
-            status = PULL_STATUS_FILE_ABS,
+            status = PULL_STATUS_FILE,
         );
         let command = format!("nohup sh -c {} >/dev/null 2>&1 &", shell_quote(&inner));
         assert!(command.contains("docker pull"));
